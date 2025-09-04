@@ -6,21 +6,6 @@ A high-performance, distributed-training-ready checkpointing library for PyTorch
 
 Core functionality is implemented but APIs are subject to change. Check back soon for stable release.
 
-## Installation
-
-### Basic Installation
-```bash
-# Clone the repository
-git clone https://github.com/your-org/torch_checkpointing.git
-cd torch_checkpointing
-
-# Install basic dependencies
-pip install -r requirements.txt
-
-# Install in development mode
-pip install -e .
-```
-
 ### Development Setup
 For contributors and developers, install all development dependencies:
 
@@ -167,4 +152,4 @@ ruff check . && flake8 torch_checkpointing tests && mypy torch_checkpointing && 
 
 3. **Performance first** -- Checkpointing should minimize impact on training performance.
 
-4. **Test thoroughly** -- All features must have unit tests and integration tests for distributed scenarios.
+4. **Test thoroughly** -- All features must have unit tests.
