@@ -1,7 +1,0 @@
-flake8==7.0.0
-ruff==0.4.10
-pygls==1.3.1
-
-# these are needed for pytorch testing utils
-expecttest==0.3.0
-numpy==1.26.4
