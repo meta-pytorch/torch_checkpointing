@@ -16,6 +16,7 @@ Classes:
 """
 
 import abc
+import contextvars
 import logging
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import nullcontext
@@ -218,7 +219,13 @@ class DefaultStager(CheckpointStager):
             assert self._staging_executor is not None, (
                 "Staging executor should be initialized for async staging"
             )
+            # Propagate the trainer thread's checkpoint_logging_context (step
+            # etc.) to the staging worker via ctx.run, so EventLogger calls
+            # inside _stage pick up the correct step via the contextvar
+            # fallback. Matches the pattern in CheckpointProcess._submit_write.
+            ctx = contextvars.copy_context()
             return self._staging_executor.submit(
+                ctx.run,
                 self._stage,
                 state_dict,
                 current_stream_ready,
