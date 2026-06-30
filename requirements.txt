@@ -1,0 +1,13 @@
+# Core dependencies for checkpointing
+# PyTorch compatibility
+torch>=2.6.0
+
+# Testing
+pytest>=7.0.0
+pytest-timeout>=2.1.0
+
+# Type checking
+mypy>=0.990
+
+# Linting requirements
+-r requirements-lint.txt
