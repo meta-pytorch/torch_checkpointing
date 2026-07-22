@@ -1,0 +1,143 @@
+name: Build and publish torch_checkpointing release
+
+# Manually-triggered release pipeline. torch_checkpointing is a pure-Python
+# package, so we build a single universal sdist + wheel and publish via PyPI
+# trusted publishing (no long-lived credentials).
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to stamp into pyproject.toml (e.g. 0.1.0rc1 or 0.1.0). Leave blank to publish the version already in pyproject.toml."
+        required: false
+        default: ""
+      is_prerelease:
+        description: "Is this a pre-release? (Marks the GitHub Release as a pre-release.)"
+        type: boolean
+        required: false
+        default: false
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # Queue, don't cancel: a release must not be interrupted between the PyPI
+  # upload and the GitHub Release, which would leave inconsistent state.
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build sdist and wheel
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Stamp release version
+        if: ${{ inputs.version != '' }}
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          python - <<'PY'
+          import os, pathlib, re
+          version = os.environ["RELEASE_VERSION"]
+          path = pathlib.Path("pyproject.toml")
+          # Match the project version line. No `count` limit: if a second
+          # `version = "..."` line ever appears, `n != 1` fails loudly here
+          # rather than silently stamping the wrong line.
+          text, n = re.subn(
+              r'(?m)^version = ".*"$',
+              f'version = "{version}"',
+              path.read_text(),
+          )
+          assert n == 1, f"expected exactly one top-level version line, found {n}"
+          path.write_text(text)
+          print(f"Stamped version {version}")
+          PY
+
+      - name: Build sdist and wheel
+        run: |
+          python -m pip install --upgrade pip build twine
+          python -m build
+          twine check dist/*
+          ls -la dist/
+
+      - name: Resolve built version
+        id: version
+        run: |
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          import pathlib, tomllib
+          data = tomllib.loads(pathlib.Path("pyproject.toml").read_text())
+          print(f"version={data['project']['version']}")
+          PY
+
+      - name: Smoke-test the wheel
+        run: |
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install dist/*.whl
+          cd /tmp
+          python -c "import torch_checkpointing as m; print('torch_checkpointing', getattr(m, '__version__', 'imported ok'))"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    name: Publish to PyPI
+    needs: build
+    runs-on: ubuntu-latest
+    # The environment must be configured as the trusted publisher for this
+    # project on PyPI (https://docs.pypi.org/trusted-publishers/).
+    environment: pypi
+    permissions:
+      id-token: write  # Required for PyPI trusted publishing
+      contents: read
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+
+      - name: Display structure of downloaded files
+        run: ls -R dist/
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          verbose: true
+
+  release:
+    name: Create GitHub release
+    needs: [build, publish]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write  # Required to create the git tag and GitHub Release
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.build.outputs.version }}
+          PRERELEASE: ${{ inputs.is_prerelease }}
+        run: |
+          args=(--title "v${VERSION}" --generate-notes)
+          if [ "$PRERELEASE" = "true" ]; then
+            args+=(--prerelease)
+          fi
+          gh release create "v${VERSION}" dist/* "${args[@]}"
