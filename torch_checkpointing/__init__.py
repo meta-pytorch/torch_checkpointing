@@ -63,12 +63,13 @@ from .dtensor_metadata import (
 )
 from .metadata_manager import DefaultMetadataManager, MetadataManager
 from .resharding import LoadPlan, Resharder, ReshardingInfo
+from .schema import ItemSpec
 from .staging import CheckpointStager, CheckpointStagerConfig, DefaultStager
 from .state_transformations import (
     optimizer_transform_post,
     optimizer_transform_pre,
 )
-from .types import RankInfo, STATE_DICT
+from .types import ItemKey, RankInfo, STATE_DICT
 from .utils import wrap_future
 from .version import __version__, get_version, Version
 
@@ -84,6 +85,8 @@ __all__ = [
     "CheckpointManager",
     "CheckpointSaveConfig",
     "CheckpointLoadConfig",
+    "ItemSpec",
+    "ItemKey",
     "CheckpointSaver",
     "SyncCheckpointSaver",
     "AsyncCheckpointSaver",

@@ -21,6 +21,9 @@ from typing_extensions import TypeAlias
 # Type alias for state dictionaries used in checkpointing
 STATE_DICT: TypeAlias = Mapping[str, Any]
 
+# Type alias for a top-level checkpoint item key.
+ItemKey: TypeAlias = str
+
 # Type alias for nested paths within a checkpoint item
 # Components can be strings (dict keys) or ints (sequence indices)
 NestedPath = tuple[str | int, ...]
