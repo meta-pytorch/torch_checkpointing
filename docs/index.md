@@ -2,12 +2,14 @@
 
 `torch_checkpointing` is a library for scalable, **asynchronous** checkpointing of PyTorch models: a `CheckpointManager` stages model state and hands it to a background process that writes to storage, so training resumes almost immediately while the write completes out of band. The same API works single-rank and scales to large distributed jobs, with resharding across different parallelism layouts on load.
 
-New here? Start with the [README quick start](../README.md), then read [Key concepts](./key_concepts.md).
+New here? Start with the [training-loop tutorial](./tutorials.md), then read
+[Key concepts](./key_concepts.md).
 
 ## Getting started (most users)
 
-- [Key concepts](./key_concepts.md) — the core building blocks: `CheckpointManager`, `CheckpointBase` / `CheckpointItem`, and how save and load work.
-- [Configuring checkpoints](./configuring_checkpoints.md) — per-item options: `layout`, `requires_copy`, serialization formats, and `resharder`.
+- [Tutorial](./tutorials.md) — checkpoint and resume a complete training loop.
+- [Key concepts](./key_concepts.md) — the core building blocks: the `CheckpointManager`, the plain-dict payload / `into=` model, and how async save and load work.
+- [Configuring checkpoints](./configuring_checkpoints.md) — per-item options via `ItemSpec`: `layout`, `requires_copy`, serialization formats, and `resharder`.
 - [Troubleshooting & FAQ](./troubleshooting.md) — common errors and how to fix them.
 - [API reference](./api_reference.md) — the public symbols at a glance.
 

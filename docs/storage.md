@@ -6,6 +6,10 @@ existence checks — flows through a small `Storage` interface, so the same
 checkpointing logic can target a local filesystem, a networked filesystem, or a
 remote object store without changes to the rest of the stack.
 
+Only the local filesystem backend ships with the package. Networked filesystems
+can be used through a local mount; a native remote or object-store integration
+requires a custom `StorageConfig` / `Storage` implementation.
+
 > **Power-user / extensibility track.** This guide is for building a bespoke
 > storage backend. Most users just use the default local filesystem backend — see
 > [Extensibility](./extensibility.md) for the full set of extension points and
@@ -20,7 +24,8 @@ This document covers:
   and `ReadArgs`.
 - A sketch of implementing your own backend.
 
-See also [./key_concepts.md](./key_concepts.md) and the [../README.md](../README.md).
+See also the [tutorial](./tutorials.md) and
+[Key concepts](./key_concepts.md).
 
 ## The two ABCs
 
@@ -170,15 +175,31 @@ class ReadArgs:
 When `read_args` is `None`, backends fall back to their own defaults (see how
 `LocalFileSystemStorage.stream_read` treats a missing `read_args` below).
 
-## Wiring: create_storage()
+## Wiring a backend into a checkpoint
 
-There is no registry or factory function to memorize — the connection between a
-config and its backend *is* `create_storage()`. You hold a `StorageConfig`,
-call `create_storage()` on it, and get back the ready-to-use `Storage`:
+You do **not** call `create_storage()` yourself for the common path. Hand the
+*config* to the manager and it constructs the live `Storage` for you:
 
 ```python
+from torch_checkpointing import CheckpointManager
 from torch_checkpointing.storage.filesystem import LocalFileSystemStorageConfig
 
+manager = CheckpointManager(CheckpointManager.Config(
+    storage_config=LocalFileSystemStorageConfig(use_direct_io=True),
+))
+```
+
+Every `save()` and `load()` on that manager then reads and writes through your
+backend. When no `storage_config` is supplied, the manager defaults to
+`LocalFileSystemStorageConfig()`.
+
+The connection between a config and its backend *is* `create_storage()` — there
+is no registry or factory function to memorize. The manager calls it internally,
+but you can also call it directly when driving the [lower-level savers and
+loaders](./api_reference.md#lower-level-savers--loaders-advanced) by hand, or
+when you just want a `Storage` to poke at:
+
+```python
 config = LocalFileSystemStorageConfig(use_direct_io=True)
 storage = config.create_storage()  # -> LocalFileSystemStorage
 ```
@@ -407,11 +428,15 @@ A few contracts matter more when the backend is a remote object store than a loc
 - **`isdir` / `ls` on a flat store.** Object stores have no real directories. Implement `isdir(path)` as "does any object exist under this prefix?" and `ls(path)` as a single-level prefix listing (again, as above).
 - **`rename` and atomicity.** For barrier-coordinated multi-rank saves the writer stages files under a temporary directory and renames it into place, so readers never observe a half-written checkpoint. If your store has no cheap rename, implement it as copy-then-delete — optionally passing `background_cleanup=True` to defer the source deletes off the critical path.
 
-Once defined, your backend plugs in exactly like the shipped one:
+Once defined, your backend plugs in exactly like the shipped one — pass the
+config to the manager and every save and load goes through it:
 
 ```python
-config = InMemoryStorageConfig(root="/checkpoints")
-storage = config.create_storage()
+from torch_checkpointing import CheckpointManager
+
+manager = CheckpointManager(CheckpointManager.Config(
+    storage_config=InMemoryStorageConfig(root="/checkpoints"),
+))
 ```
 
 ## Reference

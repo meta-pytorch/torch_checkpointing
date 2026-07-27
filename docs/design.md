@@ -1,17 +1,26 @@
 # Design & Internals
 
-> **Optional deep-dive.** You do not need this document to *use* the library — start with the [README](../README.md) and [Key concepts](./key_concepts.md). This is a contributor-oriented tour of the internals; read it when extending the library or debugging its behavior. For the extension points at a glance, see [Extensibility](./extensibility.md).
+> **Optional deep-dive.** You do not need this document to *use* the library — start with the [tutorial](./tutorials.md) and [Key concepts](./key_concepts.md). This is a contributor-oriented tour of the internals; read it when extending the library or debugging its behavior. For the extension points at a glance, see [Extensibility](./extensibility.md).
 
 This document describes the internal architecture of `torch_checkpointing`: the
 end-to-end save and load pipelines, the difference between the synchronous and
 asynchronous savers, the staging subsystem, the background write subprocess, and
 how the reader reconstructs a state dict from storage.
 
-For a higher-level overview, see [../README.md](../README.md). For the core
-vocabulary (`CheckpointBase`, `CheckpointItem`, layout, metadata), see
-[./key_concepts.md](./key_concepts.md).
+`CheckpointManager` — the single object users interact with (see
+[Key concepts](./key_concepts.md)) — is the **deep module** that composes all of
+this behind `save()` / `load()`: it builds the stager, spawns the write
+subprocess, drives the reader, and auto-wires the metadata manager, translating
+your plain `{name: value}` payload and `into=` templates into the low-level
+contracts described below. Everything in this document is machinery the manager
+wraps; you reach for it directly only when extending behavior that crosses
+component boundaries, or when driving the lower-level savers and loaders by hand.
 
-Unlike the README — which focuses on the asynchronous path — this document also
+For a higher-level workflow, see [the tutorial](./tutorials.md). For the
+user-facing model (the payload / `into=` contract, `ItemSpec`, resharding) see
+[Key concepts](./key_concepts.md).
+
+Unlike the tutorial — which focuses on the asynchronous path — this document also
 documents the synchronous saver in full, because the two paths share most of
 their machinery and differ only in *when* and *where* the write happens.
 

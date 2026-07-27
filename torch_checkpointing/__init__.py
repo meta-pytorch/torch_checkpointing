@@ -5,19 +5,12 @@
 # LICENSE file in the root directory of this source tree.
 
 """
-Checkpoint functionality for machine learning models.
+Asynchronous, distributed checkpointing for PyTorch.
 
-This module provides classes for saving and loading model checkpoints in a distributed
-training environment. It includes functionality for coordinating checkpoint operations
-across multiple processes and customizing the checkpoint process through hooks.
-
-Key components:
-- CheckpointSaver: Main class for orchestrating checkpoint save operations
-- CheckpointWriter: Handles writing state dictionaries to storage
-- CheckpointReader: Handles reading state dictionaries from storage read
-- Barrier: Synchronization mechanism for distributed checkpointing
-- RankInfo: Information about the current rank in a distributed environment
-
+``CheckpointManager`` is the entry point: it saves and loads plain
+``{item_key: value}`` payloads, staging state off the training device and writing
+it from a background process, and reshards on load across different distributed
+layouts. See the ``docs/`` directory for the guide and API reference.
 """
 
 from .barriers import (
@@ -66,62 +59,18 @@ from .state_transformations import (
     optimizer_transform_post,
     optimizer_transform_pre,
 )
-from .types import ItemKey, RankInfo, STATE_DICT
+from .types import RankInfo, STATE_DICT
 from .utils import wrap_future
 from .version import __version__, get_version, Version
 
+# Public API. `CheckpointManager` -- plus `ItemSpec` for per-item overrides -- is
+# the entire surface a typical user needs (see the tutorial in docs/). Every other
+# symbol imported above stays importable from this package and from its own
+# submodule for advanced use and backward compatibility, but is intentionally not
+# advertised as part of the public API.
 __all__ = [
-    "Barrier",
-    "TCPStoreBarrier",
-    "CheckpointReader",
-    "CheckpointWriter",
-    "CheckpointWriterConfig",
-    "CheckpointBase",
-    "CheckpointItem",
-    "CheckpointLoader",
     "CheckpointManager",
     "ItemSpec",
-    "ItemKey",
-    "CheckpointSaver",
-    "SyncCheckpointSaver",
-    "AsyncCheckpointSaver",
-    "CheckpointLoaderConfig",
-    "CheckpointSaverConfig",
-    "SyncCheckpointSaverConfig",
-    "AsyncCheckpointSaverConfig",
-    "BarrierConfig",
-    "TCPStoreBarrierConfig",
-    "CheckpointStager",
-    "CheckpointStagerConfig",
-    "DefaultStager",
-    "RankInfo",
-    "STATE_DICT",
-    "wrap_future",
-    "make_sync_checkpoint_saver",
-    "make_async_checkpoint_saver",
-    # Distributed metadata components
-    "CheckpointMetadata",
-    "DistributedItemMetadata",
-    "DistributedMetadata",
-    "GlobalObjectMetadata",
-    "ItemMetadata",
-    "ShardingMetadata",
-    "DTensorShardingMetadata",
-    "DeviceMeshSpec",
-    "get_device_mesh_spec",
-    "_PlacementSpec",
-    "ReplicateSpec",
-    "ShardSpec",
-    "MetadataManager",
-    "DefaultMetadataManager",
-    # Resharding
-    "LoadPlan",
-    "Resharder",
-    "ReshardingInfo",
-    # State transformations
-    "optimizer_transform_pre",
-    "optimizer_transform_post",
-    # Versioning
     "__version__",
     "get_version",
     "Version",

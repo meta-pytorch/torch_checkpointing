@@ -2,17 +2,22 @@
 
 This guide covers the distributed side of `torch_checkpointing`: how ranks
 identify themselves, how they coordinate at save time, how sharding metadata is
-collected and shared between the saver and loader, and how a checkpoint saved
+collected and shared between save and load, and how a checkpoint saved
 under one device mesh / placement can be loaded under a different one
 (resharding).
 
 See [./key_concepts.md](./key_concepts.md) for the core building blocks
-(`CheckpointBase`, savers, loaders) and [../README.md](../README.md) for a quick
-start.
+(the `CheckpointManager`, the payload / `into=` model) and
+[./tutorials.md](./tutorials.md) for a complete training loop.
 
-> **Power-user / extensibility track.** Multi-rank coordination, custom sharding
-> metadata, and writing a `Resharder` live here. See
-> [Extensibility](./extensibility.md) for the full set of extension points.
+> **Two tracks.** The common case at the top uses the high-level
+> `CheckpointManager` — you declare a resharder per item and the manager wires
+> the sharding-metadata pipeline on both save and load for you. The numbered
+> reference sections below document the mechanisms it wires: rank identity,
+> barriers, the metadata pipeline, and the resharding internals. They double as
+> the guide for driving the low-level savers and loaders directly, and for
+> writing a custom `Resharder`. See [Extensibility](./extensibility.md) for the
+> full set of extension points.
 
 > **Status: advanced / less battle-tested.** Single-rank and simple data-parallel
 > saves and loads are the well-trodden path. The multi-rank metadata aggregation
@@ -25,62 +30,46 @@ start.
 
 ## The common case: save distributed, reshard on load
 
-Most users come here for one task: *I saved a checkpoint on one set of ranks (or one device mesh) and want to load it onto a different one.* Here is the whole flow, before the reference sections below dive into each piece. It runs under `torchrun`, assumes your model state is made of `DTensor`s (handled by the built-in `DTensorResharder`), and takes `rank_info` (auto-detected from the process group — see §1), `storage_config`, `path`, and a `model` built under the *current* layout as given.
+Most users come here for one task: *I saved a checkpoint on one set of ranks (or one device mesh) and want to load it onto a different one.* With the high-level `CheckpointManager` that is one declaration and two calls — you **declare a resharder per item** in the config, and the manager auto-wires the sharding-metadata pipeline on **both save and load**. Rank identity is auto-detected from the process group (see §1), and you pass plain `{name: value}` dicts. It runs under `torchrun` and assumes your model state is made of `DTensor`s, handled by the built-in `DTensorResharder`.
 
-**1. Declare which items to reshard** — attach a `DTensorResharder` to each:
+**1. Declare which items to reshard** — bind an `ItemSpec` with a `DTensorResharder` to each item, once, in the config:
 
 ```python
-from torch_checkpointing import CheckpointBase, CheckpointItem, STATE_DICT
+from torch_checkpointing import CheckpointManager, ItemSpec
 from torch_checkpointing.dtensor_resharder import DTensorResharder
 
-
-class ModelCheckpoint(CheckpointBase):
-    def __init__(self, model):
-        self._model = model
-
-    def get_items(self) -> dict[str, CheckpointItem]:
-        return {"model": CheckpointItem(value=self._model.state_dict(), resharder=DTensorResharder())}
-
-    def load_state_dict(self, state_dict: STATE_DICT) -> None:
-        self._model.load_state_dict(state_dict["model"])
+manager = CheckpointManager(CheckpointManager.Config(
+    items={"model": ItemSpec(resharder=DTensorResharder())},
+))
 ```
 
-**2. Save on the original ranks** — give the saver a `MetadataManager` so the source sharding layout is recorded next to the shards (resharding on load depends on it):
+`Config.items` maps each key to its `ItemSpec`; use the `Config.with_async_save()` / `Config.with_sync_save()` presets to pick the async or sync pipeline. (For a multi-rank save to shared storage the manager coordinates the ranks with a barrier so all shards are present before the checkpoint is published — see §2.)
+
+**2. Save on the original ranks** — the manager records the source sharding layout next to the shards (resharding on load depends on it):
 
 ```python
-from torch_checkpointing import make_async_checkpoint_saver
-from torch_checkpointing.metadata_manager import DefaultMetadataManager
-
-saver = make_async_checkpoint_saver(
-    checkpoint_metadata_manager=DefaultMetadataManager(rank_info=rank_info),
-)
-_, write_future = saver.save(path, ModelCheckpoint(model))
-write_future.result()
-saver.close()
+write_future = manager.save(path, {"model": model.state_dict()})
+write_future.result()  # block only where you need the bytes durable
 ```
 
-For a multi-rank save to shared storage, also configure a barrier so all shards are present before the checkpoint is published (see §2).
-
-**3. Load on the new ranks / mesh** — wire a `MetadataManager` into the loader; the resharder redistributes each stored shard onto the rank that now owns it:
+**3. Load on the new ranks / mesh** — pass the live model, built under the *new* layout, as the `into=` target; the resharder redistributes each stored shard onto the rank that now owns it:
 
 ```python
-from torch_checkpointing import CheckpointReader, CheckpointLoader
-from torch_checkpointing.metadata_manager import DefaultMetadataManager
-
-reader = CheckpointReader(rank_info=rank_info, storage_config=storage_config)
-loader = CheckpointLoader(
-    reader=reader,
-    metadata_manager=DefaultMetadataManager(rank_info=rank_info, enable_serialization=False),
-)
-loader.load(path, ModelCheckpoint(model))  # `model` is already built under the new layout
-loader.close()
+manager.load(path, into={"model": model.state_dict()})  # `model` is already built under the new layout
 ```
 
-The contract in one line: **a resharder on each item, and a `MetadataManager` on both the saver and the loader.** Omit either and loads take a direct-read fast path that is only correct when the layout is unchanged. The sections below explain each piece — rank identity, save-time coordination, the metadata pipeline, and writing a resharder for non-DTensor state — in depth.
+That is the whole contract: **declare a resharder on each item and the manager does the rest.** It records the source sharding metadata on save and wires the target metadata on load — the two-sided coordination automatically, on both ends. There is nothing to omit and no fast-path footgun to trip: the manager wires both sides for you, so a checkpoint with a declared resharder always reshards when the layout differs and always takes a plain direct read when it doesn't.
+
+The reference sections below document the mechanisms the manager wires — rank identity, save-time coordination, the metadata pipeline, the resharding internals, and writing a resharder for non-DTensor state. Read them to understand what happens under the hood, or as the guide for driving the low-level savers and loaders directly.
 
 ---
 
 ## 1. Rank identity: `RankInfo`
+
+`CheckpointManager` auto-detects rank identity from the default process group, so
+most users never construct one of these. This section documents what it detects
+(and what you would pass explicitly when driving the low-level savers directly or
+running a multi-role topology).
 
 Every distributed component is parameterized by a `RankInfo`
 (`torch_checkpointing/types.py`), a plain dataclass:
@@ -104,8 +93,8 @@ There are two distinct notions of rank:
   TCPStore server).
 
 In a homogeneous single-role job the two coincide. They diverge when a job runs
-multiple roles (for example a trainer role alongside a separate role) and each
-role checkpoints independently.
+multiple roles (for example, trainer ranks alongside separate policy-model
+ranks) and each role checkpoints independently.
 
 ### Auto-detection from the default process group
 
@@ -293,6 +282,11 @@ To reshard a checkpoint on load, the loader needs to know how the *source*
 checkpoint was sharded. That description is **sharding metadata**, produced and
 aggregated by a `MetadataManager` (`torch_checkpointing/metadata_manager.py`).
 
+`CheckpointManager` constructs and wires a `MetadataManager` on both save and
+load whenever any item declares a resharder — you do not build one yourself. This
+section describes the pipeline the manager runs (and what you would wire by hand
+if driving the low-level savers and loaders directly).
+
 ### The abstract interface
 
 ```python
@@ -413,20 +407,30 @@ Resharding is loading a checkpoint whose shards were laid out for one device mes
 / placement into tensors laid out for a *different* one — for example changing
 the tensor-parallel degree, or moving from pure data parallelism to a 2-D mesh.
 
-> **Resharding is OFF by default.** If you do not attach resharders and wire up a
-> metadata manager on the loader, `CheckpointReader.read` takes a direct-read
-> fast path: each rank reads back exactly the file its layout points at, with no
-> metadata loading and no shard remapping. This is correct only when the
-> load-time layout matches the save-time layout. To reshard, you must (a) attach
-> a resharder to each item you want resharded, and (b) give the loader a
-> `MetadataManager`.
+With `CheckpointManager` you opt in by declaring a resharder on the item's
+`ItemSpec` (§"common case"); the manager then wires both halves of the mechanism
+this section describes — the resharder on each item, and a `MetadataManager` on
+save and load. What follows is what that wiring drives under the hood (and what
+you assemble by hand when driving the low-level loader directly).
+
+> **The direct-read fast path.** Resharding only engages when there is a
+> resharder *and* target sharding metadata. Without both, `CheckpointReader.read`
+> takes a direct-read fast path: each rank reads back exactly the file its layout
+> points at, with no metadata loading and no shard remapping — correct precisely
+> when the load-time layout matches the save-time layout. Through
+> `CheckpointManager` this is an internal optimization, not something to
+> configure: because the manager wires a resharder-declared item on both ends, it
+> reshards when the layout differs and takes the direct read when it doesn't. The
+> two ingredients below — (a) a resharder per item and (b) a `MetadataManager` on
+> the loader — are exactly what the manager supplies; you assemble them yourself
+> only when driving the low-level loader directly.
 
 ### 5a. Attach a resharder per item
 
-A resharder is attached to a checkpoint item (the exact mechanism lives on
-`CheckpointItem`; see [./key_concepts.md](./key_concepts.md)). During
-`extract_object_metadata`, only items whose `resharder is not None` contribute
-sharding metadata:
+Through `CheckpointManager` a resharder is declared on the item's `ItemSpec`
+(see [./key_concepts.md](./key_concepts.md)); the low-level path carries it on the
+`CheckpointItem`. During `extract_object_metadata`, only items whose `resharder is
+not None` contribute sharding metadata:
 
 ```python
 for item_key, checkpoint_item in checkpoint_info.checkpoint_items.items():
@@ -441,6 +445,10 @@ For DTensor state dicts the built-in `DTensorResharder`
 (`torch_checkpointing/dtensor_resharder.py`) handles this.
 
 ### 5b. Wire a metadata manager into the loader
+
+`CheckpointManager` does this step for you when an item declares a resharder. The
+mechanism below is what it wires — and what you wire by hand when driving
+`CheckpointLoader` directly.
 
 `CheckpointLoader` takes an optional `MetadataManager`:
 
@@ -613,6 +621,7 @@ altogether (identical save/load configuration on retry).
 
 | Concern | Class / knob | File |
 | --- | --- | --- |
+| High-level entry point | `CheckpointManager`, `ItemSpec(resharder=...)` | `checkpoint_manager.py` |
 | Rank identity | `RankInfo`, `_get_default_rank_info()` | `types.py`, `builder.py` |
 | Cross-rank coordination | `BarrierConfig`, `TCPStoreBarrierConfig`, `TCPStoreBarrier` | `barriers.py` |
 | Disable coordination | `CheckpointWriterConfig(barrier_config=None)` | `checkpoint_writer.py` |
@@ -623,6 +632,10 @@ altogether (identical save/load configuration on retry).
 | Built-in DTensor resharder | `DTensorResharder`, `DTensorShardingMetadata` | `dtensor_resharder.py`, `dtensor_metadata.py` |
 | Loader wiring | `CheckpointLoader(reader, metadata_manager)` | `checkpoint_loader.py` |
 
-Resharding is opt-in on both ends: attach a resharder to each item you want
-remapped, and give the loader a metadata manager. Omit either and loads take the
-direct-read fast path.
+Through `CheckpointManager` resharding is a single declaration: give an item's
+`ItemSpec` a resharder and the manager wires the source metadata on save and the
+target metadata on load — both ends, automatically. Under the hood (and when
+driving the low-level savers and loaders directly) that means a resharder on each
+item plus a metadata manager on save and load; with either absent the loader
+takes the direct-read fast path, which is correct exactly when the layout is
+unchanged.

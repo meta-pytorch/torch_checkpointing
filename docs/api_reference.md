@@ -1,70 +1,82 @@
 # API reference
 
-The public API. Most symbols import directly from the top-level package:
+The public API is small: you interact with `CheckpointManager`, plus `ItemSpec`
+when you need to override per-item behavior. Both import from the top level:
 
 ```python
-from torch_checkpointing import CheckpointManager, CheckpointBase, CheckpointItem
+from torch_checkpointing import CheckpointManager, ItemSpec
 ```
 
-A few live in submodules (noted below): layouts and serialization formats, the built-in DTensor resharder, and storage backends.
+Everything else listed below is **advanced / lower-level**: still importable (from
+the top-level package or the submodule noted), but not part of the surface a
+typical user needs. The building blocks you plug into an `ItemSpec` — layouts,
+serialization formats, resharders — live in their own submodules.
 
 ## High-level manager (start here)
 
 | Symbol | Purpose |
 | --- | --- |
-| `CheckpointManager` | The high-level entry point; drives both `save()` and `load()`. |
-| `CheckpointManager.Config` | Manager configuration; call `.build()` to construct. Presets: `Config.with_async_save()`, `Config.with_sync_save()`. |
-| `AsyncCheckpointSaverConfig`, `SyncCheckpointSaverConfig` | Save-side config on `Config.save`, including `wait_timeout_secs`. |
-| `CheckpointLoaderConfig` | Load-side config on `Config.load` (`use_mmap`). |
+| `CheckpointManager` | The entry point; drives both `save()` and `load()`. |
+| `CheckpointManager.Config` | Manager configuration; pass to `CheckpointManager(...)` or call `.build()`. Presets: `Config.with_async_save()`, `Config.with_sync_save()`. Fields include `items`, `default`, `storage_config`. |
+| `ItemSpec` | Per-item overrides in `Config.items`: `requires_copy`, `layout`, `resharder`, `required`. |
 
-`manager.save(checkpoint_id, checkpoint)` returns `(stage_future, write_future)` for async saves, or `None` for sync. `manager.load(checkpoint_id, checkpoint, *, map_location=None, strict=False)` loads in place. Call `manager.close()` when done.
+- `manager.save(checkpoint_id, checkpoint)` — `checkpoint` is a `Mapping[str, Any]`. Returns the write `Future` for async saves, or `None` for sync.
+- `manager.load(checkpoint_id, into=None, *, map_location=None, strict=False)` — restores into the `into` templates in place and returns the loaded `Mapping`.
+- `manager.lock()` — context manager; wrap `optimizer.step()` in it to wait for any in-flight async staging to finish before mutating params, so a checkpoint isn't staged mid-step. Waits only on the staging copy, not the write. No-op for sync.
+- `manager.close()` — waits for the last write and releases resources.
 
-## Defining a checkpoint
+`checkpoint_id` is a string interpreted by the configured storage backend. The
+default local filesystem backend treats it as the path to a checkpoint
+directory. `checkpoint` is the generic payload: its top-level values may be
+tensors, nested state dictionaries, JSON-compatible values, or bytes, subject
+to the selected serialization format.
 
-| Symbol | Purpose |
-| --- | --- |
-| `CheckpointBase` | Subclass and implement `get_items()` / `load_state_dict()`. |
-| `CheckpointItem` | Per-item config: `value`, `requires_copy`, `layout`, `resharder`. |
-| `STATE_DICT` | Type alias for a checkpoint state dict. |
+## Configuring items — `ItemSpec` + building blocks
 
-## Lower-level savers & loaders
+| Symbol | Module | Purpose |
+| --- | --- | --- |
+| `ItemSpec` | top-level | Per-item `requires_copy` / `layout` / `resharder` / `required`. |
+| `LayoutInfo` | `.checkpoint_layout` | Where/how an item is written (`file_path`, `serialization_format`); `{rank}` in `file_path` is filled per rank. |
+| `TorchSerialization` | `.checkpoint_layout` | `torch.save` format (the default). |
+| `JsonSerialization(cls=None)` | `.checkpoint_layout` | JSON; `None` returns the raw JSON-decoded value. |
+| `RawSerialization` | `.checkpoint_layout` | Raw bytes. |
+| `SafetensorsSerialization` | `.checkpoint_layout` | safetensors format for tensors. |
+| `DTensorResharder` | `.dtensor_resharder` | Built-in resharder for `DTensor` state. |
+| `Resharder` | `.resharding` | Base class for custom resharding. |
 
-`CheckpointManager` wraps these — reach for them directly only when you need finer control than the manager exposes.
+## Lower-level savers & loaders (advanced)
 
-| Symbol | Purpose |
-| --- | --- |
-| `make_async_checkpoint_saver(...)`, `make_sync_checkpoint_saver(...)` | Build a saver directly (auto-detects rank). |
-| `AsyncCheckpointSaver`, `SyncCheckpointSaver`, `CheckpointSaver` | Saver classes returned by the factories. |
-| `AsyncCheckpointSaverConfig`, `SyncCheckpointSaverConfig` | Saver configuration. |
-| `CheckpointStagerConfig`, `CheckpointStager`, `DefaultStager` | Async staging configuration and stager. |
-| `CheckpointReader` | Reads bytes from storage into a state dict. |
-| `CheckpointLoader` | Wraps a reader and calls your `load_state_dict()`. |
+`CheckpointManager` wraps these — reach for them only when you need finer control
+than the manager exposes (for example, driving a load-only eval job by hand).
+
+| Symbol | Module | Purpose |
+| --- | --- | --- |
+| `CheckpointBase`, `CheckpointItem` | `.checkpoint_base` | Low-level item contract the manager builds internally. |
+| `make_async_checkpoint_saver(...)`, `make_sync_checkpoint_saver(...)` | `.builder` | Build a saver directly (auto-detects rank). |
+| `AsyncCheckpointSaver`, `SyncCheckpointSaver`, `CheckpointSaver` | `.checkpoint_saver` | Saver classes returned by the factories. |
+| `CheckpointSaverConfig`, `AsyncCheckpointSaverConfig`, `SyncCheckpointSaverConfig` | `.config` | Save-side manager configuration, including `wait_timeout_secs`. |
+| `CheckpointLoaderConfig` | `.config` | Load-side manager configuration (`use_mmap`). |
+| `CheckpointStager`, `DefaultStager`, `CheckpointStagerConfig` | `.staging` | Async staging. |
+| `CheckpointReader` | `.checkpoint_reader` | Reads bytes from storage into a state dict. |
+| `CheckpointLoader` | `.checkpoint_loader` | Wraps a reader and applies a `load_state_dict`. |
 
 ## Storage — `torch_checkpointing.storage`
 
 | Symbol | Module | Purpose |
 | --- | --- | --- |
-| `LocalFileSystemStorageConfig`, `LocalFileSystemStorage` | `.storage.filesystem` | Shipped local-filesystem backend. |
+| `LocalFileSystemStorageConfig`, `LocalFileSystemStorage` | `.storage.filesystem` | Shipped local-filesystem backend (the default). |
 | `Storage`, `StorageConfig`, `ReadArgs` | `.storage.base_storage` | Base classes for a custom backend. |
 
-## Layout & serialization — `torch_checkpointing.checkpoint_layout`
-
-| Symbol | Purpose |
-| --- | --- |
-| `LayoutInfo` | Where/how an item is written (`file_path`, `serialization_format`). |
-| `TorchSerialization` | `torch.save` format (used by the default layout). |
-| `JsonSerialization(cls)` | JSON, for human-readable metadata. |
-| `RawSerialization` | Raw bytes. |
-| `SafetensorsSerialization` | safetensors format for tensors. |
-
-## Distributed & resharding
+## Distributed & resharding (advanced)
 
 | Symbol | Module | Purpose |
 | --- | --- | --- |
-| `RankInfo` | top-level | Rank identity (auto-detected by the manager and the factories). |
-| `Resharder` | top-level | Base class for custom resharding. |
-| `DTensorResharder` | `.dtensor_resharder` | Built-in resharder for `DTensor` state. |
-| `MetadataManager`, `DefaultMetadataManager` | top-level | Sharding-metadata pipeline (required for resharding). |
-| `Barrier`, `TCPStoreBarrier`, `BarrierConfig`, `TCPStoreBarrierConfig` | top-level | Cross-rank save coordination. |
+| `RankInfo` | `.types` | Rank identity (auto-detected by the manager). |
+| `MetadataManager`, `DefaultMetadataManager` | `.metadata_manager` | Sharding-metadata pipeline (auto-wired by the manager when an item has a resharder). |
+| `Barrier`, `TCPStoreBarrier`, `BarrierConfig`, `TCPStoreBarrierConfig` | `.barriers` | Cross-rank save coordination. |
 
-See [Key concepts](./key_concepts.md) for how these fit together, [Extensibility](./extensibility.md) for the extension points, and [Distributed and resharding](./distributed_and_resharding.md) for the distributed API in depth.
+See the [tutorial](./tutorials.md) for an end-to-end workflow,
+[Key concepts](./key_concepts.md) for how these pieces fit together,
+[Extensibility](./extensibility.md) for the extension points, and
+[Distributed and resharding](./distributed_and_resharding.md) for the
+distributed API in depth.

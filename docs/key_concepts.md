@@ -3,8 +3,9 @@
 This guide explains the mental models behind `torch_checkpointing` so the how-to
 guides make sense. Read it once, top to bottom; each section builds on the last.
 
-For a runnable end-to-end example, see the [README](../README.md). For depth on
-any one topic, follow the how-to links at the end of each section.
+For a runnable end-to-end example, see the
+[training-loop tutorial](./tutorials.md). For depth on any one topic, follow the
+how-to links at the end of each section.
 
 ## 1. The `CheckpointManager` and the async save pipeline
 
@@ -14,310 +15,220 @@ build it from a config preset, then call `save()` and `load()` on it.
 ```python
 from torch_checkpointing import CheckpointManager
 
-manager = CheckpointManager.Config.with_async_save().build()   # or .with_sync_save()
+manager = CheckpointManager(CheckpointManager.Config.with_async_save())   # or .with_sync_save()
 ```
+
+The default async staging options currently require CUDA. See
+[Troubleshooting](./troubleshooting.md) for the explicit CPU configuration.
 
 An asynchronous save runs in two phases, and understanding the split is the key
 to reasoning about performance and correctness.
 
-**Stage (host-side copy).** The saver first copies your state dictionary off the
-training device into host memory. This is a fast, bounded operation. Once it
-completes, your training loop is free to keep mutating the original tensors —
-the staged copy is an independent snapshot.
+**Stage (host-side copy).** The manager first copies your state off the training
+device into host memory. This is a fast, bounded operation. Once it completes,
+your training loop is free to keep mutating the original tensors — the staged
+copy is an independent snapshot.
 
 **Write (background subprocess).** The staged copy is then serialized and written
 to storage by a *separate subprocess*, concurrently with training. This is the
 slow, I/O-bound part, and it stays off the training loop's critical path.
 
-`manager.save()` returns immediately with a tuple of two futures:
+`manager.save()` returns immediately with the **write `Future`**:
 
 ```python
-stage_future, write_future = manager.save(checkpoint_id, checkpoint)
-# ... training continues here — neither phase blocks the loop ...
-stage_future.result()   # host-side staging complete; safe to mutate originals
-write_future.result()   # bytes are durable in storage
+write_future = manager.save(checkpoint_id, checkpoint)
+# ... training continues here — the write does not block the loop ...
+write_future.result()   # wait only where you need the bytes durable in storage
 ```
 
-The **`(stage_future, write_future)` contract** tells you exactly what has
-finished:
-
-- `stage_future` resolves once staging is done. After this point the source
-  tensors are yours again — the training loop can overwrite them freely.
-- `write_future` resolves once the background write has committed the checkpoint
-  to storage. Wait on this only where you need durability guarantees (for
-  example, before exiting the process).
-
-The manager also serializes successive saves: the next `save()` call first waits
-on the previous `write_future` before staging again, so a slow write naturally
-back-pressures the loop instead of overlapping two writes.
+Wait on `write_future` only where you need a durability guarantee (for example,
+before exiting the process). The manager also serializes successive saves: the
+next `save()` first waits on the previous write before staging again, so a slow
+write naturally back-pressures the loop instead of overlapping two writes.
 
 A sync manager (`CheckpointManager.Config.with_sync_save()`) runs the same logical
-steps inline and `save()` returns `None` — no futures, no subprocess. Use it when
+steps inline and `save()` returns `None` — no future, no subprocess. Use it when
 you want the simplest possible behavior and don't mind blocking the loop.
 
-> How-to: [Configuring checkpoints](./configuring_checkpoints.md).
+## 2. Payloads and template-driven loads
 
-## 2. The `CheckpointBase` / `CheckpointItem` contract
-
-You describe *what* to checkpoint by subclassing `CheckpointBase` and
-implementing two methods:
+You describe *what* to checkpoint with a plain mapping — no base class to
+subclass, no wrapper objects:
 
 ```python
-class CheckpointBase(abc.ABC):
-    @abc.abstractmethod
-    def get_items(self) -> dict[str, CheckpointItem]: ...
-
-    @abc.abstractmethod
-    def load_state_dict(self, state_dict: STATE_DICT) -> None: ...
+manager.save(checkpoint_id, {
+    "model": model.state_dict(),
+    "optimizer": optimizer.state_dict(),
+    "step": step,
+})
 ```
 
-A representative implementation checkpoints the state a training job usually
-carries — model, optimizer, dataloader, and some bookkeeping:
+The payload type is `Mapping[str, Any]`. Each top-level key names one item and
+becomes part of its on-disk file name. The checkpoint engine therefore requires
+keys to match **`^[a-zA-Z0-9_-]+$`** — alphanumeric characters, hyphens, and
+underscores only (no dots, slashes, whitespace, or extensions). A value can be
+a nested state dict, a single tensor, or a plain leaf (an `int`, a config dict,
+`bytes`) — leaves are first-class top-level items, not something you must bury
+inside a sub-dict.
+
+**Loading is template-driven.** You pass `into=` — a mapping of the *live*
+objects to restore into — and the loader merges the stored data into them:
 
 ```python
-from torch_checkpointing.dtensor_resharder import DTensorResharder
-
-
-class TrainerCheckpoint(CheckpointBase):
-    def __init__(self, model, optimizer, dataloader, step):
-        self._model = model
-        self._optimizer = optimizer
-        self._dataloader = dataloader
-        self._step = step
-
-    def get_items(self) -> dict[str, CheckpointItem]:
-        return {
-            # DTensor-sharded tensors: copy during staging, reshard on load.
-            "model": CheckpointItem(
-                value=self._model.state_dict(),
-                requires_copy=True,
-                resharder=DTensorResharder(),
-            ),
-            "optimizer": CheckpointItem(
-                value=self._optimizer.state_dict(),
-                requires_copy=True,
-                resharder=DTensorResharder(),
-            ),
-            # Dataloader progress: a snapshot (no staging copy) with a custom
-            # resharder (see Configuring checkpoints for MyCustomDataloaderResharder).
-            "dataloader": CheckpointItem(
-                value=self._dataloader.state_dict(),
-                requires_copy=False,
-                resharder=MyCustomDataloaderResharder(),
-            ),
-            # Small replicated bookkeeping (step, config, RNG): no copy, no reshard.
-            "misc_state": CheckpointItem(
-                value={"step": self._step},
-                requires_copy=False,
-            ),
-        }
-
-    def load_state_dict(self, state_dict: STATE_DICT) -> None:
-        self._model.load_state_dict(state_dict["model"])
-        self._optimizer.load_state_dict(state_dict["optimizer"])
-        self._dataloader.load_state_dict(state_dict["dataloader"])
-        self._step = state_dict["misc_state"]["step"]
+restored = manager.load(checkpoint_id, into={
+    "model": model.state_dict(),
+    "optimizer": optimizer.state_dict(),
+    "step": 0,
+})
 ```
 
-**`get_items()`** returns a dict of `CheckpointItem` objects keyed by a string
-identifier. Each key names one piece of state (for example `"model"`,
-`"optimizer"`, `"step"`). Because keys become filename components, they must
-match the rule **`^[a-zA-Z0-9_-]+$`** — alphanumeric characters, hyphens, and
-underscores only. No dots, slashes, whitespace, or extensions. Keys must be
-unique. Invalid keys raise `ValueError` when the checkpoint is saved or loaded.
-
-`get_items()` may be specialized per rank — for example, rank 0 can add global
-metadata that other ranks omit, or a rank can pick a rank-specific file name via
-`layout`.
-
-A `CheckpointItem` carries four fields:
-
-```python
-@dataclass
-class CheckpointItem:
-    value: Any = None
-    requires_copy: bool = True
-    layout: LayoutInfo | None = None
-    resharder: Resharder | None = None
-```
-
-- **`value`** — the data to save. On *write*, this is the actual object (a module
-  state dict, a tensor, an int). On *read*, it acts as a template (see section 3).
-- **`requires_copy`** — whether the value must be copied during async staging.
-  Keep this `True` for state the training loop keeps mutating, so the background
-  write doesn't race the loop. Set it `False` for snapshots that won't change,
-  to skip the staging copy.
-- **`layout`** — where and how the item is written. `None` means the default:
-  one `torch.save` file named after the key plus the rank id.
-- **`resharder`** — an optional `Resharder` for redistributing data across a
-  different parallelization layout on load (see sections 3 and 6).
-
-**`load_state_dict(state_dict)`** is the mirror image. After a checkpoint is read
-from storage, the loader calls this method with the loaded state so you can push
-it back into your already-initialized model, optimizer, and other components:
-
-```python
-def load_state_dict(self, state_dict: STATE_DICT) -> None:
-    self._model.load_state_dict(state_dict["model"])
-    self._optimizer.load_state_dict(state_dict["optimizer"])
-```
-
-> How-to: [Configuring checkpoints](./configuring_checkpoints.md).
-
-## 3. Template-driven loads
-
-Loading is *template-driven*: the `value` you supply in each `CheckpointItem`
-during a load describes the shape you want back, and the loader merges the stored
-data into it. This is what lets loads preserve object identity instead of
-allocating fresh objects.
-
-The rules the loader (`CheckpointReader` / `CheckpointLoader`) applies:
+The `into=` mapping does double duty: it names which items to read, and its
+values are the templates the loader restores into. The merge rules:
 
 - **Tensors are copied in place** via `copy_()` into the target tensor,
-  preserving the target tensor's identity (same object, new data). This matters
-  when other code already holds references to those tensors.
-- **Mutable containers** (`dict`, `list`, `deque`) are updated in place.
-- **Immutable containers** (`tuple`) and non-tensor leaf values are replaced —
-  new objects are created.
-- **When a `value` is `None`**, no template is provided, so the loader builds new
-  objects from the stored data and returns everything for that item unfiltered.
-- **When a `value` is a structure**, it also acts as a *filter*: only keys and
-  indices present in the template are loaded.
+  preserving the target's identity (same object, new data). Because
+  `model.state_dict()` returns references to the live parameters, loading into it
+  updates the model in place.
+- **Mutable containers** (`dict`, `list`, `deque`) are updated in place;
+  **immutable containers** (`tuple`) and non-tensor leaves are replaced.
+- **A structured template also filters recursively:** at every nesting level,
+  only mapping keys and sequence indices present in the template are loaded.
 
-You drive loads through the same `CheckpointManager`:
+`load()` also **returns** the loaded mapping, so you can read scalars back
+(`restored["step"]`) and re-apply object state where an object owns richer state
+than plain tensors (`optimizer.load_state_dict(restored["optimizer"])`). Pass
+`strict=True` to raise on missing keys, and `map_location=` to relocate tensors
+onto a target device.
 
-```python
-manager.load(checkpoint_id, checkpoint)   # merges stored data into your checkpoint
-```
+> With `into=None`, the manager reads the items declared in the config as-is —
+> useful for inspecting a checkpoint. Resharding needs live targets, so it
+> requires `into=`.
 
-`load()` accepts `strict=False` by default; pass `strict=True` to raise on
-missing keys, and `map_location=` to relocate tensors onto a target device.
+## 3. Per-item control: `ItemSpec`
 
-Under the hood two classes do the work — the manager wires them together, and you
-can also use them directly for load-only workloads (eval, inference):
-
-- **`CheckpointReader`** reads bytes from storage and produces the loaded state
-  dict, honoring the template merge rules above. It takes a `RankInfo` and a
-  `StorageConfig`, and `read()` returns `(state_dict, missing_keys)`.
-- **`CheckpointLoader`** wraps a `CheckpointReader` for the common load flow: it
-  calls `read()`, then feeds the result to your `checkpoint.load_state_dict()`.
-  It is deliberately lightweight — no subprocess, staging, or barriers — which is
-  why the manager can build one eagerly, and why it also suits eval- or
-  inference-only use on its own:
+For the common case you pass bare values and the manager picks sensible defaults:
+each item is copied during staging, written as one per-rank `torch.save` file,
+and read back directly. When you need to override that for a specific item, bind
+an `ItemSpec` to its key in the config — declared **once**, not rebuilt every
+save:
 
 ```python
-reader = CheckpointReader(rank_info=rank_info, storage_config=storage_config)
-loader = CheckpointLoader(reader=reader)
-loader.load(path, checkpoint)   # calls checkpoint.load_state_dict() for you
-loader.close()
+from torch_checkpointing import CheckpointManager, ItemSpec
+from torch_checkpointing.checkpoint_layout import LayoutInfo, SafetensorsSerialization
+from torch_checkpointing.dtensor_resharder import DTensorResharder
+
+manager = CheckpointManager(CheckpointManager.Config(
+    items={
+        "model": ItemSpec(
+            resharder=DTensorResharder(),                     # reshard on load
+            layout=LayoutInfo("model_{rank}.safetensors",     # custom on-disk layout
+                              SafetensorsSerialization()),
+        ),
+        "dataloader": ItemSpec(requires_copy=False),          # frozen snapshot: skip the staging copy
+    },
+))
 ```
+
+An `ItemSpec` carries the per-item "how":
+
+- **`requires_copy`** — whether staging deep-copies the value and moves device
+  tensors to host memory. Keep the default (`True`) for state the training loop
+  keeps mutating, so the background write can't race the loop. Set it `False`
+  only for stable, already host-resident data that will not change through the
+  write. Values sent to an async writer must be pickleable in either case.
+- **`layout`** — a `LayoutInfo` (`file_path` + serialization format) for where and
+  how the item is written. `None` uses the default per-rank `torch.save` layout. A
+  `{rank}` placeholder in `file_path` is filled with the current rank.
+- **`resharder`** — an optional `Resharder` for redistributing the item across a
+  different distributed layout on load (see §5).
+- **`required`** — whether the item must be present (fail fast if missing).
+
+`Config.items` maps keys to their specs; `Config.default` is the spec applied to
+any key **not** listed there (set `default=None` to make the config strict, so an
+un-listed key raises instead of using defaults). You never touch the schema for
+the common case — reach for `items` only to override a specific item.
 
 > How-to: [Configuring checkpoints](./configuring_checkpoints.md).
 
-## 4. `RankInfo`: single-rank and distributed
+## 4. Distributed: rank is auto-detected
 
-Every saver, reader, and loader needs to know where it sits in the world.
-`RankInfo` carries that:
+Every save and load needs to know where the process sits in the job. The manager
+**auto-detects** this from the default PyTorch process group: if
+`torch.distributed` is initialized it reads `get_rank()` / `get_world_size()`;
+otherwise it falls back to single-rank. The same code runs unchanged from a
+notebook to a large distributed job — you don't construct or pass rank
+information for the common case.
 
-```python
-@dataclass
-class RankInfo:
-    global_rank: int
-    global_world_size: int
-    role_rank: int
-    role_world_size: int
-```
-
-`global_rank` / `global_world_size` locate the process in the whole job;
-`role_rank` / `role_world_size` locate it within its role (trainer, evaluator,
-and so on).
-
-`CheckpointManager` and the factory functions (`make_async_checkpoint_saver`,
-`make_sync_checkpoint_saver`) **auto-detect** `RankInfo` when you don't pass one:
-
-- If `torch.distributed` is initialized, they read the default process group —
-  `global_rank`/`role_rank` from `get_rank()`, world sizes from
-  `get_world_size()`.
-- Otherwise they fall back to single-rank:
-  `RankInfo(global_world_size=1, global_rank=0, role_rank=0, role_world_size=1)`.
-
-For single-rank use (a notebook, a small eval job) you can construct it
-explicitly and skip process-group setup entirely:
-
-```python
-rank_info = RankInfo(
-    global_world_size=1, global_rank=0, role_rank=0, role_world_size=1
-)
-```
+Under the hood this is a `RankInfo` (`global_rank`/`global_world_size` locate the
+process in the whole job; `role_rank`/`role_world_size` within its role). You only
+deal with it directly for multi-role topologies or when driving the low-level
+savers by hand.
 
 > How-to: [Distributed checkpointing and resharding](./distributed_and_resharding.md).
 
-## 5. The storage abstraction
+## 5. Resharding on load
+
+A distributed checkpoint is *sharded*: each rank writes the slice of state it
+owns under a particular layout (world size, device mesh, placement).
+**Resharding** is loading a checkpoint whose saved layout differs from the one
+you're loading into — redistributing the stored shards so each target rank ends
+up with the slice it now owns. You need it whenever you resume on a different
+world size, device mesh, or parallelism strategy.
+
+You opt in per item by giving it a `resharder` in the config; the built-in
+`DTensorResharder` handles `DTensor` state, and you can write your own for other
+sharded types.
+
+```python
+manager = CheckpointManager(CheckpointManager.Config(
+    items={"model": ItemSpec(resharder=DTensorResharder())},
+))
+manager.save(path, {"model": model.state_dict()})     # records sharding metadata
+manager.load(path, into={"model": model.state_dict()})  # reshards onto the new layout
+```
+
+That is the whole contract: **declare a resharder and the manager does the
+rest.** It automatically records the source sharding metadata on save and wires
+the target metadata on load — the two-sided coordination that, with the
+lower-level API, you had to set up by hand in three places. An item with no
+resharder is read directly from the current rank's configured layout, with no
+redistribution or metadata overhead; this does not imply that the item is
+replicated.
+
+> How-to: [Distributed checkpointing and resharding](./distributed_and_resharding.md).
+
+## 6. The storage abstraction
 
 All I/O goes through a small two-type abstraction so the same checkpoint code can
 target a local disk, a network filesystem, or an object store.
 
 - **`StorageConfig`** is an abstract dataclass describing *which* backend and
-  *how* it's configured. Its one abstract method, `create_storage() -> Storage`,
-  builds the live backend.
-- **`Storage`** is the live backend — an abstract class exposing the primitive
-  operations the reader and writer need: `stream_read`, `stream_write`, `read`,
-  `write`, `delete`, `mkdir`, `rmdir`, `rename`, `ls`, `exists`, `getsize`,
-  `glob`, `isdir`, and `remap_path`.
+  *how* it's configured; its `create_storage() -> Storage` builds the live backend.
+- **`Storage`** is the live backend — the primitive read/write/rename/list
+  operations the library needs.
 
-You pass a `StorageConfig` to the `CheckpointManager` (via
-`Config.storage_config`), the factories, savers, and `CheckpointReader`; the
-library calls `create_storage()` internally. A local filesystem backend
-ships in the package:
+Pass a `StorageConfig` via `CheckpointManager.Config(storage_config=...)`; the
+library calls `create_storage()` internally. A local filesystem backend ships in
+the package and is the default:
 
 ```python
 from torch_checkpointing.storage.filesystem import LocalFileSystemStorageConfig
 
-storage_config = LocalFileSystemStorageConfig()
+manager = CheckpointManager(CheckpointManager.Config(
+    storage_config=LocalFileSystemStorageConfig(),
+))
 ```
 
 To target a different backend, implement a `StorageConfig` / `Storage` pair and
-pass your config wherever a `storage_config` is accepted. When no config is
-supplied, the factories default to `LocalFileSystemStorageConfig()`.
+pass your config. When none is supplied, the manager defaults to
+`LocalFileSystemStorageConfig()`.
 
-## 6. What "resharding" means
-
-A distributed checkpoint is *sharded*: each rank writes the slice of state it
-owns, under a particular parallelization layout (data-parallel, tensor-parallel,
-a specific device mesh and placement, a specific world size).
-
-**Resharding** is loading a checkpoint whose saved layout differs from the layout
-you're loading into — reassembling and redistributing the stored shards so each
-target rank ends up with the slice *it* now owns. You need it whenever you resume
-on a different world size, a different device mesh, or a different parallelism
-strategy than you saved with.
-
-The extensibility point is the abstract `Resharder`, attached per item via
-`CheckpointItem.resharder`. Its `should_reshard(...)` compares source and target
-sharding metadata to decide whether redistribution is needed for that item, and
-its `load(...)` performs the redistributed read into the target. A built-in
-`DTensorResharder` handles `DTensor` state; for state that isn't a plain
-`DTensor` you attach your own `Resharder` subclass — see
-[Extensibility](./extensibility.md) for the full list of extension points.
-
-Attaching a resharder is necessary but not sufficient: the loader must also be
-given a `MetadataManager` (for example `DefaultMetadataManager`), or the read
-silently falls back to a direct, non-resharded load. See the
-[distributed guide](./distributed_and_resharding.md) for the full save-and-load
-wiring.
-
-Items with no resharder are read back directly with no metadata overhead — the
-common case for single-rank or unchanged-layout resumes. When `should_reshard`
-determines the layouts match (or a resharder sets `skip_resharding = True`), the
-reader also takes this fast, direct path.
-
-> How-to: [Distributed checkpointing and resharding](./distributed_and_resharding.md).
+> How-to: [Storage](./storage.md).
 
 ## Where to go next
 
-- [README](../README.md) — installation and a runnable quick start.
-- [Configuring checkpoints](./configuring_checkpoints.md) — the `CheckpointItem`
-  fields (`value`, `requires_copy`, `layout`, `resharder`) in depth.
+- [Tutorial](./tutorials.md) — a runnable checkpoint-and-resume training loop.
+- [Configuring checkpoints](./configuring_checkpoints.md) — `ItemSpec` and the
+  `layout` / `requires_copy` / `resharder` options in depth.
 - [Distributed checkpointing and resharding](./distributed_and_resharding.md) —
-  `RankInfo`, distributed coordination, sharding metadata, and writing or
-  attaching a `Resharder`.
+  distributed coordination, sharding metadata, and writing a `Resharder`.
