@@ -48,7 +48,7 @@ Change how (and to which files) items are written — e.g. safetensors for tenso
 The stager copies device state to host memory before the background write. Customize it to change buffer strategy or add instrumentation.
 
 - **Interface:** `CheckpointStager` (`stage` / `close`) plus `CheckpointStagerConfig`.
-- **Built-in:** `DefaultStager` (pinned / shared memory, non-blocking copy — the accelerator-only paths are gated on `torch.accelerator`).
+- **Built-in:** `DefaultStager` (pinned / shared memory, non-blocking copy; pinned-memory support is currently CUDA-specific).
 
 ## Barriers — custom cross-rank coordination
 

@@ -254,6 +254,11 @@ storage pool; the base class returns `0` for stagers that do not pin memory.
 The saver configs live in `config.py` and simply compose the component configs:
 
 ```python
+@dataclass(kw_only=True)
+class CheckpointSaverConfig:
+    wait_timeout_secs: int | None = 600
+
+
 @dataclass
 class SyncCheckpointSaverConfig(CheckpointSaverConfig):
     writer_config: CheckpointWriterConfig = field(
@@ -274,10 +279,11 @@ class AsyncCheckpointSaverConfig(CheckpointSaverConfig):
     )
 ```
 
-The synchronous config carries only a `writer_config`, because the sync path has
-neither a stager nor a subprocess. The asynchronous config adds `staging_config`
-(the `CheckpointStagerConfig` above) and `process_config`
-(`CheckpointProcessConfig`, described next).
+The base config carries the timeout used by `CheckpointManager` when waiting for
+staging or writing to finish. The synchronous config adds only a `writer_config`,
+because the sync path has neither a stager nor a subprocess. The asynchronous
+config also adds `staging_config` (the `CheckpointStagerConfig` above) and
+`process_config` (`CheckpointProcessConfig`, described next).
 
 ## The write subprocess
 

@@ -260,6 +260,52 @@ class TestMakeCheckpointer(TestCase):
             # Clean up
             checkpointer.close()
 
+    def test_make_async_checkpoint_saver_propagates_zero_wait_timeout(self) -> None:
+        config = AsyncCheckpointSaverConfig(
+            wait_timeout_secs=0,
+            staging_config=CheckpointStagerConfig(
+                use_non_blocking_copy=False,
+                use_pinned_memory=False,
+            ),
+        )
+        checkpointer = make_async_checkpoint_saver(
+            config=config,
+            rank_info=self.rank_info,
+            storage_config=self.storage_config,
+        )
+
+        try:
+            with checkpointer.staging_lock.read:
+                with self.assertRaisesRegex(RuntimeError, "after 0 seconds"):
+                    checkpointer.save(
+                        os.path.join(self.temp_dir, "timeout_checkpoint"),
+                        SimpleCheckpoint(self.state_dict),
+                    )
+        finally:
+            checkpointer.close()
+
+    def test_make_async_checkpoint_saver_uses_default_lock_timeout_for_none(
+        self,
+    ) -> None:
+        config = AsyncCheckpointSaverConfig(
+            wait_timeout_secs=None,
+            staging_config=CheckpointStagerConfig(
+                use_non_blocking_copy=False,
+                use_pinned_memory=False,
+            ),
+        )
+        checkpointer = make_async_checkpoint_saver(
+            config=config,
+            rank_info=self.rank_info,
+            storage_config=self.storage_config,
+        )
+
+        try:
+            with checkpointer.staging_lock.read:
+                self.assertEqual(checkpointer.staging_lock.locked_mode(), "read")
+        finally:
+            checkpointer.close()
+
 
 if __name__ == "__main__":
     run_tests()

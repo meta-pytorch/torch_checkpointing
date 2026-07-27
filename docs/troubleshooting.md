@@ -16,16 +16,24 @@ manager = DefaultMetadataManager(rank_info=rank_info, should_cache_metadata=Fals
 
 ## Save fails on a CPU-only host (pinned memory / non-blocking copy)
 
-**Cause.** `CheckpointStagerConfig` defaults `use_pinned_memory` and `use_non_blocking_copy` to `True`, and those require an accelerator. On a CPU-only host they raise.
+**Cause.** `CheckpointStagerConfig` defaults `use_pinned_memory` and `use_non_blocking_copy` to `True`, and those currently require CUDA. On a CPU-only host they raise.
 
-**Fix.** With `CheckpointManager`, gate pinned memory on accelerator availability:
+**Fix.** With `CheckpointManager`, gate pinned memory on CUDA availability:
 
 ```python
 import torch
 from torch_checkpointing import CheckpointManager
+from torch_checkpointing.config import AsyncCheckpointSaverConfig
+from torch_checkpointing.staging import CheckpointStagerConfig
 
-manager = CheckpointManager.Config.async_save(
-    pinned_memory=torch.accelerator.is_available(),
+use_cuda = torch.cuda.is_available()
+manager = CheckpointManager.Config(
+    save=AsyncCheckpointSaverConfig(
+        staging_config=CheckpointStagerConfig(
+            use_pinned_memory=use_cuda,
+            use_non_blocking_copy=use_cuda,
+        )
+    )
 ).build()
 ```
 
@@ -35,8 +43,8 @@ If you configure a stager directly, gate both flags:
 from torch_checkpointing import CheckpointStagerConfig
 
 staging = CheckpointStagerConfig(
-    use_pinned_memory=torch.accelerator.is_available(),
-    use_non_blocking_copy=torch.accelerator.is_available(),
+    use_pinned_memory=torch.cuda.is_available(),
+    use_non_blocking_copy=torch.cuda.is_available(),
 )
 ```
 
@@ -54,7 +62,7 @@ staging = CheckpointStagerConfig(
 
 ```python
 def main():
-    manager = CheckpointManager.Config.async_save().build()
+    manager = CheckpointManager.Config.with_async_save().build()
     ...
 
 
@@ -62,7 +70,7 @@ if __name__ == "__main__":
     main()
 ```
 
-This is the standard requirement for any code using `multiprocessing` / `spawn` (including `torch.distributed`). A sync manager (`CheckpointManager.Config.sync_save()`) uses no subprocess and needs no guard.
+This is the standard requirement for any code using `multiprocessing` / `spawn` (including `torch.distributed`). A sync manager (`CheckpointManager.Config.with_sync_save()`) uses no subprocess and needs no guard.
 
 ## Load restored nothing (or only some keys)
 

@@ -32,16 +32,13 @@ from .builder import (
 )
 from .checkpoint_base import CheckpointBase, CheckpointItem
 from .checkpoint_loader import CheckpointLoader
-from .checkpoint_manager import (
-    CheckpointLoadConfig,
-    CheckpointManager,
-    CheckpointSaveConfig,
-)
+from .checkpoint_manager import CheckpointManager
 from .checkpoint_reader import CheckpointReader
 from .checkpoint_saver import AsyncCheckpointSaver, CheckpointSaver, SyncCheckpointSaver
 from .checkpoint_writer import CheckpointWriter, CheckpointWriterConfig
 from .config import (
     AsyncCheckpointSaverConfig,
+    CheckpointLoaderConfig,
     CheckpointSaverConfig,
     SyncCheckpointSaverConfig,
 )
@@ -83,13 +80,12 @@ __all__ = [
     "CheckpointItem",
     "CheckpointLoader",
     "CheckpointManager",
-    "CheckpointSaveConfig",
-    "CheckpointLoadConfig",
     "ItemSpec",
     "ItemKey",
     "CheckpointSaver",
     "SyncCheckpointSaver",
     "AsyncCheckpointSaver",
+    "CheckpointLoaderConfig",
     "CheckpointSaverConfig",
     "SyncCheckpointSaverConfig",
     "AsyncCheckpointSaverConfig",

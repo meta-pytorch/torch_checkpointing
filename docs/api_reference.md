@@ -13,9 +13,9 @@ A few live in submodules (noted below): layouts and serialization formats, the b
 | Symbol | Purpose |
 | --- | --- |
 | `CheckpointManager` | The high-level entry point; drives both `save()` and `load()`. |
-| `CheckpointManager.Config` | Manager configuration; call `.build()` to construct. Presets: `Config.async_save(pinned_memory=...)`, `Config.sync_save()`. |
-| `CheckpointSaveConfig` | Save-side config on `Config.save` (saver config, wait timeout). |
-| `CheckpointLoadConfig` | Load-side config on `Config.load` (`use_mmap`). |
+| `CheckpointManager.Config` | Manager configuration; call `.build()` to construct. Presets: `Config.with_async_save()`, `Config.with_sync_save()`. |
+| `AsyncCheckpointSaverConfig`, `SyncCheckpointSaverConfig` | Save-side config on `Config.save`, including `wait_timeout_secs`. |
+| `CheckpointLoaderConfig` | Load-side config on `Config.load` (`use_mmap`). |
 
 `manager.save(checkpoint_id, checkpoint)` returns `(stage_future, write_future)` for async saves, or `None` for sync. `manager.load(checkpoint_id, checkpoint, *, map_location=None, strict=False)` loads in place. Call `manager.close()` when done.
 

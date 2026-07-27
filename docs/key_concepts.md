@@ -14,7 +14,7 @@ build it from a config preset, then call `save()` and `load()` on it.
 ```python
 from torch_checkpointing import CheckpointManager
 
-manager = CheckpointManager.Config.async_save().build()   # or .sync_save()
+manager = CheckpointManager.Config.with_async_save().build()   # or .with_sync_save()
 ```
 
 An asynchronous save runs in two phases, and understanding the split is the key
@@ -51,7 +51,7 @@ The manager also serializes successive saves: the next `save()` call first waits
 on the previous `write_future` before staging again, so a slow write naturally
 back-pressures the loop instead of overlapping two writes.
 
-A sync manager (`CheckpointManager.Config.sync_save()`) runs the same logical
+A sync manager (`CheckpointManager.Config.with_sync_save()`) runs the same logical
 steps inline and `save()` returns `None` — no futures, no subprocess. Use it when
 you want the simplest possible behavior and don't mind blocking the loop.
 

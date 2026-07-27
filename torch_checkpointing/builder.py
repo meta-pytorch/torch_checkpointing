@@ -22,7 +22,11 @@ from .checkpoint_writer import (
     CheckpointWriter,
     CheckpointWriterArgs,
 )
-from .config import AsyncCheckpointSaverConfig, SyncCheckpointSaverConfig
+from .config import (
+    AsyncCheckpointSaverConfig,
+    DEFAULT_WAIT_TIMEOUT_SECS,
+    SyncCheckpointSaverConfig,
+)
 from .logging_utils import EventLogger
 from .metadata_manager import MetadataManager
 from .staging import DefaultStager
@@ -245,4 +249,9 @@ def make_async_checkpoint_saver(
         checkpoint_stager=checkpoint_stager,
         checkpoint_process=checkpoint_process,
         metadata_manager=checkpoint_metadata_manager,
+        lock_acquire_timeout=(
+            config.wait_timeout_secs
+            if config.wait_timeout_secs is not None
+            else DEFAULT_WAIT_TIMEOUT_SECS
+        ),
     )

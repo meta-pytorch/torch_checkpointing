@@ -43,49 +43,17 @@ from .checkpoint_reader import CheckpointReader
 from .checkpoint_saver import CheckpointSaver
 from .config import (
     AsyncCheckpointSaverConfig,
+    CheckpointLoaderConfig,
     CheckpointSaverConfig,
     SyncCheckpointSaverConfig,
 )
 from .logging_utils import EventLogger
 from .metadata_manager import DefaultMetadataManager, MetadataManager
 from .schema import _CheckpointSchema, ItemSpec
-from .staging import CheckpointStagerConfig
 from .storage.base_storage import StorageConfig
 from .storage.filesystem import LocalFileSystemStorageConfig
 from .types import ItemKey, STATE_DICT
 from .utils import ensure_future
-
-DEFAULT_WAIT_TIMEOUT_SECS = 600
-
-
-@dataclass(kw_only=True, slots=True)
-class CheckpointSaveConfig:
-    """
-    Save-side configuration for CheckpointManager.
-    """
-
-    saver_config: CheckpointSaverConfig = field(
-        default_factory=AsyncCheckpointSaverConfig
-    )
-    wait_timeout_secs: int | None = DEFAULT_WAIT_TIMEOUT_SECS
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.saver_config, CheckpointSaverConfig):
-            raise TypeError(
-                "saver_config must be a SyncCheckpointSaverConfig or "
-                "AsyncCheckpointSaverConfig"
-            )
-        if self.wait_timeout_secs is not None and self.wait_timeout_secs < 0:
-            raise ValueError("wait_timeout_secs must be non-negative or None")
-
-
-@dataclass(kw_only=True, slots=True)
-class CheckpointLoadConfig:
-    """
-    Load-side configuration for CheckpointManager.
-    """
-
-    use_mmap: bool = True
 
 
 class _DictCheckpoint(CheckpointBase):
@@ -121,8 +89,8 @@ class CheckpointManager:
         # makes the schema strict (an un-named key raises).
         items: Mapping[ItemKey, ItemSpec] = field(default_factory=dict)
         default: ItemSpec | None = field(default_factory=ItemSpec)
-        save: CheckpointSaveConfig = field(default_factory=CheckpointSaveConfig)
-        load: CheckpointLoadConfig = field(default_factory=CheckpointLoadConfig)
+        save: CheckpointSaverConfig = field(default_factory=AsyncCheckpointSaverConfig)
+        load: CheckpointLoaderConfig = field(default_factory=CheckpointLoaderConfig)
         storage_config: StorageConfig | None = None
         subprocess_init_fn: Callable[..., None] | None = None
         subprocess_init_args: tuple[Any, ...] = ()
@@ -133,31 +101,12 @@ class CheckpointManager:
             return CheckpointManager(config=self)
 
         @classmethod
-        def sync_save(cls) -> "CheckpointManager.Config":
-            return cls(
-                save=CheckpointSaveConfig(
-                    saver_config=SyncCheckpointSaverConfig(),
-                )
-            )
+        def with_sync_save(cls) -> "CheckpointManager.Config":
+            return cls(save=SyncCheckpointSaverConfig())
 
         @classmethod
-        def async_save(
-            cls,
-            *,
-            pinned_memory: bool = True,
-        ) -> "CheckpointManager.Config":
-            return cls(
-                save=CheckpointSaveConfig(
-                    saver_config=AsyncCheckpointSaverConfig(
-                        staging_config=CheckpointStagerConfig(
-                            use_pinned_memory=pinned_memory,
-                            use_shared_memory=True,
-                            use_async_staging=True,
-                            use_non_blocking_copy=pinned_memory,
-                        )
-                    )
-                )
-            )
+        def with_async_save(cls) -> "CheckpointManager.Config":
+            return cls(save=AsyncCheckpointSaverConfig())
 
     def __init__(self, config: "CheckpointManager.Config" | None = None) -> None:
         self._config = config or CheckpointManager.Config()
@@ -185,7 +134,7 @@ class CheckpointManager:
         else:
             self._metadata_manager = None
 
-        saver_config = self._config.save.saver_config
+        saver_config = self._config.save
         if isinstance(saver_config, SyncCheckpointSaverConfig):
             self._saver: CheckpointSaver = make_sync_checkpoint_saver(
                 config=saver_config,

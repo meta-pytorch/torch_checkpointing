@@ -32,6 +32,8 @@ from torch_checkpointing import (
     CheckpointManager,
     STATE_DICT,
 )
+from torch_checkpointing.config import AsyncCheckpointSaverConfig
+from torch_checkpointing.staging import CheckpointStagerConfig
 
 
 class TrainingState(CheckpointBase):
@@ -46,11 +48,16 @@ class TrainingState(CheckpointBase):
         self._state_dict.update(state_dict)
 
 
-# One manager drives both save and load. Rank info, storage, and metadata are
-# auto-configured. pinned_memory is gated on an accelerator so this snippet also
-# runs on CPU-only hosts.
-manager = CheckpointManager.Config.async_save(
-    pinned_memory=torch.accelerator.is_available(),
+# One manager drives both save and load. This example gates CUDA-specific
+# staging features so it also runs on CPU-only hosts.
+use_cuda = torch.cuda.is_available()
+manager = CheckpointManager.Config(
+    save=AsyncCheckpointSaverConfig(
+        staging_config=CheckpointStagerConfig(
+            use_pinned_memory=use_cuda,
+            use_non_blocking_copy=use_cuda,
+        )
+    )
 ).build()
 
 state = TrainingState({"model": torch.nn.Linear(10, 5).state_dict(), "step": 0})
@@ -73,7 +80,7 @@ write_future.result()
 manager.close()
 ```
 
-Prefer a blocking save? Use `CheckpointManager.Config.sync_save()` — `save()` writes inline and returns `None`; `load()` is unchanged.
+Prefer a blocking save? Use `CheckpointManager.Config.with_sync_save()` — `save()` writes inline and returns `None`; `load()` is unchanged.
 
 ## Key features
 

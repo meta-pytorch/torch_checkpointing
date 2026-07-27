@@ -13,15 +13,14 @@ from unittest import mock
 import pytest
 import torch
 from torch_checkpointing.checkpoint_base import CheckpointBase, CheckpointItem
-from torch_checkpointing.checkpoint_manager import (
-    CheckpointLoadConfig,
-    CheckpointManager,
-)
+from torch_checkpointing.checkpoint_manager import CheckpointManager
 from torch_checkpointing.config import (
     AsyncCheckpointSaverConfig,
+    CheckpointLoaderConfig,
     SyncCheckpointSaverConfig,
 )
 from torch_checkpointing.schema import ItemSpec
+from torch_checkpointing.staging import CheckpointStagerConfig
 from torch_checkpointing.storage.filesystem import LocalFileSystemStorageConfig
 from torch_checkpointing.types import STATE_DICT
 
@@ -31,6 +30,17 @@ def _payload() -> dict[str, Any]:
         "model": torch.arange(4),
         "step": 10,
     }
+
+
+def _async_config_without_accelerator() -> CheckpointManager.Config:
+    return CheckpointManager.Config(
+        save=AsyncCheckpointSaverConfig(
+            staging_config=CheckpointStagerConfig(
+                use_pinned_memory=False,
+                use_non_blocking_copy=False,
+            )
+        )
+    )
 
 
 class FakeStager:
@@ -67,41 +77,49 @@ class FakeSaver:
         self.closed = True
 
 
-def test_async_save_config_defaults_to_pinned_memory() -> None:
-    config = CheckpointManager.Config.async_save()
+def test_with_async_save_defaults_to_pinned_memory() -> None:
+    config = CheckpointManager.Config.with_async_save()
 
-    assert isinstance(config.save.saver_config, AsyncCheckpointSaverConfig)
-    assert config.save.saver_config.staging_config.use_pinned_memory
-    assert config.save.saver_config.staging_config.use_shared_memory
-    assert config.save.saver_config.staging_config.use_async_staging
-    assert config.save.saver_config.staging_config.use_non_blocking_copy
-
-
-def test_async_save_config_can_disable_pinned_memory() -> None:
-    config = CheckpointManager.Config.async_save(pinned_memory=False)
-
-    assert isinstance(config.save.saver_config, AsyncCheckpointSaverConfig)
-    assert not config.save.saver_config.staging_config.use_pinned_memory
-    assert config.save.saver_config.staging_config.use_shared_memory
-    assert config.save.saver_config.staging_config.use_async_staging
-    assert not config.save.saver_config.staging_config.use_non_blocking_copy
+    assert isinstance(config.save, AsyncCheckpointSaverConfig)
+    assert config.save.wait_timeout_secs == 600
+    assert config.save.staging_config.use_pinned_memory
+    assert config.save.staging_config.use_shared_memory
+    assert config.save.staging_config.use_async_staging
+    assert config.save.staging_config.use_non_blocking_copy
 
 
-def test_sync_save_config_uses_sync_saver_config() -> None:
-    config = CheckpointManager.Config.sync_save()
+def test_async_saver_config_can_disable_accelerator_features() -> None:
+    config = _async_config_without_accelerator()
 
-    assert isinstance(config.save.saver_config, SyncCheckpointSaverConfig)
+    assert isinstance(config.save, AsyncCheckpointSaverConfig)
+    assert not config.save.staging_config.use_pinned_memory
+    assert config.save.staging_config.use_shared_memory
+    assert config.save.staging_config.use_async_staging
+    assert not config.save.staging_config.use_non_blocking_copy
+
+
+def test_with_sync_save_uses_sync_saver_config() -> None:
+    config = CheckpointManager.Config.with_sync_save()
+
+    assert isinstance(config.save, SyncCheckpointSaverConfig)
+
+
+def test_saver_config_validates_wait_timeout() -> None:
+    assert AsyncCheckpointSaverConfig(wait_timeout_secs=None).wait_timeout_secs is None
+
+    with pytest.raises(ValueError, match="non-negative or None"):
+        AsyncCheckpointSaverConfig(wait_timeout_secs=-1)
 
 
 def test_config_has_default_load_config() -> None:
     config = CheckpointManager.Config()
 
-    assert isinstance(config.load, CheckpointLoadConfig)
+    assert isinstance(config.load, CheckpointLoaderConfig)
     assert config.load.use_mmap is True
 
 
 def test_sync_save_returns_none_and_writes_checkpoint(tmp_path: Path) -> None:
-    config = CheckpointManager.Config.sync_save()
+    config = CheckpointManager.Config.with_sync_save()
     config.storage_config = LocalFileSystemStorageConfig(use_direct_io=False)
     manager = config.build()
 
@@ -116,8 +134,8 @@ def test_sync_save_returns_none_and_writes_checkpoint(tmp_path: Path) -> None:
 
 
 def test_async_save_prewarms_staging_and_writes_checkpoint(tmp_path: Path) -> None:
-    config = CheckpointManager.Config.async_save(pinned_memory=False)
-    assert isinstance(config.save.saver_config, AsyncCheckpointSaverConfig)
+    config = _async_config_without_accelerator()
+    assert isinstance(config.save, AsyncCheckpointSaverConfig)
     config.save.wait_timeout_secs = 30
     config.storage_config = LocalFileSystemStorageConfig(use_direct_io=False)
     manager = config.build()
@@ -138,7 +156,7 @@ def test_async_save_prewarms_staging_and_writes_checkpoint(tmp_path: Path) -> No
 
 def test_prewarm_staging_stages_only_requires_copy_items() -> None:
     stager = FakeStager()
-    config = CheckpointManager.Config.async_save(pinned_memory=False)
+    config = _async_config_without_accelerator()
     config.save.wait_timeout_secs = 0
     # model uses the permissive default (requires_copy=True); step opts out.
     config.items = {"step": ItemSpec(requires_copy=False)}
@@ -162,7 +180,7 @@ def test_prewarm_staging_stages_only_requires_copy_items() -> None:
 
 
 def test_sync_save_then_load_round_trip(tmp_path: Path) -> None:
-    config = CheckpointManager.Config.sync_save()
+    config = CheckpointManager.Config.with_sync_save()
     config.storage_config = LocalFileSystemStorageConfig(use_direct_io=False)
     manager = config.build()
 
@@ -182,7 +200,7 @@ def test_sync_save_then_load_round_trip(tmp_path: Path) -> None:
 
 
 def test_async_save_then_load_round_trip(tmp_path: Path) -> None:
-    config = CheckpointManager.Config.async_save(pinned_memory=False)
+    config = _async_config_without_accelerator()
     config.save.wait_timeout_secs = 30
     config.storage_config = LocalFileSystemStorageConfig(use_direct_io=False)
     manager = config.build()
@@ -205,7 +223,7 @@ def test_async_save_then_load_round_trip(tmp_path: Path) -> None:
 
 
 def test_save_strict_schema_rejects_unknown_key(tmp_path: Path) -> None:
-    config = CheckpointManager.Config.sync_save()
+    config = CheckpointManager.Config.with_sync_save()
     config.storage_config = LocalFileSystemStorageConfig(use_direct_io=False)
     config.items = {"model": ItemSpec()}
     config.default = None  # strict: only declared keys allowed
@@ -220,7 +238,7 @@ def test_save_strict_schema_rejects_unknown_key(tmp_path: Path) -> None:
 
 
 def test_load_on_closed_manager_raises() -> None:
-    manager = CheckpointManager.Config.sync_save().build()
+    manager = CheckpointManager.Config.with_sync_save().build()
     manager.close()
 
     with pytest.raises(RuntimeError, match="closed"):

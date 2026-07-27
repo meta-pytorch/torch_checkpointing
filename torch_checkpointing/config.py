@@ -5,7 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 """
-Configuration classes for checkpoint saver construction.
+Configuration classes for checkpoint saver and loader construction.
 """
 
 from dataclasses import dataclass, field
@@ -14,11 +14,30 @@ from .checkpoint_process import CheckpointProcessConfig
 from .checkpoint_writer import CheckpointWriterConfig
 from .staging import CheckpointStagerConfig
 
+DEFAULT_WAIT_TIMEOUT_SECS = 600
 
+
+@dataclass(kw_only=True)
 class CheckpointSaverConfig:
-    """Base class for checkpoint saver configurations."""
+    """Base configuration shared by checkpoint savers.
 
-    pass
+    Attributes:
+        wait_timeout_secs: Maximum time ``CheckpointManager`` waits for staging
+            or writing to finish. ``None`` disables the timeout.
+    """
+
+    wait_timeout_secs: int | None = DEFAULT_WAIT_TIMEOUT_SECS
+
+    def __post_init__(self) -> None:
+        if self.wait_timeout_secs is not None and self.wait_timeout_secs < 0:
+            raise ValueError("wait_timeout_secs must be non-negative or None")
+
+
+@dataclass(kw_only=True)
+class CheckpointLoaderConfig:
+    """Configuration for checkpoint loading."""
+
+    use_mmap: bool = True
 
 
 @dataclass
