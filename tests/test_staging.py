@@ -205,12 +205,33 @@ class TestDefaultStager(TestCase):
 
     def test_cuda_non_blocking_without_cuda(self) -> None:
         """Test that non-blocking copy fails when CUDA is not available."""
-        if torch.cuda.is_available():
-            self.skipTest("CUDA is available, cannot test CUDA unavailable scenario")
+        with (
+            patch("torch.accelerator.is_available", return_value=False),
+            patch("torch.cuda.is_available", return_value=False),
+        ):
+            options = CheckpointStagerConfig(
+                use_pinned_memory=True, use_non_blocking_copy=True
+            )
+            with self.assertRaises(AssertionError):
+                DefaultStager(options)
 
-        options = CheckpointStagerConfig(use_non_blocking_copy=True)
-        with self.assertRaises(AssertionError):
-            DefaultStager(options)
+    def test_config_defaults_to_pinned_memory_if_available(self) -> None:
+        for can_pin_memory_value in [False, True]:
+            with self.subTest(can_pin_memory_value=can_pin_memory_value):
+                # Note, we need to mock `torch.cuda` here, mocking `can_pin_memory` is not sufficient.
+                with (
+                    patch("torch.cuda.is_available", return_value=can_pin_memory_value),
+                    patch(
+                        "torch.cuda.cudart",
+                        return_value=object() if can_pin_memory_value else None,
+                    ),
+                ):
+                    config = CheckpointStagerConfig()
+
+                assert config.use_pinned_memory == can_pin_memory_value
+                assert config.use_shared_memory
+                assert config.use_async_staging
+                assert config.use_non_blocking_copy == can_pin_memory_value
 
     def test_different_option_combinations(self) -> None:
         """Test various combinations of staging options."""

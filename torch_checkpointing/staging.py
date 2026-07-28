@@ -27,11 +27,12 @@ import logging
 from collections.abc import Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TypeVar
 
 import torch
 
+from ._pin_memory_utils import can_pin_memory
 from ._state_dict_stager import StateDictStager
 from .logging_utils import EventLogger, EventType
 from .types import STATE_DICT
@@ -104,24 +105,26 @@ class CheckpointStagerConfig:
     Attributes:
         use_pinned_memory (bool): Enable pinned memory allocation for faster
             CPU-GPU transfers. Requires CUDA to be available. Default: True
-        use_shared_memory (bool): Enable shared memory for multi-process
-            scenarios. Useful when multiple processes need access to the
-            same staged data. Default: True
+            if CUDA is available, False otherwise
+        use_shared_memory (bool): Enable writing to shared memory tensors for
+            zero-copy transfer to the checkpointing subprocess. Default: True
         use_async_staging (bool): Enable asynchronous staging using a
             background thread pool. Allows overlapping computation with
-            staging operations. Requires CUDA. Default: True
+            staging operations. Default: True
         use_non_blocking_copy (bool): Use non-blocking device memory
             copies with stream synchronization. Improves performance by
-            allowing CPU work to continue during GPU transfers. Default: True
+            allowing CPU work to continue during GPU transfers. Only effective
+            on pinned_memory tensors (non-pinned tensors are always a blocking
+            copy). Default: True if CUDA is available, False otherwise
 
     Note:
         CUDA-dependent features will raise exception if CUDA is not available.
     """
 
-    use_pinned_memory: bool = True
+    use_pinned_memory: bool = field(default_factory=can_pin_memory)
     use_shared_memory: bool = True
     use_async_staging: bool = True
-    use_non_blocking_copy: bool = True
+    use_non_blocking_copy: bool = field(default_factory=can_pin_memory)
     thread_name: str = "ckpt-staging"
     metric_prefix: str = "train.checkpoint_write"
 

@@ -77,15 +77,27 @@ class FakeSaver:
         self.closed = True
 
 
-def test_with_async_save_defaults_to_pinned_memory() -> None:
-    config = CheckpointManager.Config.with_async_save()
+@pytest.mark.parametrize("can_pin_memory_value", [False, True])
+def test_with_async_save_defaults_to_pinned_memory_if_available(
+    can_pin_memory_value: bool,
+) -> None:
+    # When the host can pin memory, async_save() enables pinning (and, with it,
+    # non-blocking copies) by default.
+    # Note, we need to mock `torch.cuda` here, mocking `can_pin_memory` is not sufficient.
+    with (
+        mock.patch("torch.cuda.is_available", return_value=can_pin_memory_value),
+        mock.patch(
+            "torch.cuda.cudart", return_value=object() if can_pin_memory_value else None
+        ),
+    ):
+        config = CheckpointManager.Config.with_async_save()
 
     assert isinstance(config.save, AsyncCheckpointSaverConfig)
     assert config.save.wait_timeout_secs == 600
-    assert config.save.staging_config.use_pinned_memory
+    assert config.save.staging_config.use_pinned_memory == can_pin_memory_value
     assert config.save.staging_config.use_shared_memory
     assert config.save.staging_config.use_async_staging
-    assert config.save.staging_config.use_non_blocking_copy
+    assert config.save.staging_config.use_non_blocking_copy == can_pin_memory_value
 
 
 def test_async_saver_config_can_disable_accelerator_features() -> None:

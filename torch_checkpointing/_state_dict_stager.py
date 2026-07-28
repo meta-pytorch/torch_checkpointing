@@ -253,7 +253,10 @@ class StateDictStager:
             The optimized storage
         """
         cpu_storage = self._storage_manager.get(storage.nbytes())
-        cpu_storage.copy_(storage, non_blocking=self._use_non_blocking_copy)
+        cpu_storage.copy_(
+            storage,
+            non_blocking=cpu_storage.is_pinned() and self._use_non_blocking_copy,
+        )
         return cpu_storage
 
     @torch.no_grad()

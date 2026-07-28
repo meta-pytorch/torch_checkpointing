@@ -7,6 +7,11 @@
 import torch
 
 
+def can_pin_memory() -> bool:
+    # Currently we only support pinning memory on CUDA devices
+    return torch.cuda.is_available() and torch.cuda.cudart() is not None
+
+
 def pin_memory(data_ptr: int, size: int) -> None:
     cudart = torch.cuda.cudart()
     assert cudart is not None, "CUDA runtime not available"
