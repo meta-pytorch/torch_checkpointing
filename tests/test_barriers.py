@@ -15,16 +15,6 @@ from torch_checkpointing.barriers import (
 )
 from torch_checkpointing.types import RankInfo
 
-# Multi-rank barrier tests spawn multiple processes; gate them on an
-# accelerator so they only run in a multi-GPU environment.
-pytestmark = [
-    pytest.mark.gpus_needed_4,
-    pytest.mark.skipif(
-        not torch.accelerator.is_available(),
-        reason="requires an accelerator (multi-rank barrier coordination)",
-    ),
-]
-
 
 @pytest.fixture
 def master_rank_info():
@@ -144,6 +134,30 @@ def test_execute_barrier(mock_barrier, mock_tcpstore, master_rank_info):
         world_size=master_rank_info.role_world_size,
         key_prefix="1",
         barrier_timeout=timeout_secs,
+    )
+
+
+@mock.patch("torch.distributed.TCPStore")
+@mock.patch("torch.distributed.elastic.utils.store.barrier")
+def test_execute_barrier_with_key_prefix(mock_barrier, mock_tcpstore, master_rank_info):
+    mock_tcpstore_instance = mock.MagicMock()
+    mock_tcpstore.return_value = mock_tcpstore_instance
+    barrier = TCPStoreBarrierConfig(
+        timeout_barrier_init_sec=60,
+        use_checkpoint_barrier_tcpstore_libuv=True,
+        tcpstore_port=12345,
+        master_address="localhost",
+        key_prefix="tenant-a/",
+    ).create_barrier(master_rank_info)
+
+    barrier.execute_barrier(timeout_secs=30)
+
+    mock_tcpstore_instance.set.assert_called_once_with("tenant-a/rank0", "0")
+    mock_barrier.assert_called_once_with(
+        store=mock_tcpstore_instance,
+        world_size=master_rank_info.role_world_size,
+        key_prefix="tenant-a/0",
+        barrier_timeout=30,
     )
 
 
@@ -296,6 +310,13 @@ def _run_barrier_worker(rank, world_size, port, timeout=3, miss_barrier=False):
         barrier.execute_barrier(timeout_secs=timeout)
 
 
+# Multi-rank barrier tests spawn multiple processes; gate them on an
+# accelerator so they only run in a multi-GPU environment.
+@pytest.mark.gpus_needed_4
+@pytest.mark.skipif(
+    not torch.accelerator.is_available(),
+    reason="requires an accelerator (multi-rank barrier coordination)",
+)
 def test_tcpstore_barrier_execute():
     """Test TCPStoreBarrier with a real TCPStore (no mocks)."""
     world_size = 4
@@ -313,6 +334,11 @@ def test_tcpstore_barrier_execute():
             )
 
 
+@pytest.mark.gpus_needed_4
+@pytest.mark.skipif(
+    not torch.accelerator.is_available(),
+    reason="requires an accelerator (multi-rank barrier coordination)",
+)
 @pytest.mark.parametrize("missed_rank", [0, 2])
 def test_tcpstore_barrier_timeout_on_missing_rank(missed_rank: int):
     """Test that barrier times out when one rank is too slow to get to the barrier."""

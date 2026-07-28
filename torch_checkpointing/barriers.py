@@ -42,11 +42,15 @@ class BarrierConfig(abc.ABC):
 
 @dataclass
 class TCPStoreBarrierConfig(BarrierConfig):
-    """Configuration for TCPStoreBarrier."""
+    """Configuration for TCPStoreBarrier.
+
+    ``key_prefix`` isolates independent barriers that share a TCPStore endpoint.
+    """
 
     use_checkpoint_barrier_tcpstore_libuv: bool
     tcpstore_port: int
     master_address: str
+    key_prefix: str = ""
 
     def create_barrier(self, rank_info: RankInfo) -> "TCPStoreBarrier":
         """Create a TCPStoreBarrier instance from this configuration."""
@@ -158,6 +162,9 @@ class TCPStoreBarrier(Barrier):
             wait_for_workers=False,  # Don't wait for non-master nodes to connect
         )
 
+    def _namespace_key(self, key: str) -> str:
+        return f"{self._config.key_prefix}{key}"
+
     def execute_barrier(self, timeout_secs: int) -> None:
         """
         Execute a synchronization barrier.
@@ -179,14 +186,15 @@ class TCPStoreBarrier(Barrier):
 
         # Set the rank's barrier sequence number
         self._tcp_store.set(
-            _rank_key(self._rank_info.role_rank), str(self._tcp_store_barrier_seq)
+            self._namespace_key(_rank_key(self._rank_info.role_rank)),
+            str(self._tcp_store_barrier_seq),
         )
 
         # Execute barrier for that sequence number
         store_util.barrier(
             store=self._tcp_store,
             world_size=self._rank_info.role_world_size,
-            key_prefix=str(self._tcp_store_barrier_seq),
+            key_prefix=self._namespace_key(str(self._tcp_store_barrier_seq)),
             barrier_timeout=timeout_secs,
         )
         self._tcp_store_barrier_seq += 1
