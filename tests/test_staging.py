@@ -4,7 +4,10 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import json
 from concurrent.futures import Future
+from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 
 import pytest
@@ -512,6 +515,72 @@ class TestDefaultStager(TestCase):
         pinned_ptrs = {call.args[0] for call in mock_pin.call_args_list}
         unpinned_ptrs = {call.args[0] for call in mock_unpin.call_args_list}
         assert pinned_ptrs == unpinned_ptrs
+        assert stager.pinned_num_bytes() == 0
+
+        # Repeated cleanup must not unpin or release the same storage twice.
+        stager.close()
+        assert mock_unpin.call_count == 4
+        assert stager.pinned_num_bytes() == 0
+        assert {call.args[0] for call in mock_unpin.call_args_list} == unpinned_ptrs
+
+
+@requires_cuda
+@pytest.mark.gpus_needed_1
+def test_default_stager_copies_run_on_side_stream(tmp_path: Path) -> None:
+    stager = DefaultStager(
+        CheckpointStagerConfig(
+            use_async_staging=True,
+            use_pinned_memory=True,
+            use_shared_memory=True,
+            use_non_blocking_copy=True,
+        )
+    )
+    try:
+        size = 2048
+        left = torch.randn(size, size, device="cuda")
+        right = torch.randn(size, size, device="cuda")
+        torch.cuda.synchronize()
+
+        with torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ]
+        ) as profiler:
+            result = left @ right
+            staged = ensure_future(stager.stage({"result": result})).result()
+            torch.cuda.synchronize()
+
+        torch.testing.assert_close(staged["result"], result.cpu())
+
+        trace_path = tmp_path / "staging_trace.json"
+        profiler.export_chrome_trace(str(trace_path))
+        trace_events: list[dict[str, Any]] = json.loads(trace_path.read_text())[
+            "traceEvents"
+        ]
+
+        def event_stream(event: dict[str, Any]) -> int | None:
+            stream = event.get("args", {}).get("stream")
+            return stream if isinstance(stream, int) else None
+
+        dtoh_streams = {
+            stream
+            for event in trace_events
+            if "dtoh" in str(event.get("name", "")).lower()
+            and (stream := event_stream(event)) is not None
+        }
+        compute_streams = {
+            stream
+            for event in trace_events
+            if str(event.get("cat", "")).lower() == "kernel"
+            and (stream := event_stream(event)) is not None
+        }
+        assert dtoh_streams, "Expected a profiled device-to-host staging copy"
+        assert compute_streams, "Expected a profiled CUDA compute kernel"
+        assert len(dtoh_streams) == 1
+        assert dtoh_streams.isdisjoint(compute_streams)
+    finally:
+        stager.close()
 
 
 class TestStorageManager(TestCase):
