@@ -58,6 +58,7 @@ class EventType(StrEnum):
 
     CHECKPOINT_SAVED_TMP = "checkpoint_saved_tmp"
     CHECKPOINT_SAVED = "checkpoint_saved"
+    CHECKPOINT_ERROR = "checkpoint_error"
 
     # Logging events for mainly logging metric
     LOG_METRIC = "log_metric"
