@@ -118,9 +118,11 @@ class CheckpointManager:
         self._write_future: Future[Any] | None = None
         self._closed = False
 
+        self._storage_config = (
+            self._config.storage_config or LocalFileSystemStorageConfig()
+        )
         rank_info = _get_default_rank_info()
         self._rank = rank_info.global_rank
-        storage_config = self._config.storage_config or LocalFileSystemStorageConfig()
 
         # Auto-wire a metadata manager when any item declares a resharder, so a
         # resharding load cannot silently fall back to the layout-unchanged fast
@@ -141,7 +143,7 @@ class CheckpointManager:
                 rank_info=rank_info,
                 pre_finalize_callback=self._config.pre_finalize_callback,
                 finalize_callback=self._config.finalize_callback,
-                storage_config=storage_config,
+                storage_config=self._storage_config,
                 checkpoint_metadata_manager=self._metadata_manager,
             )
         elif isinstance(saver_config, AsyncCheckpointSaverConfig):
@@ -152,7 +154,7 @@ class CheckpointManager:
                 finalize_callback=self._config.finalize_callback,
                 subprocess_init_fn=self._config.subprocess_init_fn,
                 subprocess_init_args=self._config.subprocess_init_args,
-                storage_config=storage_config,
+                storage_config=self._storage_config,
                 checkpoint_metadata_manager=self._metadata_manager,
             )
         else:
@@ -162,7 +164,7 @@ class CheckpointManager:
 
         self._reader = CheckpointReader(
             rank_info=rank_info,
-            storage_config=storage_config,
+            storage_config=self._storage_config,
             disable_use_mmap_backed_storage_on_load=not self._config.load.use_mmap,
         )
         self._loader = CheckpointLoader(

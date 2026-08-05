@@ -22,10 +22,14 @@ class CheckpointSaverConfig:
     """Base configuration shared by checkpoint savers.
 
     Attributes:
+        writer_config: Configuration options for the checkpoint writer component.
         wait_timeout_secs: Maximum time ``CheckpointManager`` waits for staging
             or writing to finish. ``None`` disables the timeout.
     """
 
+    writer_config: CheckpointWriterConfig = field(
+        default_factory=CheckpointWriterConfig
+    )
     wait_timeout_secs: int | None = DEFAULT_WAIT_TIMEOUT_SECS
 
     def __post_init__(self) -> None:
@@ -49,9 +53,7 @@ class SyncCheckpointSaverConfig(CheckpointSaverConfig):
         writer_config: Configuration options for the checkpoint writer component.
     """
 
-    writer_config: CheckpointWriterConfig = field(
-        default_factory=CheckpointWriterConfig
-    )
+    pass
 
 
 @dataclass
@@ -65,9 +67,6 @@ class AsyncCheckpointSaverConfig(CheckpointSaverConfig):
         process_config: Configuration options for the async checkpoint process component.
     """
 
-    writer_config: CheckpointWriterConfig = field(
-        default_factory=CheckpointWriterConfig
-    )
     staging_config: CheckpointStagerConfig = field(
         default_factory=CheckpointStagerConfig
     )

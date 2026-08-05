@@ -65,7 +65,9 @@ class FakeSaver:
         return self._stager
 
     def save(
-        self, path: str, checkpoint: CheckpointBase
+        self,
+        path: str,
+        checkpoint: CheckpointBase,
     ) -> tuple[Future[Any], Future[Any]]:
         staging_future: Future[Any] = Future()
         write_future: Future[Any] = Future()
@@ -145,6 +147,31 @@ def test_sync_save_returns_none_and_writes_checkpoint(tmp_path: Path) -> None:
         manager.close()
 
 
+def test_sync_save_runs_finalize_callback_after_checkpoint_write(
+    tmp_path: Path,
+) -> None:
+    config = CheckpointManager.Config.with_sync_save()
+    config.storage_config = LocalFileSystemStorageConfig(use_direct_io=False)
+    checkpoint_path = os.path.join(tmp_path, "sync_checkpoint")
+    finalize_observed_checkpoint: list[bool] = []
+
+    def finalize_callback(checkpoint_id: str, _event_logger: Any) -> None:
+        assert checkpoint_id == checkpoint_path
+        finalize_observed_checkpoint.append(
+            os.path.exists(os.path.join(checkpoint_path, "model_0.pt"))
+        )
+
+    config.finalize_callback = finalize_callback
+    manager = config.build()
+
+    try:
+        assert manager.save(checkpoint_path, _payload()) is None
+
+        assert finalize_observed_checkpoint == [True]
+    finally:
+        manager.close()
+
+
 def test_async_save_prewarms_staging_and_writes_checkpoint(tmp_path: Path) -> None:
     config = _async_config_without_accelerator()
     assert isinstance(config.save, AsyncCheckpointSaverConfig)
@@ -162,6 +189,32 @@ def test_async_save_prewarms_staging_and_writes_checkpoint(tmp_path: Path) -> No
 
         assert os.path.exists(os.path.join(checkpoint_path, "model_0.pt"))
         assert os.path.exists(os.path.join(checkpoint_path, "step_0.pt"))
+    finally:
+        manager.close()
+
+
+def test_async_save_config_forwards_finalize_callback_to_builder() -> None:
+    stager = FakeStager()
+    config = _async_config_without_accelerator()
+    fake_saver = FakeSaver(stager)
+
+    def finalize_callback(checkpoint_id: str, _event_logger: Any) -> None:
+        assert checkpoint_id == "checkpoint"
+
+    config.finalize_callback = finalize_callback
+    with mock.patch(
+        "torch_checkpointing.checkpoint_manager.make_async_checkpoint_saver",
+        return_value=fake_saver,
+    ) as make_saver:
+        manager = config.build()
+
+    assert make_saver.call_args is not None
+    assert make_saver.call_args.kwargs["finalize_callback"] is finalize_callback
+
+    try:
+        write_future = manager.save("checkpoint", _payload())
+        assert write_future is not None
+        write_future.result(timeout=1)
     finally:
         manager.close()
 
