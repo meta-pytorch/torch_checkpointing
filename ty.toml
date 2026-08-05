@@ -1,0 +1,22 @@
+# Translated from pyrefly.toml for Buildkite's ty typecheck.
+
+[environment]
+python-version = "3.10"
+
+[analysis]
+allowed-unresolved-imports = [
+    "oil.fuse.experimental.storageAdapterSharedMemRpc.**",
+]
+
+[rules]
+invalid-argument-type = "ignore"
+invalid-assignment = "ignore"
+invalid-return-type = "ignore"
+possibly-missing-import = "ignore"
+possibly-missing-submodule = "ignore"
+unresolved-import = "ignore"
+unsupported-operator = "ignore"
+unused-type-ignore-comment = "ignore"
+
+[terminal]
+error-on-warning = false
