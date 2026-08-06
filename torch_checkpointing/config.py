@@ -42,6 +42,13 @@ class CheckpointLoaderConfig:
     """Configuration for checkpoint loading."""
 
     use_mmap: bool = True
+    verify_integrity: bool = False
+    """If True, verify the ``_integrity_manifest.json`` (if present)
+    before loading any weights.  A hash mismatch raises
+    ``CheckpointingException`` and the load is rejected.  If the manifest
+    is absent (e.g. the checkpoint was saved without ``verify_integrity``
+    on the writer side), the load proceeds silently — old checkpoints
+    remain loadable without ignorable WARNING noise."""
 
 
 @dataclass
