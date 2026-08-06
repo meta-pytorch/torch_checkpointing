@@ -14,6 +14,7 @@ determining checkpoint layout and configuring the reader.
 import json
 import logging
 import pickle
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -41,6 +42,7 @@ from .distributed_metadata import (
 )
 from .logging_utils import EventLogger, EventType
 from .storage.base_storage import Storage, StorageConfig
+from .storage.torch_serialization import MmapFill
 from .types import CheckpointPath, NestedPath, RankInfo, STATE_DICT
 from .utils import from_dict
 from .walk_utils import walk_checkpoint_structure
@@ -79,6 +81,7 @@ class CheckpointReader:
         rank_info: RankInfo,
         storage_config: StorageConfig,
         disable_use_mmap_backed_storage_on_load: bool = False,
+        mmap_fill_factory: Callable[[Storage], MmapFill | None] | None = None,
     ):
         """
         Initialize a CheckpointReader.
@@ -91,6 +94,8 @@ class CheckpointReader:
                 default (False) routes loads through a single mmap-backed
                 overall storage to reduce allocator fragmentation after load
                 cleanup.
+            mmap_fill_factory: Optional factory for a storage-specific mmap
+                fill callback. It is resolved only for mmap-backed torch loads.
         """
 
         self._rank_info = rank_info
@@ -98,6 +103,7 @@ class CheckpointReader:
         self._disable_use_mmap_backed_storage_on_load = (
             disable_use_mmap_backed_storage_on_load
         )
+        self._mmap_fill_factory = mmap_fill_factory
 
     def read(
         self,
@@ -517,6 +523,11 @@ class CheckpointReader:
                     file_path,
                     self._storage,
                     map_location=map_location,
+                    mmap_fill=(
+                        self._mmap_fill_factory(self._storage)
+                        if self._mmap_fill_factory is not None
+                        else None
+                    ),
                 )
 
             with self._storage.stream_read(file_path) as f:

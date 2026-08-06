@@ -6,10 +6,12 @@
 
 import gc
 import io
+import logging
 import mmap
 from pathlib import Path
 from typing import Any
 
+import pytest
 import torch
 from torch_checkpointing.storage.torch_serialization import (
     _mmap_as_storage,
@@ -169,6 +171,202 @@ def _big_checkpoint() -> tuple[dict[str, Any], bytes]:
     buffer = io.BytesIO()
     torch.save(expected, buffer)
     return expected, buffer.getvalue()
+
+
+def test_mmap_fill_callback_succeeds_with_one_worker_and_receives_arguments(
+    monkeypatch: Any, caplog: Any
+) -> None:
+    expected, raw = _big_checkpoint()
+    path = Path("checkpoint.pt")
+    storage = _BytesStorage({path: raw})
+    call: dict[str, Any] = {}
+
+    def mmap_fill(
+        file_size: int,
+        callback_path: Path,
+        workers: int,
+        chunk_bytes: int,
+    ) -> mmap.mmap:
+        call.update(
+            path=callback_path,
+            workers=workers,
+            chunk_bytes=chunk_bytes,
+            size=file_size,
+        )
+        mm_file = mmap.mmap(-1, file_size)
+        mm_file[:] = raw
+        return mm_file
+
+    monkeypatch.setenv("TORCH_CKPT_PARALLEL_FILL_CHUNK_MB", "1")
+    caplog.set_level(
+        logging.INFO, logger="torch_checkpointing.storage.torch_serialization"
+    )
+
+    loaded = load_torch_serialized_from_storage(
+        path,
+        storage,
+        map_location="cpu",
+        num_workers=1,
+        mmap_fill=mmap_fill,
+    )
+
+    torch.testing.assert_close(loaded["w"], expected["w"])
+    assert loaded["step"] == expected["step"]
+    assert call == {
+        "path": path,
+        "workers": 1,
+        "chunk_bytes": 1024 * 1024,
+        "size": len(raw),
+    }
+    assert storage.read_args == []
+    assert "checkpoint mmap fill: mode=native" in caplog.text
+    assert f"ranges={-(-len(raw) // (1024 * 1024))}" in caplog.text
+
+
+def test_mmap_fill_oserror_falls_back_once_to_python_serial(
+    monkeypatch: Any, caplog: Any
+) -> None:
+    expected, raw = _big_checkpoint()
+    path = Path("checkpoint.pt")
+    storage = _BytesStorage({path: raw})
+
+    def mmap_fill(
+        _file_size: int,
+        _path: Path,
+        _workers: int,
+        _chunk_bytes: int,
+    ) -> mmap.mmap:
+        raise OSError("native fill unavailable")
+
+    monkeypatch.setenv("TORCH_CKPT_PARALLEL_FILL_CHUNK_MB", "1")
+    caplog.set_level(
+        logging.INFO, logger="torch_checkpointing.storage.torch_serialization"
+    )
+
+    loaded = load_torch_serialized_from_storage(
+        path,
+        storage,
+        map_location="cpu",
+        num_workers=4,
+        mmap_fill=mmap_fill,
+    )
+
+    torch.testing.assert_close(loaded["w"], expected["w"])
+    assert loaded["step"] == expected["step"]
+    assert len(storage.read_args) == 1
+    assert "falling back to Python fill" in caplog.text
+    assert "mode=serial-after-native-failure" in caplog.text
+    assert "workers=1 chunk_mb=1 ranges=1" in caplog.text
+
+
+def test_short_mmap_fill_falls_back_once_to_python_serial(
+    monkeypatch: Any, caplog: Any
+) -> None:
+    expected, raw = _big_checkpoint()
+    path = Path("checkpoint.pt")
+    storage = _BytesStorage({path: raw})
+    returned_mapping: mmap.mmap | None = None
+
+    def mmap_fill(
+        file_size: int,
+        _path: Path,
+        _workers: int,
+        _chunk_bytes: int,
+    ) -> mmap.mmap:
+        nonlocal returned_mapping
+        returned_mapping = mmap.mmap(-1, file_size - 1)
+        returned_mapping[:] = bytes(file_size - 1)
+        return returned_mapping
+
+    monkeypatch.setenv("TORCH_CKPT_PARALLEL_FILL_CHUNK_MB", "1")
+    caplog.set_level(
+        logging.INFO, logger="torch_checkpointing.storage.torch_serialization"
+    )
+
+    loaded = load_torch_serialized_from_storage(
+        path,
+        storage,
+        map_location="cpu",
+        num_workers=4,
+        mmap_fill=mmap_fill,
+    )
+
+    torch.testing.assert_close(loaded["w"], expected["w"])
+    assert loaded["step"] == expected["step"]
+    assert len(storage.read_args) == 1
+    assert returned_mapping is not None
+    assert returned_mapping.closed
+    assert "mode=serial-after-short-native" in caplog.text
+    assert "workers=1 chunk_mb=1 ranges=1" in caplog.text
+
+
+class _LengthFailingMmap:
+    def __init__(self, *, close_raises: bool) -> None:
+        self.close_raises = close_raises
+        self.closed = False
+
+    def __len__(self) -> int:
+        raise RuntimeError("length validation failed")
+
+    def seek(self, _offset: int, _whence: int = 0) -> int:
+        raise AssertionError("seek should not be reached")
+
+    def read(self, _size: int = -1) -> bytes:
+        raise AssertionError("read should not be reached")
+
+    def close(self) -> None:
+        self.closed = True
+        if self.close_raises:
+            raise OSError("close failed")
+
+
+@pytest.mark.parametrize("close_raises", [False, True])
+def test_mmap_fill_closes_mapping_when_length_validation_raises(
+    close_raises: bool,
+) -> None:
+    path = Path("checkpoint.pt")
+    buffer = io.BytesIO()
+    torch.save({"value": 1}, buffer)
+    storage = _BytesStorage({path: buffer.getvalue()})
+    returned_mapping = _LengthFailingMmap(close_raises=close_raises)
+
+    def mmap_fill(
+        _file_size: int,
+        _path: Path,
+        _workers: int,
+        _chunk_bytes: int,
+    ) -> _LengthFailingMmap:
+        return returned_mapping
+
+    with pytest.raises(RuntimeError, match="length validation failed"):
+        load_torch_serialized_from_storage(
+            path, storage, num_workers=4, mmap_fill=mmap_fill
+        )
+
+    assert returned_mapping.closed
+    assert storage.read_args == []
+
+
+def test_mmap_fill_programming_error_is_not_caught() -> None:
+    path = Path("checkpoint.pt")
+    buffer = io.BytesIO()
+    torch.save({"value": 1}, buffer)
+    storage = _BytesStorage({path: buffer.getvalue()})
+
+    def mmap_fill(
+        _file_size: int,
+        _path: Path,
+        _workers: int,
+        _chunk_bytes: int,
+    ) -> mmap.mmap:
+        raise RuntimeError("callback bug")
+
+    with pytest.raises(RuntimeError, match="callback bug"):
+        load_torch_serialized_from_storage(
+            path, storage, num_workers=1, mmap_fill=mmap_fill
+        )
+
+    assert storage.read_args == []
 
 
 def test_parallel_fill_round_trips_identically_to_serial(monkeypatch: Any) -> None:

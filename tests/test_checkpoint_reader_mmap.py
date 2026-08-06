@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import io
+import mmap
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -86,3 +87,65 @@ def test_checkpoint_reader_uses_mmap_backed_storage_by_default() -> None:
     assert storage.getsize_calls == 1
     assert len(storage.read_args) == 1
     assert storage.read_args[0].pre_read_full_file is False
+
+
+def test_checkpoint_reader_uses_storage_specific_mmap_fill() -> None:
+    path = Path("checkpoint.pt")
+    payload = _torch_payload()
+    storage = _BytesStorage({path: payload})
+    factory_calls: list[Any] = []
+    fill_calls: list[tuple[int, Path, int, int]] = []
+
+    def mmap_fill_factory(candidate: Any):
+        factory_calls.append(candidate)
+
+        def mmap_fill(
+            file_size: int,
+            callback_path: Path,
+            workers: int,
+            chunk_bytes: int,
+        ) -> mmap.mmap:
+            fill_calls.append((file_size, callback_path, workers, chunk_bytes))
+            mm_file = mmap.mmap(-1, file_size)
+            mm_file[:] = payload
+            return mm_file
+
+        return mmap_fill
+
+    reader = CheckpointReader(
+        rank_info=_rank_info(),
+        storage_config=_StorageConfig(storage),
+        mmap_fill_factory=mmap_fill_factory,
+    )
+    loaded = reader._load_full_file(
+        path,
+        SimpleNamespace(serialization_format=TorchSerialization()),
+        map_location="cpu",
+    )
+
+    torch.testing.assert_close(loaded["weights"], torch.arange(4, dtype=torch.float32))
+    assert factory_calls == [storage]
+    assert len(fill_calls) == 1
+    assert fill_calls[0][0] == len(payload)
+    assert fill_calls[0][1] == path
+    assert storage.read_args == []
+
+
+def test_checkpoint_reader_does_not_resolve_mmap_fill_when_disabled() -> None:
+    path = Path("checkpoint.pt")
+    storage = _BytesStorage({path: _torch_payload()})
+    factory_calls: list[Any] = []
+    reader = CheckpointReader(
+        rank_info=_rank_info(),
+        storage_config=_StorageConfig(storage),
+        disable_use_mmap_backed_storage_on_load=True,
+        mmap_fill_factory=lambda candidate: factory_calls.append(candidate),
+    )
+
+    reader._load_full_file(
+        path,
+        SimpleNamespace(serialization_format=TorchSerialization()),
+        map_location="cpu",
+    )
+
+    assert factory_calls == []
