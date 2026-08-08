@@ -18,6 +18,7 @@ from typing import Any, TypeVar
 
 from .checkpoint_base import CheckpointBase, CheckpointInfo, CheckpointReadInfo
 from .checkpoint_reader import CheckpointReader
+from .config import CheckpointLoaderConfig
 from .distributed_metadata import CheckpointMetadata
 from .logging_utils import EventLogger, EventType
 from .metadata_manager import MetadataManager
@@ -50,6 +51,7 @@ class CheckpointLoader:
         self,
         reader: CheckpointReader,
         metadata_manager: MetadataManager | None = None,
+        config: CheckpointLoaderConfig | None = None,
     ) -> None:
         """
         Initialize a CheckpointLoader.
@@ -58,9 +60,12 @@ class CheckpointLoader:
             reader: CheckpointReader for reading from storage.
             metadata_manager: Optional MetadataManager for resharding support.
                 If None, resharding is disabled.
+            config: Optional CheckpointLoaderConfig. If None, a default
+                config is used (verify_integrity=False).
         """
         self._reader = reader
         self._metadata_manager = metadata_manager
+        self._config = config or CheckpointLoaderConfig()
 
     def _compute_metadata_once(
         self,
@@ -136,6 +141,21 @@ class CheckpointLoader:
         """
         event_logger = EventLogger()
         logger.info("Loading checkpoint from %s", path)
+
+        # Verify checkpoint integrity before any weight is materialised.
+        # If the manifest is absent (old checkpoint saved without
+        # verify_integrity), the load proceeds silently.
+        if self._config.verify_integrity:
+            from .integrity import verify_manifest
+
+            logger.debug("Verifying checkpoint integrity for %s", path)
+            try:
+                verify_manifest(path)
+                logger.info("Checkpoint integrity verified for %s", path)
+            except FileNotFoundError:
+                logger.debug(
+                    "No integrity manifest at %s, skipping verification", path
+                )
 
         logger.info(
             "Preparing checkpoint read info",

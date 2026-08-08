@@ -57,6 +57,12 @@ class CheckpointWriterConfig:
     checkpoint_write_barrier_timeout_sec: int = 600
     barrier_config: BarrierConfig | None = None
     file_write_max_threads: int = 1
+    verify_integrity: bool = False
+    """If True, write an ``_integrity_manifest.json`` containing SHA-256
+    hashes of every file in the checkpoint directory after all writes
+    (including metadata) are finalised.  Enable on the load side too to
+    have the loader reject corrupt checkpoints before any weight is
+    materialised."""
 
     def __post_init__(self) -> None:
         if self.file_write_max_threads < 1:
@@ -254,6 +260,21 @@ class CheckpointWriter:
         if self._args.finalize_callback is not None:
             logger.debug(f"Executing finalize callback for {path}")
             self._args.finalize_callback(str(final_path), event_logger)
+
+        # Write integrity manifest if enabled (rank 0 only).
+        # Done after finalize_callback so that the manifest hashes the
+        # final on-disk layout exactly as a verifier would see it.
+        if self._args.config.verify_integrity and self._args.rank_info.role_rank == 0:
+            from .integrity import write_manifest
+
+            logger.debug(f"Writing integrity manifest for {final_path}")
+            write_manifest(str(final_path))
+            # Barrier so that no rank starts loading before rank 0 has
+            # finished writing the manifest.
+            if self._barrier is not None:
+                self._barrier.execute_barrier(
+                    self._args.config.checkpoint_write_barrier_timeout_sec,
+                )
 
         logger.info(
             f"Successfully wrote checkpoint to {final_path} for rank {self._args.rank_info.global_rank}"
