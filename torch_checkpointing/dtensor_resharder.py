@@ -40,6 +40,7 @@ from .distributed_metadata import (
 )
 from .dtensor_metadata import (
     DTensorShardingMetadata,
+    get_device_mesh_spec,
     ReplicateSpec,
     ShardSpec,
 )
@@ -58,6 +59,22 @@ from .types import CheckpointPath, NestedPath
 from .walk_utils import walk_checkpoint_structure
 
 logger: logging.Logger = logging.getLogger(__name__)
+
+
+def _replicated_tensor_metadata(tensor: torch.Tensor) -> DTensorShardingMetadata:
+    world_size = dist.get_world_size() if dist.is_initialized() else 1
+    mesh_spec = get_device_mesh_spec(
+        device_type=tensor.device.type,
+        mesh_shape=(world_size,),
+        mesh_data=tuple(range(world_size)),
+    )
+    return DTensorShardingMetadata(
+        global_shape=tuple(tensor.shape),
+        dtype=str(tensor.dtype),
+        stride=tuple(tensor.stride()),
+        mesh_spec=mesh_spec,
+        placements=(ReplicateSpec(),),
+    )
 
 
 def _to_dtensor_placements(
@@ -222,22 +239,26 @@ class DTensorResharder(Resharder):
         item_key: str,
         item_value: Any,
     ) -> dict[NestedPath, ShardingMetadata]:
-        """Extract DTensorShardingMetadata for all DTensors in the item.
+        """Extract DTensorShardingMetadata for all tensor leaves in the item.
 
-        Walks the item's nested structure and extracts metadata for each DTensor found.
+        Plain tensors are represented as replicated over the default process group.
 
         Args:
             item_key: The checkpoint item key (e.g., "model", "optimizer").
             item_value: The item's value (e.g., state_dict).
 
         Returns:
-            Dictionary mapping NestedPath to ShardingMetadata for each DTensor.
+            Dictionary mapping NestedPath to ShardingMetadata for each tensor.
         """
         result: dict[NestedPath, ShardingMetadata] = {}
+        plain_tensor_paths: list[NestedPath] = []
 
         def _collect(path: CheckpointPath, obj: Any, _: Any) -> None:
             if isinstance(obj, DTensor):
                 result[path.nested_path] = DTensorShardingMetadata.from_dtensor(obj)
+            elif isinstance(obj, torch.Tensor):
+                result[path.nested_path] = _replicated_tensor_metadata(obj)
+                plain_tensor_paths.append(path.nested_path)
 
         walk_checkpoint_structure(
             item_key=item_key,
@@ -245,6 +266,14 @@ class DTensorResharder(Resharder):
             target=None,
             leaf_fn=_collect,
         )
+        if plain_tensor_paths:
+            logger.warning(
+                "Found %s plain tensors in checkpoint item %r; treating them as "
+                "replicated tensors. sample_paths=%s",
+                len(plain_tensor_paths),
+                item_key,
+                plain_tensor_paths[:10],
+            )
         return result
 
     @override
