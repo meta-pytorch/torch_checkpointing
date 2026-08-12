@@ -153,6 +153,28 @@ class TensorSlice:
     def dtype_size(self) -> int:
         return torch._utils._element_size(self.torch_dtype)
 
+    @property
+    def contiguous_byte_range(self) -> tuple[int, int] | None:
+        num_elements = math.prod(self.sizes)
+        if num_elements == 0:
+            return (0, 0)
+
+        strides = [
+            math.prod(self.shape[index + 1 :]) for index in range(len(self.shape))
+        ]
+        start_element = sum(
+            offset * stride for offset, stride in zip(self.offsets, strides)
+        )
+        last_element = sum(
+            (offset + size - 1) * stride
+            for offset, size, stride in zip(self.offsets, self.sizes, strides)
+        )
+        if last_element - start_element + 1 != num_elements:
+            return None
+
+        start_byte = start_element * self.dtype_size
+        return start_byte, start_byte + num_elements * self.dtype_size
+
 
 @dataclass(frozen=True)
 class SafetensorsFileMetadata:
@@ -199,6 +221,47 @@ class SafetensorsFileMetadata:
         return cls(file_path=file_path, tensors=tensors)
 
 
+def _distributed_rank_and_world_size() -> tuple[int, int]:
+    if dist.is_available() and dist.is_initialized():
+        return dist.get_rank(), dist.get_world_size()
+    return 0, 1
+
+
+def _load_consolidation_tensor_slices(
+    input_checkpoint_dir: str,
+    item_key: str,
+    validate_tensor_metadata: bool,
+    storage: Storage,
+) -> tuple[dict[int, SafetensorsFileMetadata], dict[str, list[TensorSlice]]]:
+    distributed_metadata = load_distributed_metadata(input_checkpoint_dir, storage)
+    if distributed_metadata is None:
+        raise FileNotFoundError(
+            f"No distributed metadata found in {input_checkpoint_dir}"
+        )
+    item_metadata = distributed_metadata.metadata.get(item_key)
+    if item_metadata is None:
+        raise ValueError(
+            f"No checkpoint metadata found for item {item_key!r} in "
+            f"{input_checkpoint_dir}"
+        )
+    file_metadata_by_rank = _read_safetensors_file_metadata_by_rank(
+        input_checkpoint_dir,
+        item_metadata.rank_to_layout_info,
+        storage,
+    )
+    if not file_metadata_by_rank:
+        raise ValueError(
+            f"No rank-local safetensors files for checkpoint item "
+            f"{item_key!r} in {input_checkpoint_dir}"
+        )
+    return file_metadata_by_rank, _build_fqn_to_tensor_slices(
+        nested_path_to_metadata=item_metadata.nested_path_to_metadata,
+        rank_to_layout_info=item_metadata.rank_to_layout_info,
+        file_metadata_by_rank=file_metadata_by_rank,
+        validate_tensor_metadata=validate_tensor_metadata,
+    )
+
+
 def consolidate_hf_safetensors_checkpoint(
     input_checkpoint_dir: str,
     *,
@@ -213,6 +276,7 @@ def consolidate_hf_safetensors_checkpoint(
 
     ``metadata.pkl`` defines the tensors, their global layouts, and their source
     files. Rank-local safetensors headers supply byte layouts for those tensors.
+    Contiguous destination slices are read directly into their final positions.
     Set ``validate_tensor_metadata=False`` to skip cross-checking tensor shapes,
     dtypes, and byte spans between the two formats. Metadata tensors must still
     exist in the declared safetensors files, and header FQNs absent from metadata
@@ -224,41 +288,12 @@ def consolidate_hf_safetensors_checkpoint(
     ).create_storage()
     if output_dir is None:
         output_dir = input_checkpoint_dir
-    if dist.is_available() and dist.is_initialized():
-        rank = dist.get_rank()
-        world_size = dist.get_world_size()
-    else:
-        rank = 0
-        world_size = 1
-
-    distributed_metadata = load_distributed_metadata(input_checkpoint_dir, storage)
-    if distributed_metadata is None:
-        raise FileNotFoundError(
-            f"No distributed metadata found in {input_checkpoint_dir}"
-        )
-    item_metadata = distributed_metadata.metadata.get(item_key)
-    if item_metadata is None:
-        raise ValueError(
-            f"No checkpoint metadata found for item {item_key!r} in "
-            f"{input_checkpoint_dir}"
-        )
-    nested_path_to_metadata = item_metadata.nested_path_to_metadata
-    rank_to_layout_info = item_metadata.rank_to_layout_info
-    file_metadata_by_rank = _read_safetensors_file_metadata_by_rank(
+    rank, world_size = _distributed_rank_and_world_size()
+    file_metadata_by_rank, fqn_to_tensor_slices = _load_consolidation_tensor_slices(
         input_checkpoint_dir,
-        rank_to_layout_info,
+        item_key,
+        validate_tensor_metadata,
         storage,
-    )
-    if not file_metadata_by_rank:
-        raise ValueError(
-            f"No rank-local safetensors files for checkpoint item "
-            f"{item_key!r} in {input_checkpoint_dir}"
-        )
-    fqn_to_tensor_slices = _build_fqn_to_tensor_slices(
-        nested_path_to_metadata=nested_path_to_metadata,
-        rank_to_layout_info=rank_to_layout_info,
-        file_metadata_by_rank=file_metadata_by_rank,
-        validate_tensor_metadata=validate_tensor_metadata,
     )
     fqn_to_index_mapping = _validate_fqn_to_index_mapping(
         fqn_to_index_mapping,
@@ -846,6 +881,15 @@ def _process_output_file(
                                 direct_io=False,
                             ),
                         )
+                    destination_range = tensor_slice.contiguous_byte_range
+                    if destination_range is not None:
+                        start, end = destination_range
+                        _read_tensor_data_into(
+                            file_handles[byte_address.file_path],
+                            byte_address,
+                            full_tensor_mv[start:end],
+                        )
+                        continue
                     data_to_write = _read_tensor_data(
                         file_handles[byte_address.file_path],
                         byte_address,
@@ -895,22 +939,34 @@ def _process_output_file(
     )
 
 
-def _read_tensor_data(
+def _read_tensor_data_into(
     f: Any,
     byte_address: HFSafetensorByteAddress,
-) -> bytearray:
+    destination: memoryview,
+) -> None:
+    if destination.nbytes != byte_address.num_bytes:
+        raise ValueError(
+            f"Destination has {destination.nbytes} bytes but source tensor "
+            f"{byte_address.file_path!r} has {byte_address.num_bytes} bytes"
+        )
     f.seek(byte_address.start_byte_offset)
-    data = bytearray(byte_address.num_bytes)
-    view = memoryview(data)
     bytes_read = 0
     while bytes_read < byte_address.num_bytes:
-        read_size = f.readinto(view[bytes_read:])
+        read_size = f.readinto(destination[bytes_read:])
         if not read_size:
             raise EOFError(
                 f"Expected {byte_address.num_bytes} bytes from "
                 f"{byte_address.file_path!r}, got {bytes_read}"
             )
         bytes_read += read_size
+
+
+def _read_tensor_data(
+    f: Any,
+    byte_address: HFSafetensorByteAddress,
+) -> bytearray:
+    data = bytearray(byte_address.num_bytes)
+    _read_tensor_data_into(f, byte_address, memoryview(data))
     return data
 
 

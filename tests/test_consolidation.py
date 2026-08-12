@@ -48,6 +48,7 @@ from torch_checkpointing.hf.consolidation import (
     consolidate_hf_safetensors_checkpoint,
     HFSafetensorByteAddress,
     SafetensorsFileMetadata,
+    TensorSlice,
 )
 from torch_checkpointing.storage.filesystem import (
     LocalFileSystemStorage,
@@ -437,7 +438,74 @@ def test_read_tensor_data_rejects_truncated_input() -> None:
         _read_tensor_data(stream, address)
 
 
-def test_consolidate_hf_safetensors_reads_torch_checkpointing_metadata(
+@pytest.mark.parametrize(
+    (
+        "global_shape",
+        "global_offsets",
+        "local_shape",
+        "torch_dtype",
+        "expected",
+    ),
+    [
+        pytest.param((), (), (), torch.float32, (0, 4), id="scalar"),
+        pytest.param((0,), (0,), (0,), torch.float32, (0, 0), id="empty"),
+        pytest.param((10,), (4,), (3,), torch.float16, (8, 14), id="one_dimensional"),
+        pytest.param(
+            (4, 5), (1, 0), (2, 5), torch.float32, (20, 60), id="dim_zero_shard"
+        ),
+        pytest.param((4, 5), (0, 1), (4, 2), torch.float32, None, id="dim_one_shard"),
+        pytest.param((2, 3), (0, 0), (2, 3), torch.int8, (0, 6), id="replica"),
+        pytest.param((4, 5), (3, 0), (1, 5), torch.float64, (120, 160), id="tail_row"),
+        pytest.param(
+            (8, 4, 6),
+            (3, 0, 0),
+            (2, 4, 6),
+            torch.bfloat16,
+            (144, 240),
+            id="expert_slab",
+        ),
+        pytest.param(
+            (8, 4, 6),
+            (0, 1, 0),
+            (8, 2, 6),
+            torch.float32,
+            None,
+            id="input_dimension_shard",
+        ),
+        pytest.param(
+            (8, 4, 6),
+            (0, 0, 1),
+            (8, 4, 2),
+            torch.float32,
+            None,
+            id="output_dimension_shard",
+        ),
+    ],
+)
+def test_tensor_slice_contiguous_byte_range(
+    global_shape: tuple[int, ...],
+    global_offsets: tuple[int, ...],
+    local_shape: tuple[int, ...],
+    torch_dtype: torch.dtype,
+    expected: tuple[int, int] | None,
+) -> None:
+    tensor_slice = TensorSlice(
+        source_rank=0,
+        local_shape=local_shape,
+        torch_dtype=torch_dtype,
+        byte_address=HFSafetensorByteAddress(
+            file_path="model.safetensors",
+            start_byte_offset=0,
+            end_byte_offset=0,
+        ),
+        global_shape=global_shape,
+        global_offsets=global_offsets,
+    )
+
+    assert tensor_slice.contiguous_byte_range == expected
+
+
+def test_consolidate_hf_safetensors_reads_contiguous_slices_into_output_buffer(
     tmp_path: Path,
 ) -> None:
     checkpoint_path = tmp_path / "checkpoint"
@@ -454,11 +522,17 @@ def test_consolidate_hf_safetensors_reads_torch_checkpointing_metadata(
     )
     _write_metadata(checkpoint_path)
 
-    consolidate_hf_safetensors_checkpoint(
-        os.fspath(checkpoint_path),
-        fqn_to_index_mapping={"weight": 1},
-        item_key="model",
-    )
+    with mock.patch(
+        "torch_checkpointing.hf.consolidation._read_tensor_data",
+        wraps=_read_tensor_data,
+    ) as read_tensor_data:
+        consolidate_hf_safetensors_checkpoint(
+            os.fspath(checkpoint_path),
+            fqn_to_index_mapping={"weight": 1},
+            item_key="model",
+        )
+
+    read_tensor_data.assert_not_called()
 
     consolidated = safetensors_load_file(
         checkpoint_path / "model-00001-of-00001.safetensors"
@@ -499,6 +573,43 @@ def test_consolidate_hf_safetensors_writes_to_separate_output_dir(
     torch.testing.assert_close(consolidated["weight"], full_weight)
     assert (output_dir / "model.safetensors.index.json").exists()
     assert not (input_checkpoint_dir / "model.safetensors.index.json").exists()
+
+
+def test_consolidate_hf_safetensors_buffers_noncontiguous_destination_slices(
+    tmp_path: Path,
+) -> None:
+    checkpoint_path = tmp_path / "checkpoint"
+    checkpoint_path.mkdir()
+
+    full_weight = torch.arange(8, dtype=torch.float32).reshape(4, 2)
+    safetensors_save_file(
+        {"weight": full_weight[:, :1].contiguous()},
+        checkpoint_path / "model_0.safetensors",
+    )
+    safetensors_save_file(
+        {"weight": full_weight[:, 1:].contiguous()},
+        checkpoint_path / "model_1.safetensors",
+    )
+    _write_metadata(
+        checkpoint_path,
+        sharding_metadata=_dtensor_metadata(placements=(ShardSpec(dim=1),)),
+    )
+
+    with mock.patch(
+        "torch_checkpointing.hf.consolidation._read_tensor_data",
+        wraps=_read_tensor_data,
+    ) as read_tensor_data:
+        consolidate_hf_safetensors_checkpoint(
+            os.fspath(checkpoint_path),
+            fqn_to_index_mapping={"weight": 1},
+            item_key="model",
+        )
+
+    assert read_tensor_data.call_count == 2
+    consolidated = safetensors_load_file(
+        checkpoint_path / "model-00001-of-00001.safetensors"
+    )
+    torch.testing.assert_close(consolidated["weight"], full_weight)
 
 
 def test_consolidate_hf_safetensors_converts_nested_path_at_hf_boundary(
