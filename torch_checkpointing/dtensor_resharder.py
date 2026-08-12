@@ -102,7 +102,7 @@ def _to_dtensor_placements(
     return placements
 
 
-def _compute_local_shard_info(
+def compute_local_shard_info(
     metadata: DTensorShardingMetadata,
     rank: int,
 ) -> tuple[tuple[int, ...], tuple[int, ...]]:
@@ -363,7 +363,7 @@ class DTensorResharder(Resharder):
                 continue
 
             # Compute target local shape and global offset for current rank
-            target_local_shape, target_global_offset = _compute_local_shard_info(
+            target_local_shape, target_global_offset = compute_local_shard_info(
                 target_sharding, current_rank
             )
 
@@ -389,7 +389,7 @@ class DTensorResharder(Resharder):
                     break
 
                 for src_rank in group.ranks:
-                    src_local_shape, src_global_offset = _compute_local_shard_info(
+                    src_local_shape, src_global_offset = compute_local_shard_info(
                         src_sharding, src_rank
                     )
 

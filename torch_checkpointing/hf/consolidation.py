@@ -29,9 +29,7 @@ from torch.distributed.checkpoint._consolidate_hf_safetensors import (
     _write_sub_tensor_to_file_optimized,
 )
 from torch.distributed.checkpoint._hf_utils import (
-    _gen_file_name,
     _get_safetensors_file_metadata,
-    _metadata_fn,
     DATA_OFFSETS_KEY,
     DTYPE_KEY,
     SHAPE_KEY,
@@ -43,7 +41,7 @@ from ..distributed_metadata import (
     load_distributed_metadata,
 )
 from ..dtensor_metadata import DTensorShardingMetadata
-from ..dtensor_resharder import _compute_local_shard_info
+from ..dtensor_resharder import compute_local_shard_info
 from ..resharding_utils import get_fqn_from_nested_path
 from ..storage.base_storage import ReadArgs, Storage, StorageConfig
 from ..storage.filesystem import LocalFileSystemStorageConfig
@@ -152,9 +150,6 @@ class TensorSlice:
     def dtype_size(self) -> int:
         return torch._utils._element_size(self.torch_dtype)
 
-    def to_safetensors_dtype(self, fqn: str) -> str:
-        return _to_safetensors_dtype(self.torch_dtype, fqn)
-
 
 @dataclass(frozen=True)
 class SafetensorsFileMetadata:
@@ -213,12 +208,13 @@ def consolidate_hf_safetensors_checkpoint(
     """
     Consolidate a torch_checkpointing safetensors checkpoint into HF shards.
 
-    Rank-local safetensors headers define the tensors that were actually written.
-    ``metadata.pkl`` supplies global layouts for distributed tensors. Set
-    ``validate_tensor_metadata=False`` to skip cross-checking tensor shapes,
+    ``metadata.pkl`` defines the tensors, their global layouts, and their source
+    files. Rank-local safetensors headers supply byte layouts for those tensors.
+    Set ``validate_tensor_metadata=False`` to skip cross-checking tensor shapes,
     dtypes, and byte spans between the two formats. Metadata tensors must still
-    exist in the written safetensors files. By default, consolidated files are
-    written alongside the input checkpoint.
+    exist in the declared safetensors files, and header FQNs absent from metadata
+    are rejected. By default, consolidated files are written alongside the input
+    checkpoint and prefixed with ``item_key``.
     """
     storage = (
         storage_config if storage_config is not None else LocalFileSystemStorageConfig()
@@ -240,22 +236,27 @@ def consolidate_hf_safetensors_checkpoint(
         raise FileNotFoundError(
             f"No distributed metadata found in {input_checkpoint_dir}"
         )
-
-    try:
-        item_metadata = distributed_metadata.metadata[item_key]
-    except KeyError as e:
+    item_metadata = distributed_metadata.metadata.get(item_key)
+    if item_metadata is None:
         raise ValueError(
-            f"No distributed metadata for checkpoint item {item_key!r} "
-            f"in {input_checkpoint_dir}"
-        ) from e
+            f"No checkpoint metadata found for item {item_key!r} in "
+            f"{input_checkpoint_dir}"
+        )
+    nested_path_to_metadata = item_metadata.nested_path_to_metadata
+    rank_to_layout_info = item_metadata.rank_to_layout_info
     file_metadata_by_rank = _read_safetensors_file_metadata_by_rank(
         input_checkpoint_dir,
-        item_metadata.rank_to_layout_info,
+        rank_to_layout_info,
         storage,
     )
+    if not file_metadata_by_rank:
+        raise ValueError(
+            f"No rank-local safetensors files for checkpoint item "
+            f"{item_key!r} in {input_checkpoint_dir}"
+        )
     fqn_to_tensor_slices = _build_fqn_to_tensor_slices(
-        nested_path_to_metadata=item_metadata.nested_path_to_metadata,
-        rank_to_layout_info=item_metadata.rank_to_layout_info,
+        nested_path_to_metadata=nested_path_to_metadata,
+        rank_to_layout_info=rank_to_layout_info,
         file_metadata_by_rank=file_metadata_by_rank,
         validate_tensor_metadata=validate_tensor_metadata,
     )
@@ -272,7 +273,10 @@ def consolidate_hf_safetensors_checkpoint(
     }
     max_index = max(fqn_to_index_mapping.values())
     output_file_by_index = {
-        index: os.path.join(output_dir, _gen_file_name(index, max_index))
+        index: os.path.join(
+            output_dir,
+            _item_output_file_name(item_key, index, max_index),
+        )
         for index in set(fqn_to_index_mapping.values())
     }
     assigned_indices = {
@@ -324,6 +328,7 @@ def consolidate_hf_safetensors_checkpoint(
             fqn_to_num_bytes,
             output_file_by_index,
             storage,
+            item_key=item_key,
         )
     _barrier_if_distributed()
 
@@ -349,12 +354,17 @@ def _read_safetensors_file_metadata_by_rank(
                 f"layouts, but rank {rank} uses "
                 f"{serialization_format.__class__.__name__!r}"
             )
+        file_path = os.path.join(input_checkpoint_dir, layout_info.file_path)
         result[rank] = SafetensorsFileMetadata.from_file(
             storage=storage,
-            file_path=os.path.join(input_checkpoint_dir, layout_info.file_path),
+            file_path=file_path,
             source_rank=rank,
         )
     return result
+
+
+def _item_output_file_name(item_key: str, index: int, max_index: int) -> str:
+    return f"{item_key}-{index:05d}-of-{max_index:05d}.safetensors"
 
 
 def _build_fqn_to_tensor_slices(
@@ -366,10 +376,11 @@ def _build_fqn_to_tensor_slices(
     file_metadata_by_rank: Mapping[int, SafetensorsFileMetadata],
     validate_tensor_metadata: bool,
 ) -> dict[str, list[TensorSlice]]:
-    written_slices_by_fqn: dict[str, list[TensorSlice]] = {}
-    for file_metadata in file_metadata_by_rank.values():
-        for fqn, tensor_slice in file_metadata.tensors.items():
-            written_slices_by_fqn.setdefault(fqn, []).append(tensor_slice)
+    written_fqns = {
+        fqn
+        for file_metadata in file_metadata_by_rank.values()
+        for fqn in file_metadata.tensors
+    }
 
     result: dict[str, list[TensorSlice]] = {}
     for nested_path, groups in sorted(
@@ -390,19 +401,12 @@ def _build_fqn_to_tensor_slices(
             validate_tensor_metadata=validate_tensor_metadata,
         )
 
-    for fqn in sorted(written_slices_by_fqn.keys() - result.keys()):
-        written_slices = written_slices_by_fqn[fqn]
-        assert written_slices
-        representative = min(
-            written_slices,
-            key=lambda tensor_slice: tensor_slice.source_rank,
+    unexpected_fqns = sorted(written_fqns - result.keys())
+    if unexpected_fqns:
+        raise ValueError(
+            "Safetensors files contain FQNs absent from checkpoint metadata: "
+            f"{unexpected_fqns}"
         )
-        result[fqn] = [
-            representative.with_global_layout(
-                global_shape=representative.local_shape,
-                global_offsets=(0,) * len(representative.local_shape),
-            )
-        ]
 
     return result
 
@@ -507,7 +511,7 @@ def _resolve_distributed_tensor_slice(
             f"is missing checkpoint metadata FQN {fqn!r}"
         ) from e
 
-    local_shape, global_offsets = _compute_local_shard_info(
+    local_shape, global_offsets = compute_local_shard_info(
         sharding_metadata,
         source_rank,
     )
@@ -544,7 +548,7 @@ def _validate_written_tensor(
     if tensor_slice.torch_dtype != expected_dtype:
         raise ValueError(
             f"Cannot consolidate {fqn!r} from rank {rank}: safetensors dtype "
-            f"{tensor_slice.to_safetensors_dtype(fqn)!r} does not match "
+            f"{_to_safetensors_dtype(tensor_slice.torch_dtype, fqn)!r} does not match "
             f"expected dtype {_to_safetensors_dtype(expected_dtype, fqn)!r}"
         )
     expected_bytes = math.prod(expected_shape) * torch._utils._element_size(
@@ -646,7 +650,7 @@ def _prepare_metadata(
         )
         metadata[fqn] = {
             SHAPE_KEY: list(tensor_slice.shape),
-            DTYPE_KEY: tensor_slice.to_safetensors_dtype(fqn),
+            DTYPE_KEY: _to_safetensors_dtype(tensor_slice.torch_dtype, fqn),
             DATA_OFFSETS_KEY: [current_offset, end_offset],
         }
         current_offset = end_offset
@@ -681,6 +685,10 @@ def _process_output_file(
             output_stream.write(metadata_bytes)
             for tensor_slices in tensor_slices_by_fqn.values():
                 output_tensor_slice = tensor_slices[0]
+                if not output_tensor_slice.shape:
+                    assert len(tensor_slices) == 1, (
+                        "Scalar tensors require exactly one source slice"
+                    )
                 full_tensor_mv = memoryview(
                     bytearray(
                         math.prod(output_tensor_slice.shape)
@@ -701,6 +709,9 @@ def _process_output_file(
                         file_handles[byte_address.file_path],
                         byte_address,
                     )
+                    if not output_tensor_slice.shape:
+                        full_tensor_mv[:] = data_to_write
+                        continue
                     _write_sub_tensor_to_file_optimized(
                         full_tensor_mv,
                         data_to_write,
@@ -741,13 +752,16 @@ def _write_overall_hf_index_file(
     fqn_to_num_bytes: dict[str, int],
     output_file_by_index: dict[int, str],
     storage: Storage,
+    *,
+    item_key: str = "model",
 ) -> None:
     weight_map = {
         fqn: os.path.basename(output_file_by_index[index])
         for fqn, index in fqn_to_index_mapping.items()
     }
 
-    metadata_path = Path(output_dir) / _metadata_fn
+    metadata_file_name = f"{item_key}.safetensors.index.json"
+    metadata_path = Path(output_dir) / metadata_file_name
     with _atomic_stream_write(storage, metadata_path) as metadata_file:
         metadata_file.write(
             json.dumps(

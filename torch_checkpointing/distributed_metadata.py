@@ -530,6 +530,13 @@ def load_distributed_metadata(
     checkpoint_dir: str | Path,
     storage: Storage,
 ) -> DistributedMetadata | None:
+    """Load distributed metadata from a trusted checkpoint.
+
+    .. warning::
+        ``metadata.pkl`` is deserialized with pickle and may execute arbitrary
+        code. Only load checkpoints from trusted sources that have not been
+        tampered with.
+    """
     metadata_path = Path(checkpoint_dir) / METADATA_FILE_NAME
     if not storage.exists(metadata_path):
         return None

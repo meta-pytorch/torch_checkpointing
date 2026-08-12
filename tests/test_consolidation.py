@@ -39,6 +39,8 @@ from torch_checkpointing.dtensor_metadata import (
 )
 from torch_checkpointing.hf.consolidation import (
     _atomic_stream_write,
+    _process_output_file,
+    _read_safetensors_file_metadata_by_rank,
     _read_tensor_data,
     consolidate_hf_safetensors_checkpoint,
     HFSafetensorByteAddress,
@@ -111,12 +113,28 @@ def _dtensor_metadata(
     )
 
 
+def _replicated_tensor_metadata(tensor: torch.Tensor) -> DTensorShardingMetadata:
+    return DTensorShardingMetadata(
+        global_shape=tuple(tensor.shape),
+        dtype=str(tensor.dtype),
+        stride=tuple(tensor.stride()),
+        mesh_spec=get_device_mesh_spec(
+            device_type="cpu",
+            mesh_shape=(2,),
+            mesh_data=(0, 1),
+            mesh_dim_names=None,
+        ),
+        placements=(ReplicateSpec(),),
+    )
+
+
 def _write_metadata(
     checkpoint_path: Path,
     rank_to_file_path: dict[int, str | None] | None = None,
     sharding_metadata: DTensorShardingMetadata | None = None,
     nested_path: NestedPath = ("weight",),
-    include_sharding_metadata: bool = True,
+    item_key: str = "model",
+    metadata_by_path: dict[NestedPath, DTensorShardingMetadata] | None = None,
     nested_paths: tuple[NestedPath, ...] | None = None,
 ) -> None:
     if rank_to_file_path is None:
@@ -124,24 +142,24 @@ def _write_metadata(
             0: "model_0.safetensors",
             1: "model_1.safetensors",
         }
-    nested_path_to_metadata = {}
-    if include_sharding_metadata:
+    if metadata_by_path is None:
         if sharding_metadata is None:
             sharding_metadata = _dtensor_metadata()
         if nested_paths is None:
             nested_paths = (nested_path,)
-        nested_path_to_metadata = {
-            path: [
-                GlobalObjectMetadata(
-                    sharding_metadata=sharding_metadata,
-                    ranks=(0, 1),
-                )
-            ]
-            for path in nested_paths
-        }
+        metadata_by_path = {path: sharding_metadata for path in nested_paths}
+    nested_path_to_metadata = {
+        path: [
+            GlobalObjectMetadata(
+                sharding_metadata=path_metadata,
+                ranks=(0, 1),
+            )
+        ]
+        for path, path_metadata in metadata_by_path.items()
+    }
     metadata = DistributedMetadata(
         metadata={
-            "model": DistributedItemMetadata(
+            item_key: DistributedItemMetadata(
                 nested_path_to_metadata=nested_path_to_metadata,
                 rank_to_layout_info={
                     rank: _layout(file_path) if file_path is not None else None
@@ -287,6 +305,56 @@ def test_safetensors_file_metadata_reads_file_header(
     assert address.file_path == os.fspath(file_path)
     assert address.start_byte_offset > 8
     assert address.num_bytes == 6 * torch.empty((), dtype=torch.float32).element_size()
+
+
+def test_read_safetensors_file_metadata_by_rank_uses_only_declared_layouts(
+    tmp_path: Path,
+) -> None:
+    explicit_file = tmp_path / "optimizer_7.safetensors"
+    undeclared_file = tmp_path / "optimizer_10.safetensors"
+    safetensors_save_file({"explicit": torch.ones(2)}, explicit_file)
+    safetensors_save_file({"undeclared": torch.zeros(2)}, undeclared_file)
+    storage = LocalFileSystemStorageConfig(use_direct_io=False).create_storage()
+
+    file_metadata_by_rank = _read_safetensors_file_metadata_by_rank(
+        input_checkpoint_dir=os.fspath(tmp_path),
+        rank_to_layout_info={3: _layout(explicit_file.name), 5: None},
+        storage=storage,
+    )
+
+    assert set(file_metadata_by_rank) == {3}
+    assert file_metadata_by_rank[3].file_path == os.fspath(explicit_file)
+    assert file_metadata_by_rank[3].tensors["explicit"].source_rank == 3
+
+
+def test_process_output_file_rejects_multiple_scalar_slices(tmp_path: Path) -> None:
+    source_files = [
+        tmp_path / "scalar_0.safetensors",
+        tmp_path / "scalar_1.safetensors",
+    ]
+    for source_rank, source_file in enumerate(source_files):
+        safetensors_save_file({"scalar": torch.tensor(source_rank)}, source_file)
+    storage = LocalFileSystemStorageConfig(use_direct_io=False).create_storage()
+    tensor_slices = [
+        SafetensorsFileMetadata.from_file(
+            storage=storage,
+            file_path=os.fspath(source_file),
+            source_rank=source_rank,
+        )
+        .tensors["scalar"]
+        .with_global_layout((), ())
+        for source_rank, source_file in enumerate(source_files)
+    ]
+
+    with pytest.raises(
+        AssertionError,
+        match="Scalar tensors require exactly one source slice",
+    ):
+        _process_output_file(
+            os.fspath(tmp_path / "output.safetensors"),
+            {"scalar": tensor_slices},
+            storage,
+        )
 
 
 def test_read_tensor_data_handles_short_reads() -> None:
@@ -470,10 +538,19 @@ def test_consolidate_hf_safetensors_defaults_all_fqns_to_one_file(
         checkpoint_path / "model_0.safetensors",
     )
     safetensors_save_file(
-        {"weight": full_weight[2:].contiguous()},
+        {
+            "weight": full_weight[2:].contiguous(),
+            "plain": plain,
+        },
         checkpoint_path / "model_1.safetensors",
     )
-    _write_metadata(checkpoint_path)
+    _write_metadata(
+        checkpoint_path,
+        metadata_by_path={
+            ("weight",): _dtensor_metadata(),
+            ("plain",): _replicated_tensor_metadata(plain),
+        },
+    )
 
     consolidate_hf_safetensors_checkpoint(
         os.fspath(checkpoint_path),
@@ -501,7 +578,8 @@ def test_consolidate_hf_safetensors_exports_plain_only_item(
     _write_metadata(
         checkpoint_path,
         rank_to_file_path={0: "model_0.safetensors", 1: None},
-        include_sharding_metadata=False,
+        nested_path=("plain",),
+        sharding_metadata=_replicated_tensor_metadata(plain),
     )
 
     consolidate_hf_safetensors_checkpoint(
@@ -515,7 +593,50 @@ def test_consolidate_hf_safetensors_exports_plain_only_item(
     torch.testing.assert_close(consolidated["plain"], plain)
 
 
-def test_consolidate_hf_safetensors_discovers_plain_tensor_on_other_rank(
+def test_consolidate_hf_safetensors_exports_plain_item_from_metadata(
+    tmp_path: Path,
+) -> None:
+    checkpoint_path = tmp_path / "checkpoint"
+    checkpoint_path.mkdir()
+    exp_avg = torch.tensor([1.0, 2.0])
+    step = torch.tensor(3)
+    for rank in range(2):
+        safetensors_save_file(
+            {"exp_avg": exp_avg, "step": step},
+            checkpoint_path / f"optimizer_{rank}.safetensors",
+        )
+    _write_metadata(
+        checkpoint_path,
+        rank_to_file_path={
+            0: "optimizer_0.safetensors",
+            1: "optimizer_1.safetensors",
+        },
+        item_key="optimizer",
+        metadata_by_path={
+            ("exp_avg",): _replicated_tensor_metadata(exp_avg),
+            ("step",): _replicated_tensor_metadata(step),
+        },
+    )
+
+    consolidate_hf_safetensors_checkpoint(
+        os.fspath(checkpoint_path),
+        fqn_to_index_mapping={"exp_avg": 1, "step": 1},
+        item_key="optimizer",
+    )
+
+    output_file = checkpoint_path / "optimizer-00001-of-00001.safetensors"
+    consolidated = safetensors_load_file(output_file)
+    torch.testing.assert_close(consolidated["exp_avg"], exp_avg)
+    torch.testing.assert_close(consolidated["step"], step)
+    with open(checkpoint_path / "optimizer.safetensors.index.json") as f:
+        index = json.load(f)
+    assert index["weight_map"] == {
+        "exp_avg": output_file.name,
+        "step": output_file.name,
+    }
+
+
+def test_consolidate_hf_safetensors_rejects_header_fqn_missing_from_metadata(
     tmp_path: Path,
 ) -> None:
     checkpoint_path = tmp_path / "checkpoint"
@@ -535,16 +656,11 @@ def test_consolidate_hf_safetensors_discovers_plain_tensor_on_other_rank(
     )
     _write_metadata(checkpoint_path)
 
-    consolidate_hf_safetensors_checkpoint(
-        os.fspath(checkpoint_path),
-        item_key="model",
-    )
-
-    consolidated = safetensors_load_file(
-        checkpoint_path / "model-00001-of-00001.safetensors"
-    )
-    torch.testing.assert_close(consolidated["weight"], full_weight)
-    torch.testing.assert_close(consolidated["plain"], plain)
+    with pytest.raises(ValueError, match="absent from checkpoint metadata.*plain"):
+        consolidate_hf_safetensors_checkpoint(
+            os.fspath(checkpoint_path),
+            item_key="model",
+        )
 
 
 def test_consolidate_hf_safetensors_rejects_missing_metadata(
@@ -569,6 +685,20 @@ def test_consolidate_hf_safetensors_rejects_missing_item_key(
             os.fspath(checkpoint_path),
             item_key="optimizer",
         )
+
+
+def test_consolidate_hf_safetensors_rejects_item_without_source_files(
+    tmp_path: Path,
+) -> None:
+    checkpoint_path = tmp_path / "checkpoint"
+    checkpoint_path.mkdir()
+    _write_metadata(
+        checkpoint_path,
+        rank_to_file_path={0: None, 1: None},
+    )
+
+    with pytest.raises(ValueError, match="No rank-local safetensors files"):
+        consolidate_hf_safetensors_checkpoint(os.fspath(checkpoint_path))
 
 
 def test_consolidate_hf_safetensors_synchronizes_two_ranks(
@@ -678,18 +808,28 @@ def test_consolidate_hf_safetensors_rejects_tensor_missing_from_mapping(
     checkpoint_path.mkdir()
 
     full_weight = torch.arange(8, dtype=torch.float32).reshape(4, 2)
+    other = torch.ones(2)
     safetensors_save_file(
-        {"weight": full_weight[:2].contiguous()},
+        {
+            "weight": full_weight[:2].contiguous(),
+            "other": other,
+        },
         checkpoint_path / "model_0.safetensors",
     )
     safetensors_save_file(
         {
             "weight": full_weight[2:].contiguous(),
-            "other": full_weight[2:].clone(),
+            "other": other,
         },
         checkpoint_path / "model_1.safetensors",
     )
-    _write_metadata(checkpoint_path)
+    _write_metadata(
+        checkpoint_path,
+        metadata_by_path={
+            ("weight",): _dtensor_metadata(),
+            ("other",): _replicated_tensor_metadata(other),
+        },
+    )
 
     with pytest.raises(ValueError, match="other"):
         consolidate_hf_safetensors_checkpoint(
@@ -700,7 +840,7 @@ def test_consolidate_hf_safetensors_rejects_tensor_missing_from_mapping(
 
 
 @pytest.mark.parametrize("validate_tensor_metadata", [False, True])
-def test_consolidate_hf_safetensors_treats_plain_tensor_on_multiple_ranks_as_replicated(
+def test_consolidate_hf_safetensors_uses_replicated_metadata_for_plain_tensor(
     tmp_path: Path,
     validate_tensor_metadata: bool,
 ) -> None:
@@ -715,7 +855,11 @@ def test_consolidate_hf_safetensors_treats_plain_tensor_on_multiple_ranks_as_rep
         {"plain": torch.zeros(2)},
         checkpoint_path / "model_1.safetensors",
     )
-    _write_metadata(checkpoint_path, include_sharding_metadata=False)
+    _write_metadata(
+        checkpoint_path,
+        nested_path=("plain",),
+        sharding_metadata=_replicated_tensor_metadata(torch.ones(2)),
+    )
 
     consolidate_hf_safetensors_checkpoint(
         os.fspath(checkpoint_path),
