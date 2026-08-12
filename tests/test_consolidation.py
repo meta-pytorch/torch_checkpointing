@@ -13,11 +13,13 @@ import os
 import pickle
 import socket
 from pathlib import Path
+from unittest import mock
 
 import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+import torch_checkpointing.hf.consolidation as consolidation_module
 from safetensors.torch import (
     load_file as safetensors_load_file,
     save_file as safetensors_save_file,
@@ -38,6 +40,7 @@ from torch_checkpointing.dtensor_metadata import (
     ShardSpec,
 )
 from torch_checkpointing.hf.consolidation import (
+    _assign_items_to_owners_by_size,
     _atomic_stream_write,
     _process_output_file,
     _read_safetensors_file_metadata_by_rank,
@@ -270,6 +273,56 @@ def _distributed_consolidation_worker(
                 )
                 torch.testing.assert_close(consolidated[fqn], expected)
             assert (consolidated_dir / "model.safetensors.index.json").exists()
+    finally:
+        dist.destroy_process_group()
+
+
+def _distributed_default_mapping_worker(
+    rank: int,
+    world_size: int,
+    checkpoint_path: str,
+    port: int,
+) -> None:
+    dist.init_process_group(
+        backend="gloo",
+        init_method=f"tcp://127.0.0.1:{port}",
+        rank=rank,
+        world_size=world_size,
+    )
+    try:
+        checkpoint_dir = Path(checkpoint_path)
+        full_weight = torch.arange(8, dtype=torch.float32).reshape(4, 2)
+        full_other = full_weight + 100
+        if rank < 2:
+            rank_slice = slice(0, 2) if rank == 0 else slice(2, 4)
+            safetensors_save_file(
+                {
+                    "weight": full_weight[rank_slice].contiguous(),
+                    "other": full_other[rank_slice].contiguous(),
+                },
+                checkpoint_dir / f"model_{rank}.safetensors",
+            )
+        if rank == 0:
+            _write_metadata(
+                checkpoint_dir,
+                nested_paths=(("weight",), ("other",)),
+            )
+        dist.barrier()
+
+        original_barrier = dist.barrier
+        barrier_calls = 0
+
+        def counted_barrier(*args, **kwargs):
+            nonlocal barrier_calls
+            barrier_calls += 1
+            return original_barrier(*args, **kwargs)
+
+        with mock.patch("torch.distributed.barrier", side_effect=counted_barrier):
+            consolidate_hf_safetensors_checkpoint(
+                checkpoint_path,
+                item_key="model",
+            )
+        assert barrier_calls == (3 if rank < 2 else 0)
     finally:
         dist.destroy_process_group()
 
@@ -522,8 +575,9 @@ def test_consolidate_hf_safetensors_rejects_nested_path_fqn_collision(
         )
 
 
-def test_consolidate_hf_safetensors_defaults_all_fqns_to_one_file(
+def test_consolidate_hf_safetensors_defaults_single_fqn_to_one_file(
     tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     checkpoint_path = tmp_path / "checkpoint"
     checkpoint_path.mkdir()
@@ -552,6 +606,7 @@ def test_consolidate_hf_safetensors_defaults_all_fqns_to_one_file(
         },
     )
 
+    caplog.set_level(logging.INFO, logger=consolidation_module.__name__)
     consolidate_hf_safetensors_checkpoint(
         os.fspath(checkpoint_path),
         item_key="model",
@@ -563,6 +618,16 @@ def test_consolidate_hf_safetensors_defaults_all_fqns_to_one_file(
     torch.testing.assert_close(consolidated["weight"], full_weight)
     torch.testing.assert_close(consolidated["plain"], plain)
     assert set(consolidated) == {"weight", "plain"}
+    assert any(
+        message.startswith("Writing consolidated HF safetensors shard")
+        for message in caplog.messages
+    )
+    for progress in (25, 50, 75):
+        assert any(f"progress={progress}%" in message for message in caplog.messages)
+    assert any(
+        message.startswith("Finished consolidated HF safetensors shard")
+        for message in caplog.messages
+    )
 
 
 def test_consolidate_hf_safetensors_exports_plain_only_item(
@@ -701,7 +766,55 @@ def test_consolidate_hf_safetensors_rejects_item_without_source_files(
         consolidate_hf_safetensors_checkpoint(os.fspath(checkpoint_path))
 
 
-def test_consolidate_hf_safetensors_synchronizes_two_ranks(
+def test_consolidate_hf_safetensors_destroys_created_group_if_planning_fails(
+    tmp_path: Path,
+) -> None:
+    checkpoint_path = tmp_path / "checkpoint"
+    checkpoint_path.mkdir()
+    full_weight = torch.arange(8, dtype=torch.float32).reshape(4, 2)
+    full_other = full_weight + 100
+    for rank, rank_slice in enumerate((slice(0, 2), slice(2, 4))):
+        safetensors_save_file(
+            {
+                "weight": full_weight[rank_slice].contiguous(),
+                "other": full_other[rank_slice].contiguous(),
+            },
+            checkpoint_path / f"model_{rank}.safetensors",
+        )
+    _write_metadata(
+        checkpoint_path,
+        nested_paths=(("weight",), ("other",)),
+    )
+    consolidation_group = mock.sentinel.consolidation_group
+
+    with (
+        mock.patch.object(dist, "is_available", return_value=True),
+        mock.patch.object(dist, "is_initialized", return_value=True),
+        mock.patch.object(dist, "get_rank", return_value=0),
+        mock.patch.object(dist, "get_world_size", return_value=2),
+        mock.patch.object(
+            consolidation_module,
+            "_create_consolidation_process_group",
+            return_value=(True, consolidation_group, True),
+        ),
+        mock.patch.object(
+            consolidation_module,
+            "_validate_input_output_paths_are_disjoint",
+            side_effect=ValueError("planning failed"),
+        ),
+        mock.patch.object(dist, "destroy_process_group") as destroy_process_group,
+        pytest.raises(ValueError, match="planning failed"),
+    ):
+        consolidate_hf_safetensors_checkpoint(
+            os.fspath(checkpoint_path),
+            fqn_to_index_mapping={"weight": 1, "other": 2},
+            item_key="model",
+        )
+
+    destroy_process_group.assert_called_once_with(consolidation_group)
+
+
+def test_consolidate_hf_safetensors_uses_rank_zero_for_single_output_file(
     tmp_path: Path,
 ) -> None:
     checkpoint_path = tmp_path / "checkpoint"
@@ -733,6 +846,66 @@ def test_consolidate_hf_safetensors_creates_output_dir_once(
         ),
         nprocs=2,
         join=True,
+    )
+
+
+def test_consolidate_hf_safetensors_balances_default_mapping_across_ranks(
+    tmp_path: Path,
+) -> None:
+    checkpoint_path = tmp_path / "checkpoint"
+    checkpoint_path.mkdir()
+
+    mp.spawn(
+        _distributed_default_mapping_worker,
+        args=(3, os.fspath(checkpoint_path), _get_free_port()),
+        nprocs=3,
+        join=True,
+    )
+
+    first_shard = safetensors_load_file(
+        checkpoint_path / "model-00001-of-00002.safetensors"
+    )
+    second_shard = safetensors_load_file(
+        checkpoint_path / "model-00002-of-00002.safetensors"
+    )
+    assert set(first_shard) | set(second_shard) == {"weight", "other"}
+    assert set(first_shard).isdisjoint(second_shard)
+    consolidated = {**first_shard, **second_shard}
+    torch.testing.assert_close(
+        consolidated["weight"],
+        torch.arange(8, dtype=torch.float32).reshape(4, 2),
+    )
+    torch.testing.assert_close(consolidated["other"], consolidated["weight"] + 100)
+
+    with open(checkpoint_path / "model.safetensors.index.json") as f:
+        index = json.load(f)
+    assert index["weight_map"] == {
+        fqn: filename
+        for filename, shard in (
+            ("model-00001-of-00002.safetensors", first_shard),
+            ("model-00002-of-00002.safetensors", second_shard),
+        )
+        for fqn in shard
+    }
+
+
+@pytest.mark.parametrize(
+    ("item_sizes", "expected_owners"),
+    [
+        ({1: 9, 2: 8, 3: 7}, {1: 0, 2: 1, 3: 1}),
+        ({1: 10, 2: 1}, {1: 0, 2: 1}),
+    ],
+)
+def test_assign_items_to_owners_by_size_balances_owners(
+    item_sizes: dict[int, int],
+    expected_owners: dict[int, int],
+) -> None:
+    assert (
+        _assign_items_to_owners_by_size(
+            item_sizes,
+            num_owners=2,
+        )
+        == expected_owners
     )
 
 

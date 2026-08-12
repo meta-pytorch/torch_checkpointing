@@ -15,12 +15,13 @@ import logging
 import math
 import os
 import struct
+import time
 import uuid
 from collections.abc import Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 
 import safetensors.torch as safetensors_torch
 import torch
@@ -48,6 +49,8 @@ from ..storage.filesystem import LocalFileSystemStorageConfig
 from ..types import NestedPath
 
 logger: logging.Logger = logging.getLogger(__name__)
+
+_Item = TypeVar("_Item", str, int)
 
 
 @contextmanager
@@ -228,9 +231,6 @@ def consolidate_hf_safetensors_checkpoint(
         rank = 0
         world_size = 1
 
-    # Sync checkpoint save completion is rank-local. Rank 0 writes metadata.pkl,
-    # so wait for every rank's save path before reading it for consolidation.
-    _barrier_if_distributed()
     distributed_metadata = load_distributed_metadata(input_checkpoint_dir, storage)
     if distributed_metadata is None:
         raise FileNotFoundError(
@@ -264,78 +264,116 @@ def consolidate_hf_safetensors_checkpoint(
         fqn_to_index_mapping,
         fqn_to_tensor_slices.keys(),
     )
-    if not fqn_to_index_mapping:
+    if not fqn_to_tensor_slices:
         return
 
     fqn_to_num_bytes = {
         fqn: math.prod(tensor_slices[0].shape) * tensor_slices[0].dtype_size
         for fqn, tensor_slices in fqn_to_tensor_slices.items()
     }
-    max_index = max(fqn_to_index_mapping.values())
+    if fqn_to_index_mapping is None:
+        fqn_to_index_mapping = _default_fqn_to_index_mapping(
+            fqn_to_num_bytes,
+            world_size,
+        )
+
+    output_file_sizes_by_index: dict[int, int] = {}
+    for fqn, index in fqn_to_index_mapping.items():
+        output_file_sizes_by_index[index] = (
+            output_file_sizes_by_index.get(index, 0) + fqn_to_num_bytes[fqn]
+        )
+    # Grouping FQNs into files and assigning complete files to ranks are
+    # separate: caller-provided mappings may be sparse, uneven, or contain
+    # more output files than ranks.
+    output_index_owners = _assign_items_to_owners_by_size(
+        output_file_sizes_by_index,
+        num_owners=world_size,
+    )
+    use_distributed = any(owner != 0 for owner in output_index_owners.values())
+    logger.info(
+        "HF safetensors consolidation mode=%s output_files=%s world_size=%s",
+        "distributed" if use_distributed else "rank_zero",
+        len(output_file_sizes_by_index),
+        world_size,
+    )
+    max_index = max(output_file_sizes_by_index)
     output_file_by_index = {
         index: os.path.join(
             output_dir,
             _item_output_file_name(item_key, index, max_index),
         )
-        for index in set(fqn_to_index_mapping.values())
+        for index in output_file_sizes_by_index
     }
-    assigned_indices = {
-        index for index in output_file_by_index if (index - 1) % world_size == rank
-    }
-    assigned_fqn_to_index_mapping = {
-        fqn: index
-        for fqn, index in fqn_to_index_mapping.items()
-        if index in assigned_indices
-    }
-    _validate_input_output_paths_are_disjoint(
-        input_file_paths=(
-            file_metadata.file_path for file_metadata in file_metadata_by_rank.values()
-        ),
-        output_file_paths=output_file_by_index.values(),
-    )
-    tensor_slices_by_index: dict[int, dict[str, list[TensorSlice]]] = {}
-    for fqn, index in assigned_fqn_to_index_mapping.items():
-        tensor_slices_by_index.setdefault(index, {})[fqn] = fqn_to_tensor_slices[fqn]
-    logger.info(
-        "Rank %s/%s assigned HF safetensors consolidation output_files=%s/%s "
-        "fqns=%s/%s bytes=%s/%s indices=%s",
+    (
+        participates,
+        consolidation_process_group,
+        created_consolidation_process_group,
+    ) = _create_consolidation_process_group(
         rank,
         world_size,
-        len(tensor_slices_by_index),
-        len(output_file_by_index),
-        len(assigned_fqn_to_index_mapping),
-        len(fqn_to_index_mapping),
-        sum(fqn_to_num_bytes[fqn] for fqn in assigned_fqn_to_index_mapping),
-        sum(fqn_to_num_bytes.values()),
-        sorted(assigned_indices),
+        output_index_owners.values(),
+        use_distributed,
     )
+    if not participates:
+        return
 
-    output_path = Path(output_dir)
-    if rank == 0 and not storage.exists(output_path):
-        storage.mkdir(output_path)
-    _barrier_if_distributed()
-    _write_assigned_output_files(
-        tensor_slices_by_index,
-        output_file_by_index,
-        storage,
-    )
+    try:
+        _validate_input_output_paths_are_disjoint(
+            input_file_paths=(
+                file_metadata.file_path
+                for file_metadata in file_metadata_by_rank.values()
+            ),
+            output_file_paths=output_file_by_index.values(),
+        )
+        assigned_indices = {
+            index for index, owner in output_index_owners.items() if owner == rank
+        }
+        assigned_fqn_to_index_mapping = {
+            fqn: index
+            for fqn, index in fqn_to_index_mapping.items()
+            if index in assigned_indices
+        }
+        tensor_slices_by_index: dict[int, dict[str, list[TensorSlice]]] = {}
+        for fqn, index in assigned_fqn_to_index_mapping.items():
+            tensor_slices_by_index.setdefault(index, {})[fqn] = fqn_to_tensor_slices[
+                fqn
+            ]
+        logger.info(
+            "Rank %s/%s assigned HF safetensors consolidation output_files=%s/%s "
+            "fqns=%s/%s bytes=%s/%s indices=%s",
+            rank,
+            world_size,
+            len(tensor_slices_by_index),
+            len(output_file_by_index),
+            len(assigned_fqn_to_index_mapping),
+            len(fqn_to_index_mapping),
+            sum(fqn_to_num_bytes[fqn] for fqn in assigned_fqn_to_index_mapping),
+            sum(fqn_to_num_bytes.values()),
+            sorted(assigned_indices),
+        )
 
-    _barrier_if_distributed()
-    if rank == 0:
-        _write_overall_hf_index_file(
-            output_dir,
-            fqn_to_index_mapping,
-            fqn_to_num_bytes,
-            output_file_by_index,
-            storage,
+        output_path = Path(output_dir)
+        if rank == 0 and not storage.exists(output_path):
+            storage.mkdir(output_path)
+        if use_distributed:
+            assert consolidation_process_group is not None
+            dist.barrier(group=consolidation_process_group)
+        _write_and_finalize_consolidated_output_files(
+            tensor_slices_by_index=tensor_slices_by_index,
+            fqn_to_index_mapping=fqn_to_index_mapping,
+            fqn_to_num_bytes=fqn_to_num_bytes,
+            output_file_by_index=output_file_by_index,
+            output_dir=output_dir,
+            storage=storage,
+            rank=rank,
+            use_distributed=use_distributed,
+            consolidation_process_group=consolidation_process_group,
             item_key=item_key,
         )
-    _barrier_if_distributed()
-
-
-def _barrier_if_distributed() -> None:
-    if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
-        dist.barrier()
+    finally:
+        if created_consolidation_process_group:
+            assert consolidation_process_group is not None
+            dist.destroy_process_group(consolidation_process_group)
 
 
 def _read_safetensors_file_metadata_by_rank(
@@ -365,6 +403,93 @@ def _read_safetensors_file_metadata_by_rank(
 
 def _item_output_file_name(item_key: str, index: int, max_index: int) -> str:
     return f"{item_key}-{index:05d}-of-{max_index:05d}.safetensors"
+
+
+def _assign_items_to_owners_by_size(
+    item_sizes: dict[_Item, int],
+    num_owners: int,
+) -> dict[_Item, int]:
+    assert num_owners >= 1
+
+    owner_loads = [0] * num_owners
+    item_to_owner: dict[_Item, int] = {}
+    for item, size in sorted(item_sizes.items(), key=lambda pair: (-pair[1], pair[0])):
+        owner = min(range(num_owners), key=lambda i: (owner_loads[i], i))
+        item_to_owner[item] = owner
+        owner_loads[owner] += size
+
+    return item_to_owner
+
+
+def _default_fqn_to_index_mapping(
+    fqn_to_num_bytes: dict[str, int],
+    world_size: int,
+) -> dict[str, int]:
+    num_output_files = min(world_size, len(fqn_to_num_bytes))
+    fqn_to_owner = _assign_items_to_owners_by_size(
+        fqn_to_num_bytes,
+        num_owners=num_output_files,
+    )
+    return {fqn: owner + 1 for fqn, owner in fqn_to_owner.items()}
+
+
+def _create_consolidation_process_group(
+    rank: int,
+    world_size: int,
+    output_index_owners: Iterable[int],
+    use_distributed: bool,
+) -> tuple[bool, dist.ProcessGroup | None, bool]:
+    if not use_distributed:
+        return rank == 0, None, False
+
+    participating_ranks = sorted({0, *output_index_owners})
+    if rank not in participating_ranks:
+        return False, None, False
+    if len(participating_ranks) == world_size:
+        return True, dist.group.WORLD, False
+    return (
+        True,
+        dist.new_group(
+            ranks=participating_ranks,
+            use_local_synchronization=True,
+            group_desc="hf_safetensors_consolidation",
+        ),
+        True,
+    )
+
+
+def _write_and_finalize_consolidated_output_files(
+    tensor_slices_by_index: dict[int, dict[str, list[TensorSlice]]],
+    fqn_to_index_mapping: dict[str, int],
+    fqn_to_num_bytes: dict[str, int],
+    output_file_by_index: dict[int, str],
+    output_dir: str,
+    storage: Storage,
+    rank: int,
+    use_distributed: bool,
+    consolidation_process_group: dist.ProcessGroup | None,
+    item_key: str,
+) -> None:
+    _write_assigned_output_files(
+        tensor_slices_by_index,
+        output_file_by_index,
+        storage,
+    )
+    if use_distributed:
+        assert consolidation_process_group is not None
+        dist.barrier(group=consolidation_process_group)
+    if rank == 0:
+        _write_overall_hf_index_file(
+            output_dir,
+            fqn_to_index_mapping,
+            fqn_to_num_bytes,
+            output_file_by_index,
+            storage,
+            item_key=item_key,
+        )
+    if use_distributed:
+        assert consolidation_process_group is not None
+        dist.barrier(group=consolidation_process_group)
 
 
 def _build_fqn_to_tensor_slices(
@@ -565,11 +690,11 @@ def _validate_written_tensor(
 def _validate_fqn_to_index_mapping(
     fqn_to_index_mapping: dict[str, int] | None,
     checkpoint_fqns: Iterable[str],
-) -> dict[str, int]:
+) -> dict[str, int] | None:
     checkpoint_fqns = set(checkpoint_fqns)
 
     if fqn_to_index_mapping is None:
-        return dict.fromkeys(sorted(checkpoint_fqns), 1)
+        return None
 
     for fqn, index in fqn_to_index_mapping.items():
         if not isinstance(index, int):
@@ -679,6 +804,19 @@ def _process_output_file(
     storage: Storage,
 ) -> None:
     metadata_bytes = _prepare_metadata(tensor_slices_by_fqn)
+    total_tensor_bytes = sum(
+        math.prod(tensor_slices[0].shape) * tensor_slices[0].dtype_size
+        for tensor_slices in tensor_slices_by_fqn.values()
+    )
+    start_time = time.monotonic()
+    logger.info(
+        "Writing consolidated HF safetensors shard output_file=%s tensors=%s bytes=%s",
+        output_file,
+        len(tensor_slices_by_fqn),
+        total_tensor_bytes,
+    )
+    written_tensor_bytes = 0
+    next_progress_percent = 25
     file_handles = {}
     try:
         with _atomic_stream_write(storage, Path(output_file)) as output_stream:
@@ -699,11 +837,14 @@ def _process_output_file(
                 for tensor_slice in tensor_slices:
                     byte_address = tensor_slice.byte_address
                     if byte_address.file_path not in file_handles:
-                        # Safetensors offsets and Python buffers are not guaranteed
-                        # to meet O_DIRECT alignment requirements.
+                        # Safetensors offsets and Python buffers are not
+                        # guaranteed to meet O_DIRECT alignment requirements.
                         file_handles[byte_address.file_path] = storage.stream_read(
                             Path(byte_address.file_path),
-                            ReadArgs(pre_read_full_file=False, direct_io=False),
+                            ReadArgs(
+                                pre_read_full_file=False,
+                                direct_io=False,
+                            ),
                         )
                     data_to_write = _read_tensor_data(
                         file_handles[byte_address.file_path],
@@ -711,20 +852,47 @@ def _process_output_file(
                     )
                     if not output_tensor_slice.shape:
                         full_tensor_mv[:] = data_to_write
-                        continue
-                    _write_sub_tensor_to_file_optimized(
-                        full_tensor_mv,
-                        data_to_write,
-                        output_tensor_slice.dtype_size,
-                        list(output_tensor_slice.shape),
-                        list(tensor_slice.offsets),
-                        list(tensor_slice.sizes),
-                    )
+                    else:
+                        _write_sub_tensor_to_file_optimized(
+                            full_tensor_mv,
+                            data_to_write,
+                            output_tensor_slice.dtype_size,
+                            list(output_tensor_slice.shape),
+                            list(tensor_slice.offsets),
+                            list(tensor_slice.sizes),
+                        )
+                    del data_to_write
 
                 output_stream.write(full_tensor_mv)
+                written_tensor_bytes += full_tensor_mv.nbytes
+                del full_tensor_mv
+                while (
+                    total_tensor_bytes > 0
+                    and next_progress_percent <= 75
+                    and written_tensor_bytes * 100
+                    >= total_tensor_bytes * next_progress_percent
+                ):
+                    logger.info(
+                        "HF safetensors shard write progress output_file=%s "
+                        "progress=%s%% bytes=%s/%s elapsed_seconds=%.2f",
+                        output_file,
+                        next_progress_percent,
+                        written_tensor_bytes,
+                        total_tensor_bytes,
+                        time.monotonic() - start_time,
+                    )
+                    next_progress_percent += 25
     finally:
         for f in file_handles.values():
             f.close()
+    logger.info(
+        "Finished consolidated HF safetensors shard output_file=%s tensors=%s "
+        "bytes=%s elapsed_seconds=%.2f",
+        output_file,
+        len(tensor_slices_by_fqn),
+        total_tensor_bytes,
+        time.monotonic() - start_time,
+    )
 
 
 def _read_tensor_data(
