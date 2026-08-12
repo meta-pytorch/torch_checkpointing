@@ -21,6 +21,7 @@ The key components are:
 
 import json
 import logging
+import pickle
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from functools import cached_property
@@ -29,6 +30,7 @@ from typing import Any, ClassVar
 
 from .checkpoint_layout import default_layout_info, LayoutInfo
 from .logging_utils import EventLogger, EventType
+from .storage.base_storage import Storage
 from .types import CheckpointPath, NestedPath
 
 logger = logging.getLogger(__name__)
@@ -522,3 +524,13 @@ class CheckpointMetadata:
 
     distributed_metadata: DistributedMetadata
     local_metadata: dict[str, dict[NestedPath, ShardingMetadata]]
+
+
+def load_distributed_metadata(
+    checkpoint_dir: str | Path,
+    storage: Storage,
+) -> DistributedMetadata | None:
+    metadata_path = Path(checkpoint_dir) / METADATA_FILE_NAME
+    if not storage.exists(metadata_path):
+        return None
+    return DistributedMetadata.from_dict(pickle.loads(storage.read(metadata_path)))
