@@ -6,12 +6,15 @@
 
 # Owner(s): ["oncall: pytorch_checkpointing"]
 
+import concurrent.futures
 import io
 import json
 import logging
 import os
 import pickle
 import socket
+import threading
+import time
 from pathlib import Path
 from unittest import mock
 
@@ -441,15 +444,29 @@ def test_process_output_file_rejects_multiple_scalar_slices(tmp_path: Path) -> N
         for source_rank, source_file in enumerate(source_files)
     ]
 
-    with pytest.raises(
-        AssertionError,
-        match="Scalar tensors require exactly one source slice",
-    ):
-        _process_output_file(
-            os.fspath(tmp_path / "output.safetensors"),
-            {"scalar": tensor_slices},
-            storage,
-        )
+    handles, register_handles, close_handles = (
+        consolidation_module._reader_handle_pool()
+    )
+    try:
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=1,
+            initializer=register_handles,
+        ) as read_executor:
+            with pytest.raises(
+                AssertionError,
+                match="Scalar tensors require exactly one source slice",
+            ):
+                _process_output_file(
+                    os.fspath(tmp_path / "output.safetensors"),
+                    {"scalar": tensor_slices},
+                    storage,
+                    read_executor,
+                    1,
+                    handles,
+                    consolidation_module._ReaderMemoryBudget(1 << 30),
+                )
+    finally:
+        close_handles()
 
 
 def test_read_tensor_data_handles_short_reads() -> None:
@@ -580,6 +597,137 @@ def test_consolidate_hf_safetensors_reads_contiguous_slices_into_output_buffer(
     )
     torch.testing.assert_close(consolidated["weight"], full_weight)
     assert (checkpoint_path / "model.safetensors.index.json").exists()
+
+
+def test_reader_handles_are_reused_across_tensors(tmp_path: Path) -> None:
+    source_file = tmp_path / "model_0.safetensors"
+    safetensors_save_file(
+        {"a": torch.ones(2, 2), "b": torch.zeros(2, 2)},
+        source_file,
+    )
+    storage = LocalFileSystemStorageConfig(use_direct_io=False).create_storage()
+    file_metadata = SafetensorsFileMetadata.from_file(
+        storage=storage,
+        file_path=os.fspath(source_file),
+        source_rank=0,
+    )
+    handles, register_handles, close_handles = (
+        consolidation_module._reader_handle_pool()
+    )
+    register_handles()
+
+    real_stream_read = storage.stream_read
+    with mock.patch.object(
+        storage, "stream_read", side_effect=real_stream_read
+    ) as stream_read:
+        try:
+            for fqn in ("a", "b"):
+                tensor_slice = file_metadata.tensors[fqn].with_global_layout(
+                    (2, 2), (0, 0)
+                )
+                consolidation_module._read_full_tensor_into_from_storage(
+                    [tensor_slice],
+                    storage,
+                    memoryview(bytearray(2 * 2 * 4)),
+                    handles,
+                )
+            # Both tensors live in one file, so the second read reuses the
+            # handle the first opened rather than reopening per tensor.
+            assert stream_read.call_count == 1
+        finally:
+            close_handles()
+
+    assert not handles.by_path
+
+
+def test_reader_memory_budget_always_admits_the_first_read() -> None:
+    budget = consolidation_module._ReaderMemoryBudget(8)
+
+    # Larger than the whole budget, but forced, so an oversized tensor cannot
+    # stall the pipeline.
+    assert budget.try_reserve(64, force=True)
+    assert not budget.try_reserve(1, force=False)
+    assert budget.exhausted_count == 1
+
+    budget.release(64)
+    assert budget.try_reserve(8, force=False)
+
+
+def test_reader_memory_budget_rejects_non_positive_total() -> None:
+    with pytest.raises(AssertionError, match="must be positive"):
+        consolidation_module._ReaderMemoryBudget(0)
+
+
+@pytest.mark.parametrize(
+    ("budget_bytes", "expected_max_active_reads"),
+    [(32, 1), (64, 2)],
+)
+def test_consolidate_hf_safetensors_bounds_reads_by_memory_budget(
+    tmp_path: Path,
+    budget_bytes: int,
+    expected_max_active_reads: int,
+) -> None:
+    checkpoint_path = tmp_path / "checkpoint"
+    checkpoint_path.mkdir()
+
+    full_weight = torch.arange(8, dtype=torch.float32).reshape(4, 2)
+    full_other = full_weight + 100
+    for rank, rank_slice in enumerate((slice(0, 2), slice(2, 4))):
+        safetensors_save_file(
+            {
+                "weight": full_weight[rank_slice].contiguous(),
+                "other": full_other[rank_slice].contiguous(),
+            },
+            checkpoint_path / f"model_{rank}.safetensors",
+        )
+    _write_metadata(
+        checkpoint_path,
+        nested_paths=(("weight",), ("other",)),
+    )
+
+    active_reads = 0
+    max_active_reads = 0
+    read_lock = threading.Lock()
+    read_tensor_data_into = consolidation_module._read_tensor_data_into
+
+    def tracked_read(*args, **kwargs) -> None:
+        nonlocal active_reads, max_active_reads
+        with read_lock:
+            active_reads += 1
+            max_active_reads = max(max_active_reads, active_reads)
+        try:
+            time.sleep(0.05)
+            read_tensor_data_into(*args, **kwargs)
+        finally:
+            with read_lock:
+                active_reads -= 1
+
+    # Each consolidated tensor is 32 bytes, so a 32-byte budget admits only the
+    # forced first read while 64 bytes admits a second alongside it.
+    with (
+        mock.patch.object(
+            consolidation_module,
+            "_READER_MEMORY_BUDGET_BYTES",
+            budget_bytes,
+        ),
+        mock.patch.object(
+            consolidation_module,
+            "_read_tensor_data_into",
+            side_effect=tracked_read,
+        ),
+    ):
+        consolidate_hf_safetensors_checkpoint(
+            os.fspath(checkpoint_path),
+            fqn_to_index_mapping={"weight": 1, "other": 1},
+            item_key="model",
+        )
+
+    assert max_active_reads == expected_max_active_reads
+    consolidated = safetensors_load_file(
+        checkpoint_path / "model-00001-of-00001.safetensors"
+    )
+    torch.testing.assert_close(consolidated["weight"], full_weight)
+    torch.testing.assert_close(consolidated["other"], full_other)
 
 
 def test_consolidate_hf_safetensors_writes_to_separate_output_dir(

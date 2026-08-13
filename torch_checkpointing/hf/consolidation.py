@@ -10,15 +10,25 @@ Utilities for checkpoint consolidation.
 
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import logging
 import math
 import os
 import struct
+import threading
 import time
 import uuid
-from collections.abc import Container, Iterable, Iterator, Mapping
-from contextlib import contextmanager
+from collections import deque
+from collections.abc import (
+    Callable,
+    Container,
+    Generator,
+    Iterable,
+    Iterator,
+    Mapping,
+)
+from contextlib import closing, contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, TypeVar
@@ -51,6 +61,19 @@ from ..types import NestedPath
 
 logger: logging.Logger = logging.getLogger(__name__)
 
+# Cap on concurrent readers. Reads block, so extra threads mainly hide
+# per-request latency rather than add bandwidth. Memory does not scale with this
+# value -- the budget below bounds it independently -- so the cap only limits
+# open file handles and scheduling overhead.
+_MAX_READER_THREADS = 16
+
+# Ceiling on bytes of consolidated tensors held for read-ahead at once. Fixed
+# rather than derived from the host: available-memory probes report the host and
+# not the container, and the local world size counts training processes rather
+# than the ranks doing consolidation work.
+_READER_MEMORY_BUDGET_BYTES = int(
+    os.environ.get("HF_CONSOLIDATION_MEMORY_BUDGET_BYTES", 8 * 1024 * 1024 * 1024)
+)
 _Item = TypeVar("_Item", str, int)
 
 
@@ -318,7 +341,8 @@ def consolidate_hf_safetensors_checkpoint(
     Contiguous destination slices are read directly into their final positions.
     Tensor shapes and dtypes are cross-checked between the two formats. Metadata tensors must exist in the declared safetensors files, and
     header FQNs absent from metadata are rejected. By default, consolidated files are written alongside the input
-    checkpoint and prefixed with ``item_key``.
+    checkpoint and prefixed with ``item_key``. Output files assigned to the same
+    rank are processed sequentially while their tensors are read concurrently.
     """
     storage = (
         storage_config if storage_config is not None else LocalFileSystemStorageConfig()
@@ -878,18 +902,120 @@ def _write_assigned_output_files(
     output_file_by_index: dict[int, str],
     storage: Storage,
 ) -> None:
-    for index, tensor_slices_by_fqn in tensor_slices_by_index.items():
-        _process_output_file(
-            output_file_by_index[index],
-            tensor_slices_by_fqn,
-            storage,
+    if not tensor_slices_by_index:
+        return
+
+    work_count = sum(
+        len(tensor_slices_by_fqn)
+        for tensor_slices_by_fqn in tensor_slices_by_index.values()
+    )
+    assert work_count > 0
+    # Memory is bounded by the budget, not by the thread count.
+    reader_threads = min(work_count, _MAX_READER_THREADS)
+    budget = _ReaderMemoryBudget(_READER_MEMORY_BUDGET_BYTES)
+    handles, register_handles, close_handles = _reader_handle_pool()
+    logger.info(
+        "Writing assigned HF safetensors shards output_files=%s "
+        "reader_threads=%s budget_bytes=%s",
+        len(tensor_slices_by_index),
+        reader_threads,
+        _READER_MEMORY_BUDGET_BYTES,
+    )
+    try:
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=reader_threads,
+            initializer=register_handles,
+        ) as read_executor:
+            for index, tensor_slices_by_fqn in tensor_slices_by_index.items():
+                _process_output_file(
+                    output_file_by_index[index],
+                    tensor_slices_by_fqn,
+                    storage,
+                    read_executor,
+                    reader_threads,
+                    handles,
+                    budget,
+                )
+    finally:
+        close_handles()
+    if budget.exhausted_count:
+        logger.info(
+            "HF safetensors read-ahead was budget limited times=%s budget_bytes=%s",
+            budget.exhausted_count,
+            _READER_MEMORY_BUDGET_BYTES,
         )
+
+
+class _ReaderMemoryBudget:
+    """Bounds the consolidated-tensor bytes reader threads hold at once.
+
+    Prefetch depth follows the tensors actually queued rather than an average
+    over the whole checkpoint, so a run of large FQNs throttles itself instead
+    of multiplying a small mean by the thread count. Reserving never blocks: the
+    reader simply stops prefetching until the writer releases, which also keeps
+    an ordered pipeline from deadlocking on a reservation held by a completed
+    read further back in the queue.
+    """
+
+    def __init__(self, total_bytes: int) -> None:
+        assert total_bytes > 0, f"Reader memory budget must be positive: {total_bytes}"
+        self._available = total_bytes
+        self._lock = threading.Lock()
+        self._exhausted_count = 0
+
+    def try_reserve(self, num_bytes: int, *, force: bool) -> bool:
+        """Reserve ``num_bytes`` if the budget allows.
+
+        ``force`` admits the read regardless, and is used for the first
+        outstanding read so a tensor larger than the whole budget still makes
+        progress.
+        """
+        with self._lock:
+            if not force and num_bytes > self._available:
+                self._exhausted_count += 1
+                return False
+            self._available -= num_bytes
+            return True
+
+    def release(self, num_bytes: int) -> None:
+        with self._lock:
+            self._available += num_bytes
+
+    @property
+    def exhausted_count(self) -> int:
+        """Times prefetch was declined for want of budget."""
+        with self._lock:
+            return self._exhausted_count
+
+
+def _tensor_memory_bytes(tensor_slices: list[TensorSlice]) -> int:
+    """Peak bytes to consolidate one tensor.
+
+    The output buffer, plus at most one staged source slice: slices are read one
+    at a time and each is released before the next, so this is not multiplied by
+    the slice count.
+    """
+    tensor_slice = tensor_slices[0]
+    full_tensor_bytes = math.prod(tensor_slice.shape) * tensor_slice.dtype_size
+    largest_buffered_source_bytes = max(
+        (
+            source_slice.byte_address.num_bytes
+            for source_slice in tensor_slices
+            if source_slice.contiguous_byte_range is None
+        ),
+        default=0,
+    )
+    return full_tensor_bytes + largest_buffered_source_bytes
 
 
 def _process_output_file(
     output_file: str,
     tensor_slices_by_fqn: dict[str, list[TensorSlice]],
     storage: Storage,
+    read_executor: concurrent.futures.ThreadPoolExecutor,
+    reader_threads: int,
+    handles: _ReaderHandles,
+    budget: _ReaderMemoryBudget,
 ) -> None:
     metadata_bytes = _prepare_metadata(tensor_slices_by_fqn)
     total_tensor_bytes = sum(
@@ -905,64 +1031,25 @@ def _process_output_file(
     )
     written_tensor_bytes = 0
     next_progress_percent = 25
-    file_handles = {}
-    try:
-        with _atomic_stream_write(storage, Path(output_file)) as output_stream:
-            output_stream.write(metadata_bytes)
-            for tensor_slices in tensor_slices_by_fqn.values():
-                output_tensor_slice = tensor_slices[0]
-                if not output_tensor_slice.shape:
-                    assert len(tensor_slices) == 1, (
-                        "Scalar tensors require exactly one source slice"
-                    )
-                full_tensor_mv = memoryview(
-                    bytearray(
-                        math.prod(output_tensor_slice.shape)
-                        * output_tensor_slice.dtype_size
-                    )
-                )
-
-                for tensor_slice in tensor_slices:
-                    byte_address = tensor_slice.byte_address
-                    if byte_address.file_path not in file_handles:
-                        # Safetensors offsets and Python buffers are not
-                        # guaranteed to meet O_DIRECT alignment requirements.
-                        file_handles[byte_address.file_path] = storage.stream_read(
-                            Path(byte_address.file_path),
-                            ReadArgs(
-                                pre_read_full_file=False,
-                                direct_io=False,
-                            ),
-                        )
-                    destination_range = tensor_slice.contiguous_byte_range
-                    if destination_range is not None:
-                        start, end = destination_range
-                        _read_tensor_data_into(
-                            file_handles[byte_address.file_path],
-                            byte_address,
-                            full_tensor_mv[start:end],
-                        )
-                        continue
-                    data_to_write = _read_tensor_data(
-                        file_handles[byte_address.file_path],
-                        byte_address,
-                    )
-                    if not output_tensor_slice.shape:
-                        full_tensor_mv[:] = data_to_write
-                    else:
-                        _write_sub_tensor_to_file_optimized(
-                            full_tensor_mv,
-                            data_to_write,
-                            output_tensor_slice.dtype_size,
-                            list(output_tensor_slice.shape),
-                            list(tensor_slice.offsets),
-                            list(tensor_slice.sizes),
-                        )
-                    del data_to_write
-
-                output_stream.write(full_tensor_mv)
-                written_tensor_bytes += full_tensor_mv.nbytes
-                del full_tensor_mv
+    with _atomic_stream_write(storage, Path(output_file)) as output_stream:
+        output_stream.write(metadata_bytes)
+        with closing(
+            _read_full_tensors_in_order(
+                tensor_slices_by_fqn,
+                storage,
+                read_executor,
+                reader_threads,
+                handles,
+                budget,
+            )
+        ) as full_tensors:
+            for full_tensor_mv in full_tensors:
+                tensor_bytes = full_tensor_mv.nbytes
+                try:
+                    output_stream.write(full_tensor_mv)
+                finally:
+                    del full_tensor_mv
+                written_tensor_bytes += tensor_bytes
                 while (
                     total_tensor_bytes > 0
                     and next_progress_percent <= 75
@@ -979,9 +1066,6 @@ def _process_output_file(
                         time.monotonic() - start_time,
                     )
                     next_progress_percent += 25
-    finally:
-        for f in file_handles.values():
-            f.close()
     logger.info(
         "Finished consolidated HF safetensors shard output_file=%s tensors=%s "
         "bytes=%s elapsed_seconds=%.2f",
@@ -990,6 +1074,172 @@ def _process_output_file(
         total_tensor_bytes,
         time.monotonic() - start_time,
     )
+
+
+def _read_full_tensors_in_order(
+    tensor_slices_by_fqn: Mapping[str, list[TensorSlice]],
+    storage: Storage,
+    read_executor: concurrent.futures.ThreadPoolExecutor,
+    reader_threads: int,
+    handles: _ReaderHandles,
+    budget: _ReaderMemoryBudget,
+) -> Generator[memoryview, None, None]:
+    """Prefetch tensors in metadata order, bounded by the reader memory budget."""
+    work = list(tensor_slices_by_fqn.values())
+    work_sizes = [_tensor_memory_bytes(tensor_slices) for tensor_slices in work]
+    pending: deque[tuple[concurrent.futures.Future[memoryview], int]] = deque()
+    next_index = 0
+
+    try:
+        while next_index < len(work) or pending:
+            while next_index < len(work) and len(pending) < reader_threads:
+                # The first outstanding read is always admitted so an oversized
+                # tensor cannot stall; the rest wait for the writer to release.
+                if not budget.try_reserve(work_sizes[next_index], force=not pending):
+                    break
+                pending.append(
+                    (
+                        read_executor.submit(
+                            _read_full_tensor,
+                            work[next_index],
+                            storage,
+                            handles,
+                        ),
+                        work_sizes[next_index],
+                    )
+                )
+                next_index += 1
+
+            future, reserved_bytes = pending.popleft()
+            try:
+                full_tensor_mv = future.result()
+            except BaseException:
+                budget.release(reserved_bytes)
+                raise
+            try:
+                yield full_tensor_mv
+            finally:
+                del full_tensor_mv
+                budget.release(reserved_bytes)
+    finally:
+        for future, reserved_bytes in pending:
+            future.cancel()
+            budget.release(reserved_bytes)
+        if pending:
+            concurrent.futures.wait([future for future, _ in pending])
+
+
+def _allocate_full_tensor(
+    tensor_slices: list[TensorSlice],
+) -> memoryview:
+    output_tensor_slice = tensor_slices[0]
+    return memoryview(
+        bytearray(math.prod(output_tensor_slice.shape) * output_tensor_slice.dtype_size)
+    )
+
+
+class _ReaderHandles(threading.local):
+    """Source file handles owned by a single reader thread.
+
+    A handle carries one file position, so concurrent seek+readinto on a shared
+    handle would race. Keeping the cache thread-local preserves that safety
+    while holding opens to threads x source files rather than reopening every
+    source file for each tensor.
+    """
+
+    def __init__(self) -> None:
+        self.by_path: dict[str, Any] = {}
+
+
+def _reader_handle_pool() -> tuple[
+    _ReaderHandles,
+    Callable[[], None],
+    Callable[[], None],
+]:
+    """Thread-local handle cache plus its pool initializer and teardown.
+
+    ``threading.local`` gives no way to enumerate instances, so each worker
+    registers its own cache on startup and the caller closes them all once the
+    pool has shut down.
+    """
+    handles = _ReaderHandles()
+    registered: list[dict[str, Any]] = []
+    lock = threading.Lock()
+
+    def register() -> None:
+        with lock:
+            registered.append(handles.by_path)
+
+    def close_all() -> None:
+        with lock:
+            for by_path in registered:
+                for handle in by_path.values():
+                    handle.close()
+                by_path.clear()
+            registered.clear()
+
+    return handles, register, close_all
+
+
+def _read_full_tensor(
+    tensor_slices: list[TensorSlice],
+    storage: Storage,
+    handles: _ReaderHandles,
+) -> memoryview:
+    full_tensor_mv = _allocate_full_tensor(tensor_slices)
+    _read_full_tensor_into_from_storage(
+        tensor_slices,
+        storage,
+        full_tensor_mv,
+        handles,
+    )
+    return full_tensor_mv
+
+
+def _read_full_tensor_into_from_storage(
+    tensor_slices: list[TensorSlice],
+    storage: Storage,
+    full_tensor_mv: memoryview,
+    handles: _ReaderHandles,
+) -> None:
+    output_tensor_slice = tensor_slices[0]
+    if not output_tensor_slice.shape:
+        assert len(tensor_slices) == 1, (
+            "Scalar tensors require exactly one source slice"
+        )
+    for tensor_slice in tensor_slices:
+        byte_address = tensor_slice.byte_address
+        file_handle = handles.by_path.get(byte_address.file_path)
+        if file_handle is None:
+            # Safetensors offsets and Python buffers are not guaranteed to
+            # meet O_DIRECT alignment requirements.
+            file_handle = storage.stream_read(
+                Path(byte_address.file_path),
+                ReadArgs(pre_read_full_file=False, direct_io=False),
+            )
+            handles.by_path[byte_address.file_path] = file_handle
+        destination_range = tensor_slice.contiguous_byte_range
+        if destination_range is not None:
+            start, end = destination_range
+            _read_tensor_data_into(
+                file_handle,
+                byte_address,
+                full_tensor_mv[start:end],
+            )
+            continue
+        data_to_write = _read_tensor_data(
+            file_handle,
+            byte_address,
+        )
+        _write_sub_tensor_to_file_optimized(
+            full_tensor_mv,
+            data_to_write,
+            output_tensor_slice.dtype_size,
+            list(output_tensor_slice.shape),
+            list(tensor_slice.offsets),
+            list(tensor_slice.sizes),
+        )
+        del data_to_write
 
 
 def _read_tensor_data_into(
