@@ -230,7 +230,6 @@ def _distributed_rank_and_world_size() -> tuple[int, int]:
 def _load_consolidation_tensor_slices(
     input_checkpoint_dir: str,
     item_key: str,
-    validate_tensor_metadata: bool,
     storage: Storage,
 ) -> tuple[dict[int, SafetensorsFileMetadata], dict[str, list[TensorSlice]]]:
     distributed_metadata = load_distributed_metadata(input_checkpoint_dir, storage)
@@ -258,7 +257,6 @@ def _load_consolidation_tensor_slices(
         nested_path_to_metadata=item_metadata.nested_path_to_metadata,
         rank_to_layout_info=item_metadata.rank_to_layout_info,
         file_metadata_by_rank=file_metadata_by_rank,
-        validate_tensor_metadata=validate_tensor_metadata,
     )
 
 
@@ -268,7 +266,6 @@ def consolidate_hf_safetensors_checkpoint(
     output_dir: str | None = None,
     fqn_to_index_mapping: dict[str, int] | None = None,
     item_key: str = "model",
-    validate_tensor_metadata: bool = True,
     storage_config: StorageConfig | None = None,
 ) -> None:
     """
@@ -277,10 +274,8 @@ def consolidate_hf_safetensors_checkpoint(
     ``metadata.pkl`` defines the tensors, their global layouts, and their source
     files. Rank-local safetensors headers supply byte layouts for those tensors.
     Contiguous destination slices are read directly into their final positions.
-    Set ``validate_tensor_metadata=False`` to skip cross-checking tensor shapes,
-    dtypes, and byte spans between the two formats. Metadata tensors must still
-    exist in the declared safetensors files, and header FQNs absent from metadata
-    are rejected. By default, consolidated files are written alongside the input
+    Tensor shapes and dtypes are cross-checked between the two formats. Metadata tensors must exist in the declared safetensors files, and
+    header FQNs absent from metadata are rejected. By default, consolidated files are written alongside the input
     checkpoint and prefixed with ``item_key``.
     """
     storage = (
@@ -292,7 +287,6 @@ def consolidate_hf_safetensors_checkpoint(
     file_metadata_by_rank, fqn_to_tensor_slices = _load_consolidation_tensor_slices(
         input_checkpoint_dir,
         item_key,
-        validate_tensor_metadata,
         storage,
     )
     fqn_to_index_mapping = _validate_fqn_to_index_mapping(
@@ -534,7 +528,6 @@ def _build_fqn_to_tensor_slices(
     ],
     rank_to_layout_info: Mapping[int, LayoutInfo | None],
     file_metadata_by_rank: Mapping[int, SafetensorsFileMetadata],
-    validate_tensor_metadata: bool,
 ) -> dict[str, list[TensorSlice]]:
     written_fqns = {
         fqn
@@ -558,7 +551,6 @@ def _build_fqn_to_tensor_slices(
             groups=groups,
             rank_to_layout_info=rank_to_layout_info,
             file_metadata_by_rank=file_metadata_by_rank,
-            validate_tensor_metadata=validate_tensor_metadata,
         )
 
     unexpected_fqns = sorted(written_fqns - result.keys())
@@ -576,7 +568,6 @@ def _resolve_distributed_tensor_slices(
     groups: list[GlobalObjectMetadata],
     rank_to_layout_info: Mapping[int, LayoutInfo | None],
     file_metadata_by_rank: Mapping[int, SafetensorsFileMetadata],
-    validate_tensor_metadata: bool,
 ) -> list[TensorSlice]:
     fqn = get_fqn_from_nested_path(nested_path)
     _validate_sharding_metadata_groups(nested_path, groups)
@@ -591,7 +582,6 @@ def _resolve_distributed_tensor_slices(
                 sharding_metadata=sharding_metadata,
                 rank_to_layout_info=rank_to_layout_info,
                 file_metadata_by_rank=file_metadata_by_rank,
-                validate_tensor_metadata=validate_tensor_metadata,
             )
             if tensor_slice is None:
                 continue
@@ -654,7 +644,6 @@ def _resolve_distributed_tensor_slice(
     sharding_metadata: DTensorShardingMetadata,
     rank_to_layout_info: Mapping[int, LayoutInfo | None],
     file_metadata_by_rank: Mapping[int, SafetensorsFileMetadata],
-    validate_tensor_metadata: bool,
 ) -> TensorSlice | None:
     if source_rank not in rank_to_layout_info:
         raise ValueError(
@@ -677,13 +666,12 @@ def _resolve_distributed_tensor_slice(
     )
     torch_dtype = _torch_dtype_from_checkpoint_metadata(sharding_metadata.dtype)
     expected_local_shape = tuple(local_shape)
-    if validate_tensor_metadata:
-        _validate_written_tensor(
-            fqn=fqn,
-            tensor_slice=written_slice,
-            expected_shape=expected_local_shape,
-            expected_dtype=torch_dtype,
-        )
+    _validate_written_tensor(
+        fqn=fqn,
+        tensor_slice=written_slice,
+        expected_shape=expected_local_shape,
+        expected_dtype=torch_dtype,
+    )
     return written_slice.with_global_layout(
         global_shape=tuple(sharding_metadata.global_shape),
         global_offsets=tuple(global_offsets),
@@ -710,15 +698,6 @@ def _validate_written_tensor(
             f"Cannot consolidate {fqn!r} from rank {rank}: safetensors dtype "
             f"{_to_safetensors_dtype(tensor_slice.torch_dtype, fqn)!r} does not match "
             f"expected dtype {_to_safetensors_dtype(expected_dtype, fqn)!r}"
-        )
-    expected_bytes = math.prod(expected_shape) * torch._utils._element_size(
-        expected_dtype
-    )
-    if tensor_slice.byte_address.num_bytes != expected_bytes:
-        raise ValueError(
-            f"Cannot consolidate {fqn!r} from rank {rank}: safetensors byte span "
-            f"{tensor_slice.byte_address.num_bytes} does not match expected byte "
-            f"span {expected_bytes}"
         )
 
 

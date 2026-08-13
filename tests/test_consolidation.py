@@ -1123,10 +1123,8 @@ def test_consolidate_hf_safetensors_rejects_tensor_missing_from_mapping(
         )
 
 
-@pytest.mark.parametrize("validate_tensor_metadata", [False, True])
 def test_consolidate_hf_safetensors_uses_replicated_metadata_for_plain_tensor(
     tmp_path: Path,
-    validate_tensor_metadata: bool,
 ) -> None:
     checkpoint_path = tmp_path / "checkpoint"
     checkpoint_path.mkdir()
@@ -1148,7 +1146,6 @@ def test_consolidate_hf_safetensors_uses_replicated_metadata_for_plain_tensor(
     consolidate_hf_safetensors_checkpoint(
         os.fspath(checkpoint_path),
         item_key="model",
-        validate_tensor_metadata=validate_tensor_metadata,
     )
 
     consolidated = safetensors_load_file(
@@ -1157,7 +1154,7 @@ def test_consolidate_hf_safetensors_uses_replicated_metadata_for_plain_tensor(
     torch.testing.assert_close(consolidated["plain"], torch.ones(2))
 
 
-def test_consolidate_hf_safetensors_can_disable_tensor_metadata_validation(
+def test_consolidate_hf_safetensors_rejects_shape_mismatch_against_metadata(
     tmp_path: Path,
 ) -> None:
     checkpoint_path = tmp_path / "checkpoint"
@@ -1174,23 +1171,14 @@ def test_consolidate_hf_safetensors_can_disable_tensor_metadata_validation(
     )
     _write_metadata(checkpoint_path)
 
+    # Rank 1 saved its shard flattened, so the header shape disagrees with the
+    # shape the sharding metadata implies even though the byte count matches.
     with pytest.raises(ValueError, match="safetensors shape"):
         consolidate_hf_safetensors_checkpoint(
             os.fspath(checkpoint_path),
             fqn_to_index_mapping={"weight": 1},
             item_key="model",
         )
-
-    consolidate_hf_safetensors_checkpoint(
-        os.fspath(checkpoint_path),
-        fqn_to_index_mapping={"weight": 1},
-        item_key="model",
-        validate_tensor_metadata=False,
-    )
-    consolidated = safetensors_load_file(
-        checkpoint_path / "model-00001-of-00001.safetensors"
-    )
-    torch.testing.assert_close(consolidated["weight"], full_weight)
 
 
 def test_consolidate_hf_safetensors_ignores_unused_rank_layout(
