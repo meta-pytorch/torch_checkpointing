@@ -74,6 +74,28 @@ def _layout(file_path: str) -> LayoutInfo:
     return LayoutInfo(file_path, SafetensorsSerialization())
 
 
+def _two_element_file_metadata(source_rank: int) -> SafetensorsFileMetadata:
+    file_path = f"model_{source_rank}.safetensors"
+    return SafetensorsFileMetadata(
+        file_path=file_path,
+        tensors={
+            "weight": SafetensorsTensorSlice(
+                global_shape=None,
+                global_offsets=None,
+                local_offsets=(0,),
+                slice_shape=(2,),
+                source_rank=source_rank,
+                torch_dtype=torch.float32,
+                byte_address=HFSafetensorByteAddress(
+                    file_path=file_path,
+                    start_byte_offset=16,
+                    end_byte_offset=24,
+                ),
+            )
+        },
+    )
+
+
 def test_atomic_stream_write_replaces_file_after_success(tmp_path: Path) -> None:
     path = tmp_path / "output.safetensors"
     path.write_bytes(b"old")
@@ -416,6 +438,38 @@ def test_safetensors_file_metadata_reads_unresolved_file_header(
     assert resolved_weight.byte_address == weight.byte_address
     assert resolved_weight.local_offsets == weight.local_offsets
     assert resolved_weight.slice_shape == weight.slice_shape
+
+
+def test_build_fqn_to_tensor_slices_selects_one_complete_metadata_group() -> None:
+    # Both groups shard the same tensor two ways, over disjoint rank pairs.
+    groups = [
+        GlobalObjectMetadata(
+            sharding_metadata=DTensorShardingMetadata(
+                global_shape=(4,),
+                dtype=str(torch.float32),
+                stride=(1,),
+                mesh_spec=get_device_mesh_spec(
+                    device_type="cpu",
+                    mesh_shape=(2,),
+                    mesh_data=group_ranks,
+                    mesh_dim_names=None,
+                ),
+                placements=(ShardSpec(dim=0),),
+            ),
+            ranks=group_ranks,
+        )
+        for group_ranks in ((1, 2), (0, 3))
+    ]
+    ranks = (0, 1, 2, 3)
+
+    result = consolidation_module._build_fqn_to_tensor_slices(
+        {("weight",): groups},
+        {rank: _layout(f"model_{rank}.safetensors") for rank in ranks},
+        {rank: _two_element_file_metadata(rank) for rank in ranks},
+    )["weight"]
+
+    assert {tensor_slice.source_rank for tensor_slice in result} == {0, 3}
+    assert [tensor_slice.global_offsets for tensor_slice in result] == [(0,), (2,)]
 
 
 def test_read_safetensors_file_metadata_by_rank_uses_only_declared_layouts(

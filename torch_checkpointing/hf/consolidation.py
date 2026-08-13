@@ -665,28 +665,25 @@ def _resolve_distributed_tensor_slices(
     selected_slices: dict[
         tuple[tuple[int, ...], tuple[int, ...]], SafetensorsTensorSlice
     ] = {}
-    for group in groups:
-        sharding_metadata = group.sharding_metadata
-        assert isinstance(sharding_metadata, DTensorShardingMetadata)
-        for source_rank in group.ranks:
-            tensor_slice = _resolve_distributed_tensor_slice(
-                fqn=fqn,
-                source_rank=source_rank,
-                sharding_metadata=sharding_metadata,
-                rank_to_layout_info=rank_to_layout_info,
-                file_metadata_by_rank=file_metadata_by_rank,
-            )
-            if tensor_slice is None:
-                continue
-            global_offsets = tensor_slice.global_offsets
-            assert global_offsets is not None
-            slice_key = (global_offsets, tensor_slice.slice_shape)
-            existing_slice = selected_slices.get(slice_key)
-            if (
-                existing_slice is None
-                or tensor_slice.source_rank < existing_slice.source_rank
-            ):
-                selected_slices[slice_key] = tensor_slice
+    # Every region comes from one metadata group, so a tensor is never stitched
+    # together from ranks that disagree about how it was sharded.
+    group = min(groups, key=lambda group: tuple(sorted(group.ranks)))
+    sharding_metadata = group.sharding_metadata
+    assert isinstance(sharding_metadata, DTensorShardingMetadata)
+    for source_rank in sorted(group.ranks):
+        tensor_slice = _resolve_distributed_tensor_slice(
+            fqn=fqn,
+            source_rank=source_rank,
+            sharding_metadata=sharding_metadata,
+            rank_to_layout_info=rank_to_layout_info,
+            file_metadata_by_rank=file_metadata_by_rank,
+        )
+        if tensor_slice is None:
+            continue
+        global_offsets = tensor_slice.global_offsets
+        assert global_offsets is not None
+        slice_key = (global_offsets, tensor_slice.slice_shape)
+        selected_slices.setdefault(slice_key, tensor_slice)
 
     if not selected_slices:
         raise ValueError(
