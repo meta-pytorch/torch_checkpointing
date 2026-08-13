@@ -323,9 +323,10 @@ writer support a custom encoding.
 A resharder runs on **load** to map data saved under one distributed layout onto
 this rank's target layout. Items with no resharder are read back directly.
 
-- **`DTensorResharder()`** — reshards DTensor state across different Shard/Replicate
-  placements and device mesh configurations, using DTensor's native placement APIs
-  to compute shard geometry. It takes no constructor arguments.
+- **`DTensorResharder()`** — reshards DTensor state across different
+  Shard/Replicate placements, StridedShard layouts, and device mesh
+  configurations. Disjoint rank-local layouts are represented as multiple
+  contiguous load-plan slices. It takes no constructor arguments.
 - **Custom `Resharder`** — for state that is not a plain DTensor (for example,
   dataloader progress), subclass `Resharder` and implement its two abstract
   methods, `extract_sharding_metadata()` and `load()`.

@@ -28,6 +28,7 @@ import torch.distributed as dist
 from torch.distributed.tensor import DTensor
 from torch.distributed.tensor._utils import _compute_local_shape_and_global_offset
 from torch.distributed.tensor.placement_types import (
+    _StridedShard as DTensorStridedShard,
     Placement as DTensorPlacement,
     Replicate as DTensorReplicate,
     Shard as DTensorShard,
@@ -43,6 +44,7 @@ from .dtensor_metadata import (
     get_device_mesh_spec,
     ReplicateSpec,
     ShardSpec,
+    StridedShardSpec,
 )
 from .resharding import (
     LoadPlan,
@@ -86,14 +88,16 @@ def _to_dtensor_placements(
         metadata: DTensorShardingMetadata containing ShardSpec/ReplicateSpec placements.
 
     Returns:
-        List of DTensor placement objects (Shard/Replicate).
+        List of DTensor placement objects (Shard/StridedShard/Replicate).
 
     Raises:
         ValueError: If an unsupported placement type is encountered.
     """
     placements: list[DTensorPlacement] = []
     for p in metadata.placements:
-        if isinstance(p, ShardSpec):
+        if isinstance(p, StridedShardSpec):
+            placements.append(DTensorStridedShard(p.dim, split_factor=p.split_factor))
+        elif isinstance(p, ShardSpec):
             placements.append(DTensorShard(p.dim))
         elif isinstance(p, ReplicateSpec):
             placements.append(DTensorReplicate())

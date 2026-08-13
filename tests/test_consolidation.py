@@ -41,6 +41,7 @@ from torch_checkpointing.dtensor_metadata import (
     get_device_mesh_spec,
     ReplicateSpec,
     ShardSpec,
+    StridedShardSpec,
 )
 from torch_checkpointing.hf.consolidation import (
     _assign_items_to_owners_by_size,
@@ -470,6 +471,50 @@ def test_build_fqn_to_tensor_slices_selects_one_complete_metadata_group() -> Non
 
     assert {tensor_slice.source_rank for tensor_slice in result} == {0, 3}
     assert [tensor_slice.global_offsets for tensor_slice in result] == [(0,), (2,)]
+
+
+def test_build_fqn_to_tensor_slices_resolves_strided_shard(tmp_path: Path) -> None:
+    """FSDP + TP emits StridedShard; each rank still holds one contiguous block."""
+    sharding_metadata = DTensorShardingMetadata(
+        global_shape=(8, 2),
+        dtype=str(torch.float32),
+        stride=(2, 1),
+        mesh_spec=get_device_mesh_spec(
+            device_type="cpu",
+            mesh_shape=(2, 2),
+            mesh_data=(0, 1, 2, 3),
+            mesh_dim_names=("dp", "tp"),
+        ),
+        placements=(StridedShardSpec(dim=0, split_factor=2), ShardSpec(dim=0)),
+    )
+    storage = LocalFileSystemStorageConfig(use_direct_io=False).create_storage()
+    file_metadata_by_rank = {}
+    for rank in range(4):
+        file_path = tmp_path / f"model_{rank}.safetensors"
+        safetensors_save_file({"weight": torch.zeros(2, 2)}, file_path)
+        file_metadata_by_rank[rank] = SafetensorsFileMetadata.from_file(
+            storage=storage,
+            file_path=os.fspath(file_path),
+            source_rank=rank,
+        )
+
+    tensor_slices = consolidation_module._build_fqn_to_tensor_slices(
+        {
+            ("weight",): [
+                GlobalObjectMetadata(
+                    sharding_metadata=sharding_metadata, ranks=(0, 1, 2, 3)
+                )
+            ]
+        },
+        {rank: _layout(f"model_{rank}.safetensors") for rank in range(4)},
+        file_metadata_by_rank,
+    )["weight"]
+
+    assert {
+        tensor_slice.source_rank: tensor_slice.global_offsets
+        for tensor_slice in tensor_slices
+    } == {0: (0, 0), 1: (4, 0), 2: (2, 0), 3: (6, 0)}
+    assert all(tensor_slice.slice_shape == (2, 2) for tensor_slice in tensor_slices)
 
 
 def test_read_safetensors_file_metadata_by_rank_uses_only_declared_layouts(

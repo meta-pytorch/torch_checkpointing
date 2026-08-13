@@ -21,6 +21,8 @@ import torch
 import torch.distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import distribute_tensor, DTensor, Replicate, Shard
+from torch.distributed.tensor._utils import _compute_local_shape_and_global_offset
+from torch.distributed.tensor.placement_types import _StridedShard
 from torch.testing._internal.distributed._tensor.common_dtensor import (
     DTensorTestBase,
     with_comms,
@@ -42,9 +44,14 @@ from torch_checkpointing.distributed_metadata import (
 from torch_checkpointing.dtensor_metadata import (
     DeviceMeshSpec,
     DTensorShardingMetadata,
+    get_device_mesh_spec,
     ShardSpec,
+    StridedShardSpec,
 )
-from torch_checkpointing.dtensor_resharder import DTensorResharder
+from torch_checkpointing.dtensor_resharder import (
+    compute_local_shard_info,
+    DTensorResharder,
+)
 from torch_checkpointing.metadata_manager import (
     CheckpointMetadata,
     DefaultMetadataManager,
@@ -922,3 +929,32 @@ class TestDTensorResharder(DTensorTestBase):
 
         # Verify epoch loaded without resharding
         self.assertEqual(result_dict["epoch"], 42)
+
+
+@pytest.mark.parametrize("rank", range(4))
+def test_compute_local_shard_info_matches_dtensor_for_strided_shard(rank: int) -> None:
+    """Strided shard geometry must agree with DTensor's own computation."""
+    placements = (StridedShardSpec(dim=0, split_factor=2), ShardSpec(dim=0))
+    metadata = DTensorShardingMetadata(
+        global_shape=(8, 2),
+        dtype=str(torch.float32),
+        stride=(2, 1),
+        mesh_spec=get_device_mesh_spec(
+            device_type="cpu",
+            mesh_shape=(2, 2),
+            mesh_data=(0, 1, 2, 3),
+            mesh_dim_names=("dp", "tp"),
+        ),
+        placements=placements,
+    )
+
+    local_shape, global_offset = compute_local_shard_info(metadata, rank)
+
+    expected_shape, expected_offset = _compute_local_shape_and_global_offset(
+        torch.Size((8, 2)),
+        torch.Size((2, 2)),
+        [rank // 2, rank % 2],
+        [_StridedShard(0, split_factor=2), Shard(0)],
+    )
+    assert tuple(local_shape) == tuple(expected_shape)
+    assert tuple(global_offset) == tuple(expected_offset)

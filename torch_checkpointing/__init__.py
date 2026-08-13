@@ -50,6 +50,7 @@ from .dtensor_metadata import (
     get_device_mesh_spec,
     ReplicateSpec,
     ShardSpec,
+    StridedShardSpec,
 )
 from .metadata_manager import DefaultMetadataManager, MetadataManager
 from .resharding import LoadPlan, Resharder, ReshardingInfo
@@ -71,6 +72,7 @@ from .version import __version__, get_version, Version
 __all__ = [
     "CheckpointManager",
     "ItemSpec",
+    "StridedShardSpec",
     "__version__",
     "get_version",
     "Version",

@@ -14,6 +14,7 @@ ShardingMetadata interface defined in distributed_metadata.py.
 The key components are:
 - _PlacementSpec: Base class for DTensor placement specifications
 - ShardSpec: Shard placement specification (shards a tensor dimension)
+- StridedShardSpec: Right-to-left shard placement specification
 - ReplicateSpec: Replicate placement specification (replicates across a mesh dimension)
 - DeviceMeshSpec: Lightweight, immutable device mesh specification
 - DTensorShardingMetadata: Complete DTensor distribution information
@@ -27,6 +28,7 @@ from typing import Any
 import torch
 from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.placement_types import (
+    _StridedShard as DTensorStridedShard,
     Replicate as DTensorReplicate,
     Shard as DTensorShard,
 )
@@ -96,6 +98,38 @@ class ShardSpec(_PlacementSpec):
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "_PlacementSpec":
         return ShardSpec(dim=d["dim"])
+
+
+@dataclass(frozen=True)
+class StridedShardSpec(_PlacementSpec):
+    """Right-to-left DTensor sharding on a tensor dimension.
+
+    ``split_factor`` records how many same-dimension shards are logically
+    applied after this placement.
+    """
+
+    dim: int
+    split_factor: int
+
+    def __repr__(self) -> str:
+        return f"StridedShardSpec(dim={self.dim}, split_factor={self.split_factor})"
+
+    def __str__(self) -> str:
+        return f"StridedShard({self.dim}, split_factor={self.split_factor})"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "type": "StridedShard",
+            "dim": self.dim,
+            "split_factor": self.split_factor,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "_PlacementSpec":
+        return StridedShardSpec(
+            dim=d["dim"],
+            split_factor=d["split_factor"],
+        )
 
 
 @dataclass(frozen=True)
@@ -307,7 +341,15 @@ class DTensorShardingMetadata(ShardingMetadata):
         # Convert DTensor placements to our custom placement types
         converted_placements = []
         for placement in dtensor.placements:
-            if isinstance(placement, DTensorShard):
+            if isinstance(placement, DTensorStridedShard):
+                converted_placements.append(
+                    StridedShardSpec(
+                        dim=placement.dim,
+                        split_factor=int(placement.split_factor),
+                    )
+                )
+                continue
+            elif isinstance(placement, DTensorShard):
                 converted_placements.append(ShardSpec(dim=placement.dim))
                 continue
             elif isinstance(placement, DTensorReplicate):
@@ -315,7 +357,8 @@ class DTensorShardingMetadata(ShardingMetadata):
                 continue
             raise RuntimeError(
                 f"Unsupported placement type {type(placement)} encountered for DTensor. "
-                "During checkpointing, we only support Shard and Replicate placements."
+                "During checkpointing, we only support Shard, StridedShard, and "
+                "Replicate placements."
             )
 
         # Create DeviceMeshSpec from the DTensor's device mesh using factory method
@@ -357,19 +400,24 @@ class DTensorShardingMetadata(ShardingMetadata):
         Returns:
             A DTensorShardingMetadata object constructed from the dictionary.
         """
+        placements: list[_PlacementSpec] = []
+        for placement in d["placements"]:
+            placement_type = placement["type"]
+            if placement_type == "Shard":
+                placements.append(ShardSpec.from_dict(placement))
+            elif placement_type == "StridedShard":
+                placements.append(StridedShardSpec.from_dict(placement))
+            elif placement_type == "Replicate":
+                placements.append(ReplicateSpec.from_dict(placement))
+            else:
+                raise ValueError(f"Unknown DTensor placement type: {placement_type}")
+
         return cls(
             global_shape=tuple(d["global_shape"]),
             dtype=d["dtype"],
             stride=tuple(d["stride"]),
             mesh_spec=DeviceMeshSpec.from_dict(d["mesh_spec"]),
-            placements=tuple(
-                (
-                    ShardSpec.from_dict(p)
-                    if p["type"] == "Shard"
-                    else ReplicateSpec.from_dict(p)
-                )
-                for p in d["placements"]
-            ),
+            placements=tuple(placements),
         )
 
     @property

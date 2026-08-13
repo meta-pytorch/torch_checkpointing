@@ -510,9 +510,13 @@ def _collect(path: CheckpointPath, obj: Any, _: Any) -> None:
 `DTensorShardingMetadata` records `global_shape`, `dtype`, `stride`, a
 `mesh_spec` (a `DeviceMeshSpec` with device type, mesh shape, the flattened
 global rank IDs, and optional dim names), and a tuple of `placements`
-(`ShardSpec(dim=...)` / `ReplicateSpec()`). Its `equivalent_ranks` returns the
-mesh's flattened rank IDs (`mesh_spec.mesh_data`), which is what enables the
-metadata compaction described above.
+(`ShardSpec(dim=...)`, `StridedShardSpec(dim=..., split_factor=...)`, or
+`ReplicateSpec()`). Its `equivalent_ranks` returns the mesh's flattened rank IDs
+(`mesh_spec.mesh_data`), which is what enables the metadata compaction described
+above. Resharding decomposes a strided placement into contiguous local-to-global
+slices and emits one `LoadPlan` for each overlapping source and target region.
+This preserves disjoint layouts such as a packed local tensor whose elements map
+to nonadjacent global indices.
 
 Its `load` computes, for the current rank's target shard, which source ranks'
 shards overlap it, generates `LoadPlan`s for each overlapping chunk, reads the

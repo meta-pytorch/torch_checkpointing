@@ -22,6 +22,7 @@ from torch_checkpointing.dtensor_metadata import (
     get_device_mesh_spec,
     ReplicateSpec,
     ShardSpec,
+    StridedShardSpec,
 )
 from torch_checkpointing.metadata_manager import DefaultMetadataManager
 from torch_checkpointing.types import CheckpointPath, NestedPath, RankInfo
@@ -102,6 +103,59 @@ def test_to_and_from_dict():
 
     # Check that the two metadata objects are equal
     assert md == md2
+
+
+def test_dtensor_strided_shard_metadata_round_trip():
+    metadata_dict = {
+        "global_shape": [8, 4],
+        "dtype": "torch.float32",
+        "stride": [4, 1],
+        "mesh_spec": {
+            "device_type": "cpu",
+            "mesh_shape": (2, 2),
+            "mesh_data": (0, 1, 2, 3),
+            "mesh_dim_names": ("dp", "tp"),
+        },
+        "placements": [
+            {"type": "StridedShard", "dim": 0, "split_factor": 2},
+            {"type": "Shard", "dim": 0},
+        ],
+    }
+
+    metadata = DTensorShardingMetadata.from_dict(metadata_dict)
+
+    assert isinstance(metadata.placements[0], StridedShardSpec)
+    assert metadata.to_dict() == metadata_dict
+    restored = DTensorShardingMetadata.from_dict(metadata.to_dict())
+    assert metadata == restored
+    assert hash(metadata) == hash(restored)
+
+    different_split_factor = {
+        **metadata_dict,
+        "placements": [
+            {"type": "StridedShard", "dim": 0, "split_factor": 4},
+            {"type": "Shard", "dim": 0},
+        ],
+    }
+    assert metadata != DTensorShardingMetadata.from_dict(different_split_factor)
+
+
+def test_dtensor_metadata_rejects_unknown_placement_type():
+    with pytest.raises(ValueError, match="Unknown DTensor placement type"):
+        DTensorShardingMetadata.from_dict(
+            {
+                "global_shape": [8],
+                "dtype": "torch.float32",
+                "stride": [1],
+                "mesh_spec": {
+                    "device_type": "cpu",
+                    "mesh_shape": (1,),
+                    "mesh_data": (0,),
+                    "mesh_dim_names": None,
+                },
+                "placements": [{"type": "Unknown"}],
+            }
+        )
 
 
 def test_distributed_metadata_with_layout_info():
