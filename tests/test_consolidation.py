@@ -928,6 +928,28 @@ def test_consolidate_hf_safetensors_defaults_single_fqn_to_one_file(
         message.startswith("Finished consolidated HF safetensors shard")
         for message in caplog.messages
     )
+    assert any("phase=read_source_headers" in message for message in caplog.messages)
+    assert any(
+        message.startswith("Finished HF safetensors consolidation")
+        for message in caplog.messages
+    )
+    metric_records = {
+        record.metric_name: record
+        for record in caplog.records
+        if getattr(record, "metric_name", None)
+    }
+    metric_prefix = "train.checkpoint_write.execute.hf_consolidation"
+    expected_metrics = {
+        f"{metric_prefix}.read_source_headers.latency_ms",
+        f"{metric_prefix}.write_output_files.latency_ms",
+        f"{metric_prefix}.output_shard.read_and_write.latency_ms",
+        f"{metric_prefix}.output_shard.finalize.latency_ms",
+        f"{metric_prefix}.output_shard.e2e.latency_ms",
+        f"{metric_prefix}.e2e.latency_ms",
+    }
+    assert expected_metrics <= metric_records.keys()
+    assert all(metric_records[name].value >= 0 for name in expected_metrics)
+    assert metric_records[f"{metric_prefix}.e2e.latency_ms"].end_to_end
 
 
 def test_consolidate_hf_safetensors_exports_plain_only_item(

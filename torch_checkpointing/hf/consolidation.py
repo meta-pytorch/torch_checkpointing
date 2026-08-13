@@ -54,6 +54,7 @@ from ..distributed_metadata import (
 )
 from ..dtensor_metadata import DTensorShardingMetadata
 from ..dtensor_resharder import compute_local_shard_info
+from ..logging_utils import EventLogger, EventType
 from ..resharding_utils import get_fqn_from_nested_path
 from ..storage.base_storage import ReadArgs, Storage, StorageConfig
 from ..storage.filesystem import LocalFileSystemStorageConfig
@@ -74,7 +75,21 @@ _MAX_READER_THREADS = 16
 _READER_MEMORY_BUDGET_BYTES = int(
     os.environ.get("HF_CONSOLIDATION_MEMORY_BUDGET_BYTES", 8 * 1024 * 1024 * 1024)
 )
+_HF_CONSOLIDATION_METRIC_PREFIX = "train.checkpoint_write.execute.hf_consolidation"
 _Item = TypeVar("_Item", str, int)
+
+
+def _log_phase(event_logger: EventLogger, phase: str, **metadata: Any) -> None:
+    logger.info(
+        "HF safetensors consolidation phase=%s %s",
+        phase,
+        " ".join(f"{key}={value}" for key, value in metadata.items()),
+        extra=event_logger(
+            EventType.LOG_METRIC,
+            metric_name=f"{_HF_CONSOLIDATION_METRIC_PREFIX}.{phase}.latency_ms",
+            **metadata,
+        ),
+    )
 
 
 @contextmanager
@@ -255,8 +270,12 @@ def _load_item_metadata(
     input_checkpoint_dir: str,
     item_key: str,
     storage: Storage,
+    *,
+    event_logger: EventLogger,
+    rank: int,
 ) -> DistributedItemMetadata:
     distributed_metadata = load_distributed_metadata(input_checkpoint_dir, storage)
+    _log_phase(event_logger, "load_metadata", rank=rank)
     if distributed_metadata is None:
         raise FileNotFoundError(
             f"No distributed metadata found in {input_checkpoint_dir}"
@@ -344,13 +363,21 @@ def consolidate_hf_safetensors_checkpoint(
     checkpoint and prefixed with ``item_key``. Output files assigned to the same
     rank are processed sequentially while their tensors are read concurrently.
     """
+    event_logger = EventLogger()
     storage = (
         storage_config if storage_config is not None else LocalFileSystemStorageConfig()
     ).create_storage()
     if output_dir is None:
         output_dir = input_checkpoint_dir
     rank, world_size = _distributed_rank_and_world_size()
-    item_metadata = _load_item_metadata(input_checkpoint_dir, item_key, storage)
+    _log_phase(event_logger, "setup", rank=rank)
+    item_metadata = _load_item_metadata(
+        input_checkpoint_dir,
+        item_key,
+        storage,
+        event_logger=event_logger,
+        rank=rank,
+    )
     fqn_to_num_bytes = _fqn_to_num_bytes_from_metadata(
         item_metadata.nested_path_to_metadata
     )
@@ -380,12 +407,7 @@ def consolidate_hf_safetensors_checkpoint(
         num_owners=world_size,
     )
     use_distributed = any(owner != 0 for owner in output_index_owners.values())
-    logger.info(
-        "HF safetensors consolidation mode=%s output_files=%s world_size=%s",
-        "distributed" if use_distributed else "rank_zero",
-        len(output_file_sizes_by_index),
-        world_size,
-    )
+    mode = "distributed" if use_distributed else "rank_zero"
     max_index = max(output_file_sizes_by_index)
     output_file_by_index = {
         index: os.path.join(
@@ -394,6 +416,14 @@ def consolidate_hf_safetensors_checkpoint(
         )
         for index in output_file_sizes_by_index
     }
+    _log_phase(
+        event_logger,
+        "planning",
+        rank=rank,
+        mode=mode,
+        output_files=len(output_file_sizes_by_index),
+        world_size=world_size,
+    )
     (
         participates,
         consolidation_process_group,
@@ -403,6 +433,12 @@ def consolidate_hf_safetensors_checkpoint(
         world_size,
         output_index_owners.values(),
         use_distributed,
+    )
+    _log_phase(
+        event_logger,
+        "create_process_group",
+        rank=rank,
+        participates=participates,
     )
     if not participates:
         return
@@ -430,6 +466,12 @@ def consolidate_hf_safetensors_checkpoint(
                 )
             },
             storage,
+        )
+        _log_phase(
+            event_logger,
+            "read_source_headers",
+            rank=rank,
+            source_files=len(file_metadata_by_rank),
         )
         _validate_header_fqns_are_known(
             file_metadata_by_rank.values(),
@@ -471,6 +513,13 @@ def consolidate_hf_safetensors_checkpoint(
             sum(fqn_to_num_bytes.values()),
             sorted(assigned_indices),
         )
+        _log_phase(
+            event_logger,
+            "assign_work",
+            rank=rank,
+            output_files=len(tensor_slices_by_index),
+            fqns=len(assigned_fqn_to_index_mapping),
+        )
 
         output_path = Path(output_dir)
         if rank == 0 and not storage.exists(output_path):
@@ -478,6 +527,7 @@ def consolidate_hf_safetensors_checkpoint(
         if use_distributed:
             assert consolidation_process_group is not None
             dist.barrier(group=consolidation_process_group)
+        _log_phase(event_logger, "create_output_dir", rank=rank)
         _write_and_finalize_consolidated_output_files(
             tensor_slices_by_index=tensor_slices_by_index,
             fqn_to_index_mapping=fqn_to_index_mapping,
@@ -490,10 +540,28 @@ def consolidate_hf_safetensors_checkpoint(
             consolidation_process_group=consolidation_process_group,
             item_key=item_key,
         )
+        logger.info(
+            "Finished HF safetensors consolidation rank=%s output_files=%s "
+            "fqns=%s bytes=%s",
+            rank,
+            len(tensor_slices_by_index),
+            len(assigned_fqn_to_index_mapping),
+            sum(fqn_to_num_bytes[fqn] for fqn in assigned_fqn_to_index_mapping),
+            extra=event_logger(
+                EventType.LOG_METRIC,
+                metric_name=f"{_HF_CONSOLIDATION_METRIC_PREFIX}.e2e.latency_ms",
+                end_to_end=True,
+                rank=rank,
+                output_files=len(tensor_slices_by_index),
+                fqns=len(assigned_fqn_to_index_mapping),
+            ),
+        )
     finally:
         if created_consolidation_process_group:
             assert consolidation_process_group is not None
+            destroy_event_logger = EventLogger()
             dist.destroy_process_group(consolidation_process_group)
+            _log_phase(destroy_event_logger, "destroy_process_group", rank=rank)
 
 
 def _read_safetensors_file_metadata_by_rank(
@@ -590,14 +658,22 @@ def _write_and_finalize_consolidated_output_files(
     consolidation_process_group: dist.ProcessGroup | None,
     item_key: str,
 ) -> None:
+    event_logger = EventLogger()
     _write_assigned_output_files(
         tensor_slices_by_index,
         output_file_by_index,
         storage,
     )
+    _log_phase(
+        event_logger,
+        "write_output_files",
+        rank=rank,
+        output_files=len(tensor_slices_by_index),
+    )
     if use_distributed:
         assert consolidation_process_group is not None
         dist.barrier(group=consolidation_process_group)
+        _log_phase(event_logger, "wait_for_output_files", rank=rank)
     if rank == 0:
         _write_overall_hf_index_file(
             output_dir,
@@ -607,9 +683,11 @@ def _write_and_finalize_consolidated_output_files(
             storage,
             item_key=item_key,
         )
+        _log_phase(event_logger, "write_index", rank=rank)
     if use_distributed:
         assert consolidation_process_group is not None
         dist.barrier(group=consolidation_process_group)
+        _log_phase(event_logger, "wait_for_index", rank=rank)
 
 
 def _build_fqn_to_tensor_slices(
@@ -1017,10 +1095,18 @@ def _process_output_file(
     handles: _ReaderHandles,
     budget: _ReaderMemoryBudget,
 ) -> None:
+    event_logger = EventLogger()
     metadata_bytes = _prepare_metadata(tensor_slices_by_fqn)
     total_tensor_bytes = sum(
         math.prod(tensor_slices[0].shape) * tensor_slices[0].dtype_size
         for tensor_slices in tensor_slices_by_fqn.values()
+    )
+    _log_phase(
+        event_logger,
+        "output_shard.metadata",
+        output_file=output_file,
+        tensors=len(tensor_slices_by_fqn),
+        bytes=total_tensor_bytes,
     )
     start_time = time.monotonic()
     logger.info(
@@ -1031,6 +1117,8 @@ def _process_output_file(
     )
     written_tensor_bytes = 0
     next_progress_percent = 25
+    io_event_logger = EventLogger()
+    finalize_event_logger: EventLogger
     with _atomic_stream_write(storage, Path(output_file)) as output_stream:
         output_stream.write(metadata_bytes)
         with closing(
@@ -1066,13 +1154,32 @@ def _process_output_file(
                         time.monotonic() - start_time,
                     )
                     next_progress_percent += 25
+        _log_phase(
+            io_event_logger,
+            "output_shard.read_and_write",
+            output_file=output_file,
+        )
+        finalize_event_logger = EventLogger()
+    _log_phase(
+        finalize_event_logger,
+        "output_shard.finalize",
+        output_file=output_file,
+    )
     logger.info(
-        "Finished consolidated HF safetensors shard output_file=%s tensors=%s "
-        "bytes=%s elapsed_seconds=%.2f",
+        "Finished consolidated HF safetensors shard output_file=%s tensors=%s bytes=%s",
         output_file,
         len(tensor_slices_by_fqn),
         total_tensor_bytes,
-        time.monotonic() - start_time,
+        extra=event_logger(
+            EventType.LOG_METRIC,
+            metric_name=(
+                f"{_HF_CONSOLIDATION_METRIC_PREFIX}.output_shard.e2e.latency_ms"
+            ),
+            end_to_end=True,
+            output_file=output_file,
+            tensors=len(tensor_slices_by_fqn),
+            bytes=total_tensor_bytes,
+        ),
     )
 
 
