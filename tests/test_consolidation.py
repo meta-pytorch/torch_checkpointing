@@ -51,7 +51,7 @@ from torch_checkpointing.hf.consolidation import (
     consolidate_hf_safetensors_checkpoint,
     HFSafetensorByteAddress,
     SafetensorsFileMetadata,
-    TensorSlice,
+    SafetensorsTensorSlice,
 )
 from torch_checkpointing.storage.filesystem import (
     LocalFileSystemStorage,
@@ -372,7 +372,7 @@ def _distributed_default_mapping_worker(
         dist.destroy_process_group()
 
 
-def test_safetensors_file_metadata_reads_file_header(
+def test_safetensors_file_metadata_reads_unresolved_file_header(
     tmp_path: Path,
 ) -> None:
     file_path = tmp_path / "model.safetensors"
@@ -394,15 +394,28 @@ def test_safetensors_file_metadata_reads_file_header(
     assert file_metadata.file_path == os.fspath(file_path)
     assert set(file_metadata.tensors) == {"weight", "scale"}
     weight = file_metadata.tensors["weight"]
+    assert isinstance(weight, SafetensorsTensorSlice)
     assert weight.source_rank == 3
-    assert weight.local_shape == (2, 3)
     assert weight.torch_dtype == torch.float32
     assert weight.global_shape is None
     assert weight.global_offsets is None
+    assert weight.local_offsets == (0, 0)
+    assert weight.slice_shape == (2, 3)
     address = weight.byte_address
     assert address.file_path == os.fspath(file_path)
     assert address.start_byte_offset > 8
     assert address.num_bytes == 6 * torch.empty((), dtype=torch.float32).element_size()
+
+    resolved_weight = weight.with_global_layout(
+        global_shape=(4, 3),
+        global_offsets=(2, 0),
+    )
+    assert isinstance(resolved_weight, SafetensorsTensorSlice)
+    assert resolved_weight.source_rank == weight.source_rank
+    assert resolved_weight.torch_dtype == weight.torch_dtype
+    assert resolved_weight.byte_address == weight.byte_address
+    assert resolved_weight.local_offsets == weight.local_offsets
+    assert resolved_weight.slice_shape == weight.slice_shape
 
 
 def test_read_safetensors_file_metadata_by_rank_uses_only_declared_layouts(
@@ -540,27 +553,28 @@ def test_read_tensor_data_rejects_truncated_input() -> None:
         ),
     ],
 )
-def test_tensor_slice_contiguous_byte_range(
+def test_safetensors_tensor_slice_contiguous_global_byte_range(
     global_shape: tuple[int, ...],
     global_offsets: tuple[int, ...],
     local_shape: tuple[int, ...],
     torch_dtype: torch.dtype,
     expected: tuple[int, int] | None,
 ) -> None:
-    tensor_slice = TensorSlice(
+    tensor_slice = SafetensorsTensorSlice(
+        global_shape=global_shape,
+        global_offsets=global_offsets,
+        local_offsets=(0,) * len(local_shape),
+        slice_shape=local_shape,
         source_rank=0,
-        local_shape=local_shape,
         torch_dtype=torch_dtype,
         byte_address=HFSafetensorByteAddress(
             file_path="model.safetensors",
             start_byte_offset=0,
             end_byte_offset=0,
         ),
-        global_shape=global_shape,
-        global_offsets=global_offsets,
     )
 
-    assert tensor_slice.contiguous_byte_range == expected
+    assert tensor_slice.contiguous_global_byte_range == expected
 
 
 def test_consolidate_hf_safetensors_reads_contiguous_slices_into_output_buffer(
@@ -1385,6 +1399,33 @@ def test_consolidate_hf_safetensors_rejects_shape_mismatch_against_metadata(
     # Rank 1 saved its shard flattened, so the header shape disagrees with the
     # shape the sharding metadata implies even though the byte count matches.
     with pytest.raises(ValueError, match="safetensors shape"):
+        consolidate_hf_safetensors_checkpoint(
+            os.fspath(checkpoint_path),
+            fqn_to_index_mapping={"weight": 1},
+            item_key="model",
+        )
+
+
+def test_consolidate_hf_safetensors_rejects_dtype_mismatch_against_metadata(
+    tmp_path: Path,
+) -> None:
+    checkpoint_path = tmp_path / "checkpoint"
+    checkpoint_path.mkdir()
+
+    full_weight = torch.arange(8, dtype=torch.float32).reshape(4, 2)
+    safetensors_save_file(
+        {"weight": full_weight[:2].contiguous()},
+        checkpoint_path / "model_0.safetensors",
+    )
+    safetensors_save_file(
+        {"weight": full_weight[2:].to(torch.float16).contiguous()},
+        checkpoint_path / "model_1.safetensors",
+    )
+    _write_metadata(checkpoint_path)
+
+    # Rank 1 saved half precision, so the header dtype disagrees with the dtype
+    # the sharding metadata declares.
+    with pytest.raises(ValueError, match="safetensors dtype"):
         consolidate_hf_safetensors_checkpoint(
             os.fspath(checkpoint_path),
             fqn_to_index_mapping={"weight": 1},
