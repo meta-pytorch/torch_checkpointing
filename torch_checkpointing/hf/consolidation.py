@@ -17,7 +17,7 @@ import os
 import struct
 import time
 import uuid
-from collections.abc import Iterable, Iterator, Mapping
+from collections.abc import Container, Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -38,6 +38,7 @@ from torch.distributed.checkpoint._hf_utils import (
 
 from ..checkpoint_layout import LayoutInfo, SafetensorsSerialization
 from ..distributed_metadata import (
+    DistributedItemMetadata,
     GlobalObjectMetadata,
     load_distributed_metadata,
 )
@@ -227,11 +228,11 @@ def _distributed_rank_and_world_size() -> tuple[int, int]:
     return 0, 1
 
 
-def _load_consolidation_tensor_slices(
+def _load_item_metadata(
     input_checkpoint_dir: str,
     item_key: str,
     storage: Storage,
-) -> tuple[dict[int, SafetensorsFileMetadata], dict[str, list[TensorSlice]]]:
+) -> DistributedItemMetadata:
     distributed_metadata = load_distributed_metadata(input_checkpoint_dir, storage)
     if distributed_metadata is None:
         raise FileNotFoundError(
@@ -243,21 +244,62 @@ def _load_consolidation_tensor_slices(
             f"No checkpoint metadata found for item {item_key!r} in "
             f"{input_checkpoint_dir}"
         )
-    file_metadata_by_rank = _read_safetensors_file_metadata_by_rank(
-        input_checkpoint_dir,
-        item_metadata.rank_to_layout_info,
-        storage,
-    )
-    if not file_metadata_by_rank:
+    if not any(
+        layout_info is not None
+        for layout_info in item_metadata.rank_to_layout_info.values()
+    ):
         raise ValueError(
             f"No rank-local safetensors files for checkpoint item "
             f"{item_key!r} in {input_checkpoint_dir}"
         )
-    return file_metadata_by_rank, _build_fqn_to_tensor_slices(
-        nested_path_to_metadata=item_metadata.nested_path_to_metadata,
-        rank_to_layout_info=item_metadata.rank_to_layout_info,
-        file_metadata_by_rank=file_metadata_by_rank,
-    )
+    return item_metadata
+
+
+def _fqn_to_num_bytes_from_metadata(
+    nested_path_to_metadata: Mapping[NestedPath, list[GlobalObjectMetadata]],
+) -> dict[str, int]:
+    """Consolidated tensor sizes, taken from ``metadata.pkl`` alone.
+
+    Sizing without the safetensors headers is what lets output files be assigned
+    before anything is resolved, so a rank only reads the headers for the
+    tensors it was given rather than for the whole checkpoint.
+    """
+    result: dict[str, int] = {}
+    for nested_path, groups in sorted(
+        nested_path_to_metadata.items(),
+        key=lambda item: get_fqn_from_nested_path(item[0]),
+    ):
+        fqn = get_fqn_from_nested_path(nested_path)
+        if fqn in result:
+            raise ValueError(
+                "FQN collision detected while converting checkpoint metadata "
+                f"NestedPath values for HF safetensors: {fqn!r}"
+            )
+        _validate_sharding_metadata_groups(nested_path, groups)
+        sharding_metadata = groups[0].sharding_metadata
+        assert isinstance(sharding_metadata, DTensorShardingMetadata)
+        torch_dtype = _torch_dtype_from_checkpoint_metadata(sharding_metadata.dtype)
+        result[fqn] = math.prod(
+            sharding_metadata.global_shape
+        ) * torch._utils._element_size(torch_dtype)
+    return result
+
+
+def _source_ranks_for_fqns(
+    nested_path_to_metadata: Mapping[NestedPath, list[GlobalObjectMetadata]],
+    fqns: Container[str],
+) -> set[int]:
+    """Source ranks that hold any part of ``fqns``, from metadata alone.
+
+    Ranks that wrote no file are left in; reading their metadata skips them.
+    """
+    return {
+        source_rank
+        for nested_path, groups in nested_path_to_metadata.items()
+        if get_fqn_from_nested_path(nested_path) in fqns
+        for group in groups
+        for source_rank in group.ranks
+    }
 
 
 def consolidate_hf_safetensors_checkpoint(
@@ -284,22 +326,17 @@ def consolidate_hf_safetensors_checkpoint(
     if output_dir is None:
         output_dir = input_checkpoint_dir
     rank, world_size = _distributed_rank_and_world_size()
-    file_metadata_by_rank, fqn_to_tensor_slices = _load_consolidation_tensor_slices(
-        input_checkpoint_dir,
-        item_key,
-        storage,
+    item_metadata = _load_item_metadata(input_checkpoint_dir, item_key, storage)
+    fqn_to_num_bytes = _fqn_to_num_bytes_from_metadata(
+        item_metadata.nested_path_to_metadata
     )
     fqn_to_index_mapping = _validate_fqn_to_index_mapping(
         fqn_to_index_mapping,
-        fqn_to_tensor_slices.keys(),
+        fqn_to_num_bytes.keys(),
     )
-    if not fqn_to_tensor_slices:
+    if not fqn_to_num_bytes:
         return
 
-    fqn_to_num_bytes = {
-        fqn: math.prod(tensor_slices[0].shape) * tensor_slices[0].dtype_size
-        for fqn, tensor_slices in fqn_to_tensor_slices.items()
-    }
     if fqn_to_index_mapping is None:
         fqn_to_index_mapping = _default_fqn_to_index_mapping(
             fqn_to_num_bytes,
@@ -347,13 +384,6 @@ def consolidate_hf_safetensors_checkpoint(
         return
 
     try:
-        _validate_input_output_paths_are_disjoint(
-            input_file_paths=(
-                file_metadata.file_path
-                for file_metadata in file_metadata_by_rank.values()
-            ),
-            output_file_paths=output_file_by_index.values(),
-        )
         assigned_indices = {
             index for index, owner in output_index_owners.items() if owner == rank
         }
@@ -362,6 +392,43 @@ def consolidate_hf_safetensors_checkpoint(
             for fqn, index in fqn_to_index_mapping.items()
             if index in assigned_indices
         }
+        # Only the assigned tensors are resolved, so only their source files are
+        # opened. Reading every rank's header here would scale with the whole
+        # checkpoint rather than with this rank's share of it.
+        assigned_fqns = set(assigned_fqn_to_index_mapping)
+        file_metadata_by_rank = _read_safetensors_file_metadata_by_rank(
+            input_checkpoint_dir,
+            {
+                source_rank: item_metadata.rank_to_layout_info[source_rank]
+                for source_rank in _source_ranks_for_fqns(
+                    item_metadata.nested_path_to_metadata,
+                    assigned_fqns,
+                )
+            },
+            storage,
+        )
+        _validate_header_fqns_are_known(
+            file_metadata_by_rank.values(),
+            fqn_to_num_bytes.keys(),
+        )
+        _validate_input_output_paths_are_disjoint(
+            input_file_paths=(
+                file_metadata.file_path
+                for file_metadata in file_metadata_by_rank.values()
+            ),
+            output_file_paths=output_file_by_index.values(),
+        )
+        fqn_to_tensor_slices = _build_fqn_to_tensor_slices(
+            nested_path_to_metadata={
+                nested_path: groups
+                for nested_path, groups in (
+                    item_metadata.nested_path_to_metadata.items()
+                )
+                if get_fqn_from_nested_path(nested_path) in assigned_fqns
+            },
+            rank_to_layout_info=item_metadata.rank_to_layout_info,
+            file_metadata_by_rank=file_metadata_by_rank,
+        )
         tensor_slices_by_index: dict[int, dict[str, list[TensorSlice]]] = {}
         for fqn, index in assigned_fqn_to_index_mapping.items():
             tensor_slices_by_index.setdefault(index, {})[fqn] = fqn_to_tensor_slices[
@@ -529,12 +596,6 @@ def _build_fqn_to_tensor_slices(
     rank_to_layout_info: Mapping[int, LayoutInfo | None],
     file_metadata_by_rank: Mapping[int, SafetensorsFileMetadata],
 ) -> dict[str, list[TensorSlice]]:
-    written_fqns = {
-        fqn
-        for file_metadata in file_metadata_by_rank.values()
-        for fqn in file_metadata.tensors
-    }
-
     result: dict[str, list[TensorSlice]] = {}
     for nested_path, groups in sorted(
         nested_path_to_metadata.items(),
@@ -551,13 +612,6 @@ def _build_fqn_to_tensor_slices(
             groups=groups,
             rank_to_layout_info=rank_to_layout_info,
             file_metadata_by_rank=file_metadata_by_rank,
-        )
-
-    unexpected_fqns = sorted(written_fqns - result.keys())
-    if unexpected_fqns:
-        raise ValueError(
-            "Safetensors files contain FQNs absent from checkpoint metadata: "
-            f"{unexpected_fqns}"
         )
 
     return result
@@ -761,6 +815,26 @@ def _torch_dtype_from_checkpoint_metadata(dtype: str) -> torch.dtype:
     if not isinstance(torch_dtype, torch.dtype):
         raise ValueError(f"Unsupported checkpoint metadata dtype {dtype!r}")
     return torch_dtype
+
+
+def _validate_header_fqns_are_known(
+    file_metadata: Iterable[SafetensorsFileMetadata],
+    checkpoint_fqns: Iterable[str],
+) -> None:
+    """Reject safetensors FQNs that ``metadata.pkl`` does not describe.
+
+    Only the files this rank opened are checked; a rank does not read the files
+    for tensors it was not assigned.
+    """
+    known_fqns = set(checkpoint_fqns)
+    unexpected_fqns = sorted(
+        {fqn for metadata in file_metadata for fqn in metadata.tensors} - known_fqns
+    )
+    if unexpected_fqns:
+        raise ValueError(
+            "Safetensors files contain FQNs absent from checkpoint metadata: "
+            f"{unexpected_fqns}"
+        )
 
 
 def _validate_input_output_paths_are_disjoint(

@@ -177,6 +177,47 @@ def _write_metadata(
         pickle.dump(metadata.to_dict(), f)
 
 
+def test_fqn_to_num_bytes_from_metadata_sizes_without_reading_headers() -> None:
+    sizes = consolidation_module._fqn_to_num_bytes_from_metadata(
+        {
+            ("weight",): [
+                GlobalObjectMetadata(
+                    sharding_metadata=_dtensor_metadata(), ranks=(0, 1)
+                )
+            ],
+            ("plain",): [
+                GlobalObjectMetadata(
+                    sharding_metadata=_replicated_tensor_metadata(torch.ones(3)),
+                    ranks=(0, 1),
+                )
+            ],
+        }
+    )
+
+    # (4, 2) float32 and (3,) float32, taken from metadata.pkl alone.
+    assert sizes == {"weight": 4 * 2 * 4, "plain": 3 * 4}
+
+
+def test_source_ranks_for_fqns_covers_only_the_requested_tensors() -> None:
+    nested_path_to_metadata = {
+        ("weight",): [
+            GlobalObjectMetadata(sharding_metadata=_dtensor_metadata(), ranks=(0, 1))
+        ],
+        ("other",): [
+            GlobalObjectMetadata(sharding_metadata=_dtensor_metadata(), ranks=(2, 3))
+        ],
+    }
+    # "other" was not requested, so its ranks are not read.
+    assert consolidation_module._source_ranks_for_fqns(
+        nested_path_to_metadata,
+        {"weight"},
+    ) == {0, 1}
+    assert consolidation_module._source_ranks_for_fqns(
+        nested_path_to_metadata,
+        {"weight", "other"},
+    ) == {0, 1, 2, 3}
+
+
 def test_consolidate_hf_safetensors_rejects_metadata_without_source_ranks(
     tmp_path: Path,
 ) -> None:
