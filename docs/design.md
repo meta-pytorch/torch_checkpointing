@@ -389,10 +389,12 @@ serialization format:
   `prepare_tensors_for_save`, then `safetensors.torch.save`.
 
 Metadata is written by `role_rank == 0` only. When a barrier is configured, the
-writer stages files under a `tmp_` directory, waits for all ranks at the barrier,
-then renames to the final path for atomicity; `pre_finalize_callback` runs before
-the barrier and `finalize_callback` after. With no barrier configured, the writer
-writes directly to the final path and skips synchronization.
+writer stages files under a `tmp_` directory and waits for all ranks at the
+barrier. `pre_finalize_callback` then runs against the complete temporary
+checkpoint; distributed callbacks must synchronize any work required before
+rank zero returns and renames to the final path. `finalize_callback` runs after
+the rename branch. With no barrier configured, the writer writes directly to the
+final path and skips synchronization.
 
 ## The read pipeline
 

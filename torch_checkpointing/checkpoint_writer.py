@@ -71,7 +71,8 @@ class CheckpointWriterArgs:
         config: Configuration options for the checkpoint writer.
         rank_info: Information about the current rank in a distributed setting.
         pre_finalize_callback: Optional callback for custom actions before checkpoint finalization.
-                Called after files are written but before barrier synchronization.
+                With a barrier, it receives the complete temporary checkpoint path.
+                Distributed callbacks must synchronize before rank zero returns.
         finalize_callback: Optional callback for custom actions after checkpoint finalization.
                 Called after barrier synchronization (all ranks coordinated).
         storage_config: StorageConfig backend to use for I/O operations. If None, defaults to LocalFileSystemStorageConfig
@@ -209,11 +210,6 @@ class CheckpointWriter:
             extra=event_logger(EventType.CHECKPOINT_SAVED_TMP),
         )
 
-        # Execute pre-finalize callback if available
-        if self._args.pre_finalize_callback is not None:
-            logger.debug(f"Executing pre-finalize callback for {path}")
-            self._args.pre_finalize_callback(path, event_logger)
-
         # Wait for all ranks to finish writing if barrier is available
         if self._barrier is not None:
             logger.info(
@@ -232,6 +228,10 @@ class CheckpointWriter:
             )
         else:
             logger.info("No barrier configured, skipping synchronization")
+
+        if self._args.pre_finalize_callback is not None:
+            logger.debug(f"Executing pre-finalize callback for {tmp_dir_path}")
+            self._args.pre_finalize_callback(str(tmp_dir_path), event_logger)
 
         # rename back to original path for atomicity. It's important this is done
         # immediately after the barrier to ensure all ranks have finished writing

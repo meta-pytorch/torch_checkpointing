@@ -330,6 +330,50 @@ class TestCheckpointWriter(TestCase):
         self.assertIsNotNone(self.mock_callback.finalize_event_logger)
         self.assertIsInstance(self.mock_callback.finalize_event_logger, EventLogger)
 
+    def test_pre_finalize_callback_runs_before_atomic_rename(self):
+        checkpoint_path = Path(self.temp_dir) / "checkpoint_with_callback"
+        temporary_path = checkpoint_path.parent / f"tmp_{checkpoint_path.name}"
+        events: list[str] = []
+
+        def pre_finalize_callback(path: str, _event_logger: EventLogger) -> None:
+            events.append("pre_finalize")
+            self.assertEqual(Path(path), temporary_path)
+            self.assertTrue(temporary_path.is_dir())
+            self.assertFalse(checkpoint_path.exists())
+
+        def finalize_callback(path: str, _event_logger: EventLogger) -> None:
+            events.append("finalize")
+            self.assertEqual(Path(path), checkpoint_path)
+            self.assertTrue(checkpoint_path.is_dir())
+
+        writer = CheckpointWriter(
+            CheckpointWriterArgs(
+                config=self.config,
+                rank_info=self.rank_info,
+                storage_config=self.storage_config,
+                pre_finalize_callback=pre_finalize_callback,
+                finalize_callback=finalize_callback,
+            )
+        )
+        barrier = mock.Mock()
+        barrier.execute_barrier.side_effect = lambda _timeout: events.append("barrier")
+        writer._barrier = barrier
+
+        items = {
+            key: CheckpointItem(value=value, layout=None)
+            for key, value in self.state_dict.items()
+        }
+        writer.write(
+            str(checkpoint_path),
+            CheckpointWriteInfo(checkpoint_items=items),
+        )
+
+        self.assertEqual(
+            events,
+            ["barrier", "pre_finalize", "finalize"],
+        )
+        self.assertFalse(temporary_path.exists())
+
     def test_write_without_callbacks(self):
         """Test that write works correctly without callbacks."""
         args = CheckpointWriterArgs(

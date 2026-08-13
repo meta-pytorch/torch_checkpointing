@@ -184,9 +184,10 @@ Inside `CheckpointWriter.write()` the ordering is:
 
 1. Write all shard files (and, on `role_rank == 0`, the metadata file) into a
    temporary directory.
-2. Run `pre_finalize_callback` (see below).
-3. If a barrier is configured, `execute_barrier(...)` — wait for every rank to
+2. If a barrier is configured, `execute_barrier(...)` — wait for every rank to
    finish writing.
+3. Run `pre_finalize_callback` (see below) against the complete temporary
+   checkpoint.
 4. On `role_rank == 0`, atomically rename the temporary directory to the final
    path.
 5. Run `finalize_callback`.
@@ -252,9 +253,12 @@ class CheckpointWriterArgs:
 
 Both callbacks have the signature `(path: str, event_logger: EventLogger) -> None`:
 
-- **`pre_finalize_callback`** runs after all files are written but *before* the
-  barrier — it observes the temporary directory, on every rank. It is invoked
-  with the original `path` argument passed to `write()`.
+- **`pre_finalize_callback`** runs after all files are written and the first
+  barrier has completed, but before the atomic rename. It is invoked on every
+  rank with the temporary checkpoint path. A distributed callback must ensure
+  that rank zero does not return until work required before commit is complete.
+  Without a configured barrier, it receives the final write path and no rename
+  occurs.
 - **`finalize_callback`** runs *after* the barrier and rename — it is invoked
   with the final path.
 
