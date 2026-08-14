@@ -29,6 +29,7 @@ from .checkpoint_manager import CheckpointManager
 from .checkpoint_reader import CheckpointReader
 from .checkpoint_saver import AsyncCheckpointSaver, CheckpointSaver, SyncCheckpointSaver
 from .checkpoint_writer import CheckpointWriter, CheckpointWriterConfig
+from .integrity import CheckpointingException, MANIFEST_FILENAME
 from .config import (
     AsyncCheckpointSaverConfig,
     CheckpointLoaderConfig,

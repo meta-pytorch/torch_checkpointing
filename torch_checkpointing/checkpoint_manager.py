@@ -170,6 +170,7 @@ class CheckpointManager:
         self._loader = CheckpointLoader(
             reader=self._reader,
             metadata_manager=self._metadata_manager,
+            config=self._config.load,
         )
 
     def save(
