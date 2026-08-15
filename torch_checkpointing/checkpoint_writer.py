@@ -36,6 +36,8 @@ from .logging_utils import EventLogger, EventType, get_log_event_type_for_file_s
 from .storage.base_storage import StorageConfig
 from .types import RankInfo
 
+DEFAULT_TEMP_DIR_PREFIX = "tmp_"
+
 logger = logging.getLogger(__name__)
 
 
@@ -52,15 +54,23 @@ class CheckpointWriterConfig:
             fields if provided.
         file_write_max_threads: Maximum workers for independent file writes and
             parent-directory creation.
+        temp_dir_prefix: Prefix of the temporary directory the checkpoint is
+            written to before it is renamed to its final path. Must be identical
+            on every rank. Only used when a barrier is configured.
     """
 
     checkpoint_write_barrier_timeout_sec: int = 600
     barrier_config: BarrierConfig | None = None
     file_write_max_threads: int = 1
+    temp_dir_prefix: str = DEFAULT_TEMP_DIR_PREFIX
 
     def __post_init__(self) -> None:
         if self.file_write_max_threads < 1:
             raise ValueError("file_write_max_threads must be positive")
+        if self.barrier_config is not None and not self.temp_dir_prefix:
+            raise ValueError(
+                "temp_dir_prefix must be non-empty when a barrier is configured"
+            )
 
 
 @dataclass
@@ -95,6 +105,10 @@ class CheckpointWriterArgs:
         return CheckpointWriter(args=self)
 
 
+def _temp_dir_path(final_path: Path, temp_dir_prefix: str) -> Path:
+    return final_path.parent / f"{temp_dir_prefix}{final_path.name}"
+
+
 class CheckpointWriter:
     """
     Handles writing state dictionaries to storage.
@@ -102,9 +116,10 @@ class CheckpointWriter:
     This class is responsible for writing model state dictionaries to storage according
     to the specified checkpoint layout. It supports synchronization barriers to ensure
     all ranks in a distributed setting complete their checkpoint operations.
-    """
 
-    TMP_PREFIX: str = "tmp_"
+    If a barrier is configured, ranks first write to a temporary path, then rank 0
+    atomically renames the directory to the final path.
+    """
 
     def __init__(self, args: CheckpointWriterArgs):
         """
@@ -164,7 +179,7 @@ class CheckpointWriter:
         if self._barrier is None:
             tmp_dir_path = final_path
         else:
-            tmp_dir_path = final_path.parent / f"{self.TMP_PREFIX}{final_path.name}"
+            tmp_dir_path = _temp_dir_path(final_path, self._args.config.temp_dir_prefix)
 
         state_dict = checkpoint_info.state_dict
         save_items: list[tuple[str, LayoutInfo, Path]] = []

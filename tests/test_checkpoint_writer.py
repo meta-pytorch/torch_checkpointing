@@ -9,12 +9,14 @@ import os
 import shutil
 import tempfile
 import threading
+from dataclasses import dataclass
 from pathlib import Path
 from unittest import mock
 
 import torch
 import torch_checkpointing.checkpoint_writer as checkpoint_writer_module
 from torch.testing._internal.common_utils import run_tests, TestCase
+from torch_checkpointing.barriers import Barrier, BarrierConfig
 from torch_checkpointing.checkpoint_base import (
     CheckpointItem,
     CheckpointWriteInfo,
@@ -29,6 +31,7 @@ from torch_checkpointing.checkpoint_writer import (
     CheckpointWriter,
     CheckpointWriterArgs,
     CheckpointWriterConfig,
+    DEFAULT_TEMP_DIR_PREFIX,
 )
 from torch_checkpointing.logging_utils import EventLogger
 from torch_checkpointing.storage.filesystem import (
@@ -76,6 +79,22 @@ def global_file_layout(rank: int) -> dict[str, LayoutInfo]:
             serialization_format=TorchSerialization(),
         ),
     }
+
+
+class _NoopBarrier(Barrier):
+    def __init__(self, config: BarrierConfig) -> None:
+        pass
+
+    def execute_barrier(self, timeout_secs: int) -> None:
+        pass
+
+
+@dataclass
+class _NoopBarrierConfig(BarrierConfig):
+    timeout_barrier_init_sec: int = 0
+
+    def create_barrier(self, rank_info) -> _NoopBarrier:
+        return _NoopBarrier(self)
 
 
 class MockCallback:
@@ -162,6 +181,7 @@ class TestCheckpointWriterConfig(TestCase):
         self.assertEqual(options.checkpoint_write_barrier_timeout_sec, 600)
         self.assertIsNone(options.barrier_config)
         self.assertEqual(options.file_write_max_threads, 1)
+        self.assertEqual(options.temp_dir_prefix, DEFAULT_TEMP_DIR_PREFIX)
 
     def test_custom_values(self):
         """Test that CheckpointWriterConfig can be initialized with custom values."""
@@ -172,6 +192,18 @@ class TestCheckpointWriterConfig(TestCase):
         """Test that file_write_max_threads must be positive."""
         with self.assertRaisesRegex(ValueError, "file_write_max_threads"):
             CheckpointWriterConfig(file_write_max_threads=0)
+
+    def test_empty_temp_dir_prefix_rejected_with_barrier(self):
+        """Test that an empty prefix is rejected when a barrier commits the write."""
+        with self.assertRaisesRegex(ValueError, "temp_dir_prefix"):
+            CheckpointWriterConfig(
+                barrier_config=_NoopBarrierConfig(), temp_dir_prefix=""
+            )
+
+    def test_empty_temp_dir_prefix_allowed_without_barrier(self):
+        """Test that the prefix is inert without a barrier (no temp dir is used)."""
+        options = CheckpointWriterConfig(temp_dir_prefix="")
+        self.assertEqual(options.temp_dir_prefix, "")
 
 
 class TestCheckpointWriter(TestCase):
@@ -206,16 +238,24 @@ class TestCheckpointWriter(TestCase):
         *,
         file_write_max_threads: int = 1,
         storage_config: _ProbeStorageConfig | None = None,
+        barrier_config: BarrierConfig | None = None,
+        temp_dir_prefix: str = DEFAULT_TEMP_DIR_PREFIX,
+        pre_finalize_callback=None,
+        finalize_callback=None,
     ) -> CheckpointWriter:
         if storage_config is None:
             storage_config = _ProbeStorageConfig(probe)
         return CheckpointWriter(
             CheckpointWriterArgs(
                 config=CheckpointWriterConfig(
-                    file_write_max_threads=file_write_max_threads
+                    file_write_max_threads=file_write_max_threads,
+                    barrier_config=barrier_config,
+                    temp_dir_prefix=temp_dir_prefix,
                 ),
                 rank_info=self.rank_info,
                 storage_config=storage_config,
+                pre_finalize_callback=pre_finalize_callback,
+                finalize_callback=finalize_callback,
             )
         )
 
@@ -294,6 +334,65 @@ class TestCheckpointWriter(TestCase):
             "train.checkpoint_write.execute.storage.mkdir.latency_ms",
             metric_names,
         )
+
+    def test_write_with_barrier_commits_from_prefixed_temp_dir(self):
+        """Test that a barriered write stages in <prefix><name> then renames."""
+        prefix = "tmp_job123_attempt2_"
+        final_path = Path(self.temp_dir) / "checkpoint_0003000"
+        expected_tmp_path = Path(self.temp_dir) / f"{prefix}checkpoint_0003000"
+        mock_pre_finalize_callback = mock.MagicMock()
+        mock_finalize_callback = mock.MagicMock()
+
+        probe = _ConcurrencyProbe(1)
+        writer = self._writer(
+            probe,
+            barrier_config=_NoopBarrierConfig(),
+            temp_dir_prefix=prefix,
+            pre_finalize_callback=mock_pre_finalize_callback,
+            finalize_callback=mock_finalize_callback,
+        )
+        writer.write(str(final_path), self._raw_checkpoint_info())
+        self.assertEqual(mock_pre_finalize_callback.call_count, 1)
+        self.assertEqual(
+            mock_pre_finalize_callback.call_args.args[0], str(expected_tmp_path)
+        )
+        self.assertEqual(mock_finalize_callback.call_count, 1)
+        self.assertEqual(mock_finalize_callback.call_args.args[0], str(final_path))
+        self.assertTrue(final_path.exists())
+        self.assertFalse(expected_tmp_path.exists())
+
+    def test_write_with_barrier_only_role_rank_0_commits(self):
+        """Test that only role rank 0 renames the shared temp dir to final."""
+        self.rank_info = RankInfo(
+            global_rank=1,
+            global_world_size=2,
+            role_rank=1,
+            role_world_size=2,
+        )
+        prefix = "tmp_job123_attempt2_"
+        final_path = Path(self.temp_dir) / "checkpoint_0003000"
+        expected_tmp_path = Path(self.temp_dir) / f"{prefix}checkpoint_0003000"
+        mock_pre_finalize_callback = mock.MagicMock()
+        mock_finalize_callback = mock.MagicMock()
+        probe = probe = _ConcurrencyProbe(1)
+        writer = self._writer(
+            probe,
+            barrier_config=_NoopBarrierConfig(),
+            temp_dir_prefix=prefix,
+            pre_finalize_callback=mock_pre_finalize_callback,
+            finalize_callback=mock_finalize_callback,
+        )
+        writer.write(str(final_path), self._raw_checkpoint_info())
+        self.assertEqual(mock_pre_finalize_callback.call_count, 1)
+        self.assertEqual(
+            mock_pre_finalize_callback.call_args.args[0], str(expected_tmp_path)
+        )
+        self.assertEqual(mock_finalize_callback.call_count, 1)
+        self.assertEqual(mock_finalize_callback.call_args.args[0], str(final_path))
+
+        # Not renamed -- temp dir still exists
+        self.assertFalse(final_path.exists())
+        self.assertTrue(expected_tmp_path.exists())
 
     def test_write_calls_callbacks(self):
         """Test that write calls the callbacks with correct parameters."""
