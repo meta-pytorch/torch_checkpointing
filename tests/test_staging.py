@@ -5,7 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import json
-from concurrent.futures import Future
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
@@ -20,6 +20,31 @@ from torch_checkpointing.staging import (
     DefaultStager,
 )
 from torch_checkpointing.utils import ensure_future
+
+
+def test_default_stagers_can_share_a_caller_owned_executor() -> None:
+    executor = ThreadPoolExecutor(max_workers=1)
+    config = CheckpointStagerConfig(
+        use_async_staging=True,
+        use_pinned_memory=False,
+        use_shared_memory=False,
+        use_non_blocking_copy=False,
+    )
+    stagers = [DefaultStager(config, staging_executor=executor) for _ in range(2)]
+
+    try:
+        staged = [
+            ensure_future(stager.stage({"value": torch.tensor(index)})).result()
+            for index, stager in enumerate(stagers)
+        ]
+        assert [result["value"].item() for result in staged] == [0, 1]
+
+        for stager in stagers:
+            stager.close()
+
+        assert executor.submit(lambda: 42).result() == 42
+    finally:
+        executor.shutdown(wait=True)
 
 
 class TestDefaultStager(TestCase):

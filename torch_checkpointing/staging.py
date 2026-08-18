@@ -161,9 +161,19 @@ class DefaultStager(CheckpointStager):
             result = stager.stage(state_dict)
             # Automatic cleanup on exit
 
+        # Multiple stagers sharing a caller-owned executor
+        executor = ThreadPoolExecutor(max_workers=1)
+        stagers = [DefaultStager(config, staging_executor=executor) for _ in range(2)]
+        # Closing a stager does not close a caller-owned executor.
+        for stager in stagers:
+            stager.close()
+        executor.shutdown()
+
     Performance Considerations:
         - Async staging provides best performance when model computation
           can overlap with staging operations
+        - A caller-owned executor can bound worker threads across multiple
+          independently buffered stagers
         - Pinned memory improves CPU-GPU transfer speeds but uses more memory
         - Shared memory allows efficient IPC to checkpoint process
         - Non-blocking copies reduce GPU idle time during memory transfers
@@ -181,6 +191,8 @@ class DefaultStager(CheckpointStager):
     def __init__(
         self,
         config: CheckpointStagerConfig | None = None,
+        *,
+        staging_executor: ThreadPoolExecutor | None = None,
     ):
         event_logger = EventLogger()
         if config is None:
@@ -194,6 +206,7 @@ class DefaultStager(CheckpointStager):
         )
         self._staged_state_dict: STATE_DICT | None = None
         self._staging_executor: ThreadPoolExecutor | None = None
+        self._owns_staging_executor = False
         self._staging_stream: torch.Stream | None = None
         self._accelerator_available = torch.accelerator.is_available()
         # Capture the main thread's CUDA device so we can replay it on the
@@ -206,10 +219,16 @@ class DefaultStager(CheckpointStager):
             torch.cuda.current_device() if torch.cuda.is_available() else None
         )
 
-        if self._config.use_async_staging:
-            self._staging_executor = ThreadPoolExecutor(
-                max_workers=1, initializer=self._init_worker_thread
+        if staging_executor is not None and not self._config.use_async_staging:
+            raise ValueError(
+                "staging_executor requires use_async_staging to be enabled"
             )
+
+        if self._config.use_async_staging:
+            self._staging_executor = staging_executor
+            if self._staging_executor is None:
+                self._staging_executor = ThreadPoolExecutor(max_workers=1)
+                self._owns_staging_executor = True
             if self._accelerator_available:
                 # Note: stream needs to be initialized on the main thread after default cuda
                 # stream is setup/used to avoid the risk of accidentally reusing the main
@@ -240,6 +259,19 @@ class DefaultStager(CheckpointStager):
         if self._cuda_device is not None:
             torch.cuda.set_device(self._cuda_device)
 
+    def _stage_on_worker(
+        self,
+        state_dict: STATE_DICT,
+        current_stream_ready: torch.Event | None,
+        keys_not_requiring_copy: Sequence[str],
+    ) -> STATE_DICT:
+        self._init_worker_thread()
+        return self._stage(
+            state_dict,
+            current_stream_ready,
+            keys_not_requiring_copy,
+        )
+
     def stage(
         self,
         state_dict: STATE_DICT,
@@ -265,7 +297,7 @@ class DefaultStager(CheckpointStager):
             ctx = contextvars.copy_context()
             return self._staging_executor.submit(
                 ctx.run,
-                self._stage,
+                self._stage_on_worker,
                 state_dict,
                 current_stream_ready,
                 keys_not_requiring_copy,
@@ -371,7 +403,7 @@ class DefaultStager(CheckpointStager):
             # ... do staging operations ...
             stager.close()  # Clean up all resources
         """
-        if self._staging_executor:
+        if self._staging_executor is not None and self._owns_staging_executor:
             self._staging_executor.shutdown(wait=True)
 
         # Check if StateDictStager has a close method before calling it
