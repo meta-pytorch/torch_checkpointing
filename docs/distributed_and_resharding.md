@@ -30,16 +30,16 @@ See [./key_concepts.md](./key_concepts.md) for the core building blocks
 
 ## The common case: save distributed, reshard on load
 
-Most users come here for one task: *I saved a checkpoint on one set of ranks (or one device mesh) and want to load it onto a different one.* With the high-level `CheckpointManager` that is one declaration and two calls — you **declare a resharder per item** in the config, and the manager auto-wires the sharding-metadata pipeline on **both save and load**. Rank identity is auto-detected from the process group (see §1), and you pass plain `{name: value}` dicts. It runs under `torchrun` and assumes your model state is made of `DTensor`s, handled by the built-in `DTensorResharder`.
+Most users come here for one task: *I saved a checkpoint on one set of ranks (or one device mesh) and want to load it onto a different one.* With the high-level `CheckpointManager` that is one declaration and two calls — you **declare a resharder per item** in the config, and the manager auto-wires the sharding-metadata pipeline on **both save and load**. Rank identity is auto-detected from the process group (see §1), and you pass plain `{name: value}` dicts. It runs under `torchrun` and assumes your model state is made of `DTensor`s, handled by the built-in `DefaultResharder`.
 
-**1. Declare which items to reshard** — bind an `ItemSpec` with a `DTensorResharder` to each item, once, in the config:
+**1. Declare which items to reshard** — bind an `ItemSpec` with a `DefaultResharder` to each item, once, in the config:
 
 ```python
 from torch_checkpointing import CheckpointManager, ItemSpec
-from torch_checkpointing.dtensor_resharder import DTensorResharder
+from torch_checkpointing.default_resharder import DefaultResharder
 
 manager = CheckpointManager(CheckpointManager.Config(
-    items={"model": ItemSpec(resharder=DTensorResharder())},
+    items={"model": ItemSpec(resharder=DefaultResharder())},
 ))
 ```
 
@@ -445,8 +445,8 @@ for item_key, checkpoint_item in checkpoint_info.checkpoint_items.items():
     )
 ```
 
-For DTensor state dicts the built-in `DTensorResharder`
-(`torch_checkpointing/dtensor_resharder.py`) handles this.
+For DTensor state dicts the built-in `DefaultResharder`
+(`torch_checkpointing/default_resharder.py`) handles this.
 
 ### 5b. Wire a metadata manager into the loader
 
@@ -492,9 +492,9 @@ loader.load(path, checkpoint)  # resharding runs for items with a resharder
 loader.close()
 ```
 
-### 5c. The built-in `DTensorResharder`
+### 5c. The built-in `DefaultResharder`
 
-`DTensorResharder` uses DTensor's native placement APIs to compute shard geometry
+`DefaultResharder` uses DTensor's native placement APIs to compute shard geometry
 and remap data. Its `extract_sharding_metadata` walks the item and produces a
 `DTensorShardingMetadata` (from `torch_checkpointing/dtensor_metadata.py`) for
 every `DTensor` it finds:
@@ -637,7 +637,7 @@ altogether (identical save/load configuration on retry).
 | Metadata pipeline | `MetadataManager`, `DefaultMetadataManager` | `metadata_manager.py` |
 | Metadata payload | `CheckpointMetadata`, `DistributedMetadata`, `DistributedItemMetadata` | `distributed_metadata.py` |
 | Resharding interface | `Resharder` | `resharding.py` |
-| Built-in DTensor resharder | `DTensorResharder`, `DTensorShardingMetadata` | `dtensor_resharder.py`, `dtensor_metadata.py` |
+| Built-in DTensor resharder | `DefaultResharder`, `DTensorShardingMetadata` | `default_resharder.py`, `dtensor_metadata.py` |
 | Loader wiring | `CheckpointLoader(reader, metadata_manager)` | `checkpoint_loader.py` |
 
 Through `CheckpointManager` resharding is a single declaration: give an item's

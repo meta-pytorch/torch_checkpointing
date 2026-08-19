@@ -41,7 +41,7 @@ to the selected serialization format.
 | `JsonSerialization(cls=None)` | `.checkpoint_layout` | JSON; `None` returns the raw JSON-decoded value. |
 | `RawSerialization` | `.checkpoint_layout` | Raw bytes. |
 | `SafetensorsSerialization` | `.checkpoint_layout` | safetensors format for tensors. |
-| `DTensorResharder` | `.dtensor_resharder` | Built-in resharder for `DTensor` state. |
+| `DefaultResharder` | `.default_resharder` | Built-in resharder for `DTensor` state. |
 | `Resharder` | `.resharding` | Base class for custom resharding. |
 
 ## Lower-level savers & loaders (advanced)

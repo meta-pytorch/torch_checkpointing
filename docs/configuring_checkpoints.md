@@ -35,7 +35,7 @@ resharders see [./key_concepts.md](./key_concepts.md).
 | Store human-readable metadata (step, config) | `ItemSpec(layout=LayoutInfo(..., JsonSerialization()))` |
 | Store already-serialized bytes | `ItemSpec(layout=LayoutInfo(..., RawSerialization()))` |
 | Store tensors in safetensors format | `ItemSpec(layout=LayoutInfo(..., SafetensorsSerialization()))` |
-| Resume on a different mesh / world size (DTensor) | `ItemSpec(resharder=DTensorResharder())` |
+| Resume on a different mesh / world size (DTensor) | `ItemSpec(resharder=DefaultResharder())` |
 | Reshard non-DTensor sharded state | `ItemSpec(resharder=MyCustomResharder())` |
 | Require an item to be present (fail fast if missing) | `ItemSpec(required=True)` (default) |
 | Make an un-listed key raise instead of using defaults | `Config(default=None)` |
@@ -107,7 +107,7 @@ different parallelization layout than the one it was saved with (for example,
 resuming on a different device mesh or with different sharding). Items with no
 resharder are read back directly.
 
-The built-in `DTensorResharder` handles DTensor state. For state that is not a
+The built-in `DefaultResharder` handles DTensor state. For state that is not a
 plain DTensor (such as dataloader progress) you attach your own `Resharder`
 subclass. See [Resharders](#resharders) below. When an item declares a resharder,
 the manager auto-wires the sharding-metadata pipeline on both save and load — you
@@ -323,7 +323,7 @@ writer support a custom encoding.
 A resharder runs on **load** to map data saved under one distributed layout onto
 this rank's target layout. Items with no resharder are read back directly.
 
-- **`DTensorResharder()`** — reshards DTensor state across different
+- **`DefaultResharder()`** — reshards DTensor state across different
   Shard/Replicate placements, StridedShard layouts, and device mesh
   configurations. Disjoint rank-local layouts are represented as multiple
   contiguous load-plan slices. It takes no constructor arguments.
@@ -335,10 +335,10 @@ You attach a resharder through the item's `ItemSpec`:
 
 ```python
 from torch_checkpointing import CheckpointManager, ItemSpec
-from torch_checkpointing.dtensor_resharder import DTensorResharder
+from torch_checkpointing.default_resharder import DefaultResharder
 
 manager = CheckpointManager(CheckpointManager.Config(
-    items={"model": ItemSpec(resharder=DTensorResharder())},
+    items={"model": ItemSpec(resharder=DefaultResharder())},
 ))
 manager.save(path, {"model": model.state_dict()})       # records sharding metadata
 manager.load(path, into={"model": model.state_dict()})  # reshards onto the new layout
@@ -350,7 +350,7 @@ target metadata on load — so there is no `MetadataManager` to construct or han
 the loader. Resharding needs live targets, so always pass `into=` when you resume
 onto a changed layout.
 
-Import `DTensorResharder` from `torch_checkpointing.dtensor_resharder`; the
+Import `DefaultResharder` from `torch_checkpointing.default_resharder`; the
 `Resharder` base class lives in `torch_checkpointing.resharding`. `Resharder`,
 `LoadPlan`, and `ReshardingInfo` are also re-exported from the top-level
 `torch_checkpointing` package.
@@ -361,7 +361,7 @@ Putting it together with the state a training job usually checkpoints — `model
 `optimizer`, `dataloader`, and `misc_state`. You declare each item's spec once in
 `Config.items`, then pass plain payloads to `save()` and `load()`. Model and
 optimizer are DTensor tensor state: copied during staging (`requires_copy=True`)
-and resharded with the built-in `DTensorResharder`. The dataloader is an unmutated
+and resharded with the built-in `DefaultResharder`. The dataloader is an unmutated
 snapshot, so it skips the staging copy (`requires_copy=False`) and uses a custom
 `MyCustomDataloaderResharder`. `misc_state` is small per-rank bookkeeping,
 written as human-readable JSON.
@@ -372,7 +372,7 @@ from typing import Any
 
 from torch_checkpointing import CheckpointManager, ItemSpec
 from torch_checkpointing.checkpoint_layout import JsonSerialization, LayoutInfo
-from torch_checkpointing.dtensor_resharder import DTensorResharder
+from torch_checkpointing.default_resharder import DefaultResharder
 from torch_checkpointing.distributed_metadata import (
     DistributedItemMetadata,
     ShardingMetadata,
@@ -418,11 +418,11 @@ manager = CheckpointManager(CheckpointManager.Config(
         # what sharded state wants.
         "model": ItemSpec(
             requires_copy=True,
-            resharder=DTensorResharder(),
+            resharder=DefaultResharder(),
         ),
         "optimizer": ItemSpec(
             requires_copy=True,
-            resharder=DTensorResharder(),
+            resharder=DefaultResharder(),
         ),
         # dataloader: not a plain DTensor, so a custom resharder. An unmutated
         # snapshot, so skip the staging copy.

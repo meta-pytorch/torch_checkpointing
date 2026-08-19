@@ -115,12 +115,12 @@ save:
 ```python
 from torch_checkpointing import CheckpointManager, ItemSpec
 from torch_checkpointing.checkpoint_layout import LayoutInfo, SafetensorsSerialization
-from torch_checkpointing.dtensor_resharder import DTensorResharder
+from torch_checkpointing.default_resharder import DefaultResharder
 
 manager = CheckpointManager(CheckpointManager.Config(
     items={
         "model": ItemSpec(
-            resharder=DTensorResharder(),                     # reshard on load
+            resharder=DefaultResharder(),                     # reshard on load
             layout=LayoutInfo("model_{rank}.safetensors",     # custom on-disk layout
                               SafetensorsSerialization()),
         ),
@@ -176,12 +176,12 @@ up with the slice it now owns. You need it whenever you resume on a different
 world size, device mesh, or parallelism strategy.
 
 You opt in per item by giving it a `resharder` in the config; the built-in
-`DTensorResharder` handles `DTensor` state, and you can write your own for other
+`DefaultResharder` handles `DTensor` state, and you can write your own for other
 sharded types.
 
 ```python
 manager = CheckpointManager(CheckpointManager.Config(
-    items={"model": ItemSpec(resharder=DTensorResharder())},
+    items={"model": ItemSpec(resharder=DefaultResharder())},
 ))
 manager.save(path, {"model": model.state_dict()})     # records sharding metadata
 manager.load(path, into={"model": model.state_dict()})  # reshards onto the new layout

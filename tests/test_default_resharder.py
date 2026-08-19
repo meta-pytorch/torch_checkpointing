@@ -5,7 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 """
-Integration tests for DTensorResharder.
+Integration tests for DefaultResharder.
 
 Tests resharding scenarios including placement changes and mesh topology changes
 using DTensor's native placement APIs.
@@ -35,6 +35,10 @@ from torch_checkpointing.checkpoint_base import (
 )
 from torch_checkpointing.checkpoint_layout import default_layout_info
 from torch_checkpointing.checkpoint_reader import CheckpointReader
+from torch_checkpointing.default_resharder import (
+    compute_local_shard_info,
+    DefaultResharder,
+)
 from torch_checkpointing.distributed_metadata import (
     DistributedItemMetadata,
     GlobalObjectMetadata,
@@ -47,10 +51,6 @@ from torch_checkpointing.dtensor_metadata import (
     get_device_mesh_spec,
     ShardSpec,
     StridedShardSpec,
-)
-from torch_checkpointing.dtensor_resharder import (
-    compute_local_shard_info,
-    DTensorResharder,
 )
 from torch_checkpointing.metadata_manager import (
     CheckpointMetadata,
@@ -120,7 +120,7 @@ def test_generate_load_plans_skips_path_with_unsupported_source_metadata() -> No
         rank_to_layout_info={},
     )
 
-    resharding_info = DTensorResharder()._generate_load_plans(
+    resharding_info = DefaultResharder()._generate_load_plans(
         target_metadata={nested_path: dtensor_metadata},
         source_metadata=source_metadata,
     )
@@ -150,7 +150,7 @@ def test_generate_load_plans_marks_non_intersecting_target_shard_non_reshardable
     )
 
     with caplog.at_level(logging.WARNING):
-        resharding_info = DTensorResharder()._generate_load_plans(
+        resharding_info = DefaultResharder()._generate_load_plans(
             target_metadata={nested_path: dtensor_metadata},
             source_metadata=source_metadata,
         )
@@ -160,8 +160,8 @@ def test_generate_load_plans_marks_non_intersecting_target_shard_non_reshardable
     assert "No source DTensor shard intersects target shard" in caplog.text
 
 
-class TestDTensorResharder(DTensorTestBase):
-    """Integration tests for DTensorResharder resharding across topologies."""
+class TestDefaultResharder(DTensorTestBase):
+    """Integration tests for DefaultResharder resharding across topologies."""
 
     temp_dir: str  # Set by @with_temp_dir decorator
 
@@ -262,6 +262,9 @@ class TestDTensorResharder(DTensorTestBase):
         expected_global_tensor: torch.Tensor,
     ) -> None:
         """Verify loaded DTensor contains correct data by comparing local tensors."""
+        # `with_temp_dir` removes the shared directory independently on each
+        # rank, so every rank must finish reading before any test can return.
+        dist.barrier()
         expected_dtensor = distribute_tensor(
             expected_global_tensor,
             loaded_dtensor.device_mesh,
@@ -298,7 +301,7 @@ class TestDTensorResharder(DTensorTestBase):
                         [Shard(0)],
                     )
                 },
-                resharder=DTensorResharder(),
+                resharder=DefaultResharder(),
             ),
         }
 
@@ -320,7 +323,7 @@ class TestDTensorResharder(DTensorTestBase):
                         [Shard(1)],
                     )
                 },
-                resharder=DTensorResharder(),
+                resharder=DefaultResharder(),
             ),
         }
 
@@ -363,7 +366,7 @@ class TestDTensorResharder(DTensorTestBase):
                     source_mesh,
                     [Shard(0)],
                 ),
-                resharder=DTensorResharder(),
+                resharder=DefaultResharder(),
             ),
         }
 
@@ -382,7 +385,7 @@ class TestDTensorResharder(DTensorTestBase):
                     target_mesh,
                     [Shard(1)],
                 ),
-                resharder=DTensorResharder(),
+                resharder=DefaultResharder(),
             ),
         }
 
@@ -431,7 +434,7 @@ class TestDTensorResharder(DTensorTestBase):
                         }
                     ]
                 },
-                resharder=DTensorResharder(),
+                resharder=DefaultResharder(),
             ),
         }
 
@@ -456,7 +459,7 @@ class TestDTensorResharder(DTensorTestBase):
                         }
                     ]
                 },
-                resharder=DTensorResharder(),
+                resharder=DefaultResharder(),
             ),
         }
 
@@ -503,7 +506,7 @@ class TestDTensorResharder(DTensorTestBase):
                         [Shard(0), Shard(1)],
                     )
                 },
-                resharder=DTensorResharder(),
+                resharder=DefaultResharder(),
             ),
         }
 
@@ -525,7 +528,7 @@ class TestDTensorResharder(DTensorTestBase):
                         [Shard(0), Replicate()],
                     )
                 },
-                resharder=DTensorResharder(),
+                resharder=DefaultResharder(),
             ),
         }
 
@@ -570,7 +573,7 @@ class TestDTensorResharder(DTensorTestBase):
                         [Shard(0), Shard(1)],
                     )
                 },
-                resharder=DTensorResharder(),
+                resharder=DefaultResharder(),
             ),
         }
 
@@ -592,7 +595,7 @@ class TestDTensorResharder(DTensorTestBase):
                         [Shard(0), Shard(1)],
                     )
                 },
-                resharder=DTensorResharder(),
+                resharder=DefaultResharder(),
             ),
         }
 
@@ -601,7 +604,7 @@ class TestDTensorResharder(DTensorTestBase):
         )
 
         # Verify should_reshard returns False for identical topologies
-        resharder = DTensorResharder()
+        resharder = DefaultResharder()
         target_sharding = resharder.extract_sharding_metadata(
             "model", target_items["model"].value
         )
@@ -652,7 +655,7 @@ class TestDTensorResharder(DTensorTestBase):
                         [Replicate()],
                     )
                 },
-                resharder=DTensorResharder(),
+                resharder=DefaultResharder(),
             ),
         }
 
@@ -674,7 +677,7 @@ class TestDTensorResharder(DTensorTestBase):
                         [Shard(0)],
                     )
                 },
-                resharder=DTensorResharder(),
+                resharder=DefaultResharder(),
             ),
         }
 
@@ -720,7 +723,7 @@ class TestDTensorResharder(DTensorTestBase):
                         [Shard(0)],
                     )
                 },
-                resharder=DTensorResharder(),
+                resharder=DefaultResharder(),
             ),
         }
 
@@ -742,7 +745,7 @@ class TestDTensorResharder(DTensorTestBase):
                         [Replicate()],
                     )
                 },
-                resharder=DTensorResharder(),
+                resharder=DefaultResharder(),
             ),
         }
 
@@ -788,7 +791,7 @@ class TestDTensorResharder(DTensorTestBase):
                         [Shard(0), Shard(1)],
                     )
                 },
-                resharder=DTensorResharder(),
+                resharder=DefaultResharder(),
             ),
             "optimizer": CheckpointItem(
                 value={
@@ -798,7 +801,7 @@ class TestDTensorResharder(DTensorTestBase):
                         [Shard(0), Replicate()],
                     )
                 },
-                resharder=DTensorResharder(),
+                resharder=DefaultResharder(),
             ),
         }
 
@@ -822,7 +825,7 @@ class TestDTensorResharder(DTensorTestBase):
                         [Shard(0), Replicate()],
                     )
                 },
-                resharder=DTensorResharder(),
+                resharder=DefaultResharder(),
             ),
             "optimizer": CheckpointItem(
                 value={
@@ -832,7 +835,7 @@ class TestDTensorResharder(DTensorTestBase):
                         [Shard(0), Replicate()],
                     )
                 },
-                resharder=DTensorResharder(),
+                resharder=DefaultResharder(),
             ),
         }
 
@@ -859,7 +862,7 @@ class TestDTensorResharder(DTensorTestBase):
     @with_comms()
     @with_temp_dir
     def test_mixed_items_reshard_and_no_reshard(self):
-        """Test mix of items: one with DTensorResharder, one without."""
+        """Test mix of items: one with DefaultResharder, one without."""
         self.rank_info = self._create_rank_info()
         self.reader = CheckpointReader(
             rank_info=self.rank_info, storage_config=LocalFileSystemStorageConfig()
@@ -879,7 +882,7 @@ class TestDTensorResharder(DTensorTestBase):
                         [Shard(0), Shard(1)],
                     )
                 },
-                resharder=DTensorResharder(),
+                resharder=DefaultResharder(),
             ),
             "epoch": CheckpointItem(value=42),  # Non-tensor, no resharder
         }
@@ -904,7 +907,7 @@ class TestDTensorResharder(DTensorTestBase):
                         [Shard(0), Replicate()],
                     )
                 },
-                resharder=DTensorResharder(),
+                resharder=DefaultResharder(),
             ),
             "epoch": CheckpointItem(value=None),  # No resharder
         }

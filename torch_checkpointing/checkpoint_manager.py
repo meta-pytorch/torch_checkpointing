@@ -12,8 +12,10 @@ binds a declarative schema (per-item :class:`ItemSpec`: ``requires_copy``,
 on-disk ``layout``, ``resharder``, ``required``) once in its ``Config``, then
 accepts plain ``Mapping[ItemKey, Any]`` payloads::
 
+    from torch_checkpointing.default_resharder import DefaultResharder
+
     manager = CheckpointManager(CheckpointManager.Config(
-        items={"model": ItemSpec(resharder=DTensorResharder())},
+        items={"model": ItemSpec(resharder=DefaultResharder())},
     ))
     manager.save("/ckpt/step_1000", {"model": model.state_dict(), "step": 1000})
     manager.load("/ckpt/step_1000", into={"model": model.state_dict()})

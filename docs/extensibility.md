@@ -22,7 +22,7 @@ Implement a resharder when a checkpoint saved under one parallelism layout must 
 
 - **Interface:** `Resharder` (`torch_checkpointing.resharding`).
 - **Implement:** `extract_sharding_metadata(item_key, item_value)` and `load(...)`; optionally override `should_reshard(...)` and the `skip_resharding` property.
-- **Built-in:** `DTensorResharder` (`.dtensor_resharder`) — handles `DTensor` mesh/placement changes.
+- **Built-in:** `DefaultResharder` (`.default_resharder`) — handles `DTensor` mesh/placement changes.
 - **Wire it in:** attach it per item via `ItemSpec(resharder=YourResharder())` in `CheckpointManager.Config(items={...})`. That is the whole contract: the manager **auto-wires** the sharding-metadata pipeline on both save and load — recording the source layout on save and computing the target layout on load — so a declared resharder actually runs. (Under the hood this is a `MetadataManager`; see the next section.)
 - **Deep dive:** [Distributed and resharding](./distributed_and_resharding.md).
 

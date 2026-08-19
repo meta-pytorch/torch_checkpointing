@@ -62,6 +62,8 @@ from .walk_utils import walk_checkpoint_structure
 
 logger: logging.Logger = logging.getLogger(__name__)
 
+__all__ = ["DefaultResharder"]
+
 
 def _replicated_tensor_metadata(tensor: torch.Tensor) -> DTensorShardingMetadata:
     world_size = dist.get_world_size() if dist.is_initialized() else 1
@@ -229,7 +231,7 @@ def _flatten_state_dict(item_key: str, value: Any) -> dict[str, Any]:
     return flattened
 
 
-class DTensorResharder(Resharder):
+class DefaultResharder(Resharder):
     """Resharder for DTensor checkpoints.
 
     Uses DTensor's native placement APIs to compute shard geometry and perform
@@ -323,7 +325,7 @@ class DTensorResharder(Resharder):
             )
         else:
             logger.warning(
-                f"DTensorResharder.load: no load plans generated for item '{item_key}'."
+                f"DefaultResharder.load: no load plans generated for item '{item_key}'."
             )
 
         return resharding_info.non_reshardable_paths

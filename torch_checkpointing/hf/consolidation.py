@@ -47,13 +47,13 @@ from torch.distributed.checkpoint._hf_utils import (
 )
 
 from ..checkpoint_layout import LayoutInfo, SafetensorsSerialization
+from ..default_resharder import compute_local_shard_info
 from ..distributed_metadata import (
     DistributedItemMetadata,
     GlobalObjectMetadata,
     load_distributed_metadata,
 )
 from ..dtensor_metadata import DTensorShardingMetadata
-from ..dtensor_resharder import compute_local_shard_info
 from ..logging_utils import EventLogger, EventType
 from ..resharding_utils import get_fqn_from_nested_path
 from ..storage.base_storage import ReadArgs, Storage, StorageConfig

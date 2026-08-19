@@ -9,11 +9,11 @@ from unittest.mock import patch
 
 import pytest
 import torch
+from torch_checkpointing.default_resharder import DefaultResharder
 from torch_checkpointing.dtensor_metadata import (
     DTensorShardingMetadata,
     ReplicateSpec,
 )
-from torch_checkpointing.dtensor_resharder import DTensorResharder
 
 
 def test_extract_sharding_metadata_treats_plain_tensors_as_replicated(
@@ -27,16 +27,16 @@ def test_extract_sharding_metadata_treats_plain_tensors_as_replicated(
 
     with (
         patch(
-            "torch_checkpointing.dtensor_resharder.dist.is_initialized",
+            "torch_checkpointing.default_resharder.dist.is_initialized",
             return_value=True,
         ),
         patch(
-            "torch_checkpointing.dtensor_resharder.dist.get_world_size",
+            "torch_checkpointing.default_resharder.dist.get_world_size",
             return_value=4,
         ),
         caplog.at_level(logging.WARNING),
     ):
-        metadata = DTensorResharder().extract_sharding_metadata(
+        metadata = DefaultResharder().extract_sharding_metadata(
             "model",
             checkpoint_item,
         )

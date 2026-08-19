@@ -105,16 +105,16 @@ Tensors in the templates are restored in place; `load()` also returns the loaded
 
 ```python
 from torch_checkpointing import CheckpointManager, ItemSpec
-from torch_checkpointing.dtensor_resharder import DTensorResharder
+from torch_checkpointing.default_resharder import DefaultResharder
 
 manager = CheckpointManager(CheckpointManager.Config(
-    items={"model": ItemSpec(resharder=DTensorResharder())},
+    items={"model": ItemSpec(resharder=DefaultResharder())},
 ))
 manager.save(path, {"model": model.state_dict()})      # records source sharding metadata
 manager.load(path, into={"model": model.state_dict()})  # reshards onto the new layout
 ```
 
-The built-in `DTensorResharder` handles `DTensor` state; write a custom `Resharder` for other sharded types. See [Distributed and resharding](./distributed_and_resharding.md).
+The built-in `DefaultResharder` handles `DTensor` state; write a custom `Resharder` for other sharded types. See [Distributed and resharding](./distributed_and_resharding.md).
 
 ## `save()` / `load()` raises on a key like `"model.pt"` or `"optim/state"`
 
