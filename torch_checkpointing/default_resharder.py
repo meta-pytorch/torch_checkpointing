@@ -25,6 +25,7 @@ from typing import Any
 
 import torch
 import torch.distributed as dist
+from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode
 from torch.distributed.tensor import DTensor
 from torch.distributed.tensor._utils import _compute_local_shape_and_global_offset
 from torch.distributed.tensor.placement_types import (
@@ -56,13 +57,29 @@ from .resharding_utils import (
     deduplicate_source_chunks,
     get_fqn_from_nested_path,
 )
-from .storage.base_storage import Storage
+from .storage.base_storage import ReadArgs, Storage
 from .types import CheckpointPath, NestedPath
 from .walk_utils import walk_checkpoint_structure
 
 logger: logging.Logger = logging.getLogger(__name__)
 
 __all__ = ["DefaultResharder"]
+
+
+def _read_exact(stream: Any, offset: int, buffer: memoryview) -> None:
+    stream.seek(offset)
+    if stream.tell() != offset:
+        raise OSError(f"Failed to seek to checkpoint offset {offset}")
+
+    bytes_read = 0
+    while bytes_read < len(buffer):
+        count = stream.readinto(buffer[bytes_read:])
+        if not count:
+            raise EOFError(
+                f"Expected {len(buffer)} bytes at checkpoint offset {offset}, "
+                f"but read {bytes_read}"
+            )
+        bytes_read += count
 
 
 def _replicated_tensor_metadata(tensor: torch.Tensor) -> DTensorShardingMetadata:
@@ -229,6 +246,69 @@ def _flatten_state_dict(item_key: str, value: Any) -> dict[str, Any]:
     path_to_value = _collect_leaf_values(item_key, value)
     flattened, _ = convert_nested_path_dict_to_fqn(path_to_value)
     return flattened
+
+
+def _unwrap_dtensor(value: Any) -> Any:
+    return value._local_tensor if isinstance(value, DTensor) else value
+
+
+def _slice_source_tensor(source: torch.Tensor, load_plan: LoadPlan) -> torch.Tensor:
+    source_slice = tuple(
+        slice(offset, offset + size)
+        for offset, size in zip(load_plan.src_offsets, load_plan.src_sizes)
+    )
+    return source[source_slice]
+
+
+def _read_source_tensor_slice(
+    stream: Any,
+    source: Any,
+    load_plan: LoadPlan,
+) -> torch.Tensor:
+    source = _unwrap_dtensor(source)
+    if not isinstance(source, FakeTensor):
+        raise NotImplementedError(f"Source {load_plan.src_fqn!r} is not a plain tensor")
+    if source.layout is not torch.strided or source.is_quantized:
+        raise NotImplementedError(
+            f"Source {load_plan.src_fqn!r} does not use a strided storage"
+        )
+    assert len(load_plan.src_offsets) == len(load_plan.src_sizes) == source.ndim, (
+        f"Load plan rank does not match source tensor {load_plan.src_fqn!r}"
+    )
+    strides = tuple(source.stride())
+
+    if any(size == 0 for size in load_plan.src_sizes):
+        result = torch.empty(load_plan.src_sizes, dtype=source.dtype)
+    else:
+        checkpoint_offset = getattr(
+            source.untyped_storage(), "_checkpoint_offset", None
+        )
+        if checkpoint_offset is None:
+            raise NotImplementedError(
+                f"Source {load_plan.src_fqn!r} has no checkpoint offset"
+            )
+
+        element_size = source.element_size()
+        first_element = source.storage_offset() + sum(
+            offset * stride for offset, stride in zip(load_plan.src_offsets, strides)
+        )
+        # Span from the first wanted element through the last, read in one go.
+        # For a contiguous source this never exceeds the tensor itself, so the
+        # worst case matches reading the whole tensor.
+        span = 1 + sum(
+            (size - 1) * stride for size, stride in zip(load_plan.src_sizes, strides)
+        )
+        packed = bytearray(span * element_size)
+        _read_exact(
+            stream,
+            checkpoint_offset + first_element * element_size,
+            memoryview(packed),
+        )
+        result = torch.frombuffer(packed, dtype=source.dtype).as_strided(
+            load_plan.src_sizes, strides
+        )
+
+    return result
 
 
 class DefaultResharder(Resharder):
@@ -476,9 +556,9 @@ class DefaultResharder(Resharder):
 
         Groups load plans by source rank to minimize file reads, then for each
         source rank:
-        1. Read the full checkpoint file.
-        2. Flatten the loaded state dict.
-        3. For each load plan, extract source data and copy into target tensor.
+        1. Read checkpoint metadata and the storage span needed by each load plan.
+        2. Fall back to a full checkpoint load for unsupported archive features.
+        3. Copy the staged source data into target tensors.
 
         Args:
             src_path_fn: Callable that returns the file path for a given source rank.
@@ -500,42 +580,67 @@ class DefaultResharder(Resharder):
         # Process each source rank
         for src_rank, rank_plans in plans_by_rank.items():
             file_path = src_path_fn(src_rank)
+            staged = self._read_source_slices(
+                file_path,
+                item_key,
+                rank_plans,
+                storage,
+            )
 
-            # TODO: Use offset reads for tensor chunks.
-            with storage.stream_read(file_path) as f:
-                loaded_data = torch.load(
-                    f,  # type: ignore[arg-type]
-                    map_location="cpu",
-                    weights_only=False,
-                )
-
-            # Flatten the loaded state dict
-            flattened = _flatten_state_dict(item_key, loaded_data)
-
-            # Execute each load plan for this rank
-            for nested_path, lp in rank_plans:
-                # Get source tensor from flattened dict
-                src_tensor = flattened[lp.src_fqn]
-
-                # Unwrap DTensor if needed
-                if isinstance(src_tensor, DTensor):
-                    src_tensor = src_tensor._local_tensor
-
-                # Extract source slice
-                src_slice = tuple(
-                    slice(o, o + s) for o, s in zip(lp.src_offsets, lp.src_sizes)
-                )
-                src_data = src_tensor[src_slice]
-
-                # Get target tensor from the walked target structure
-                target_obj = target_by_path[nested_path]
-
-                # Unwrap DTensor if needed
-                if isinstance(target_obj, DTensor):
-                    target_tensor = target_obj._local_tensor
-                else:
-                    target_tensor = target_obj
-
-                # Copy into target
+            for nested_path, lp, src_data in staged:
+                target_tensor = _unwrap_dtensor(target_by_path[nested_path])
                 tgt_slice = tuple(slice(o, o + s) for o, s in zip(lp.offsets, lp.sizes))
                 target_tensor[tgt_slice].copy_(src_data)
+
+    def _read_source_slices(
+        self,
+        file_path: Path,
+        item_key: str,
+        rank_plans: list[tuple[NestedPath, LoadPlan]],
+        storage: Storage,
+    ) -> list[tuple[NestedPath, LoadPlan, torch.Tensor]]:
+        """Read the source data every plan needs from one checkpoint file."""
+        try:
+            with storage.stream_read(
+                file_path,
+                ReadArgs(pre_read_full_file=False),
+            ) as stream:
+                with FakeTensorMode():
+                    metadata = torch.load(
+                        stream,  # type: ignore[arg-type]
+                        map_location="cpu",
+                        weights_only=False,
+                    )
+                flattened = _flatten_state_dict(item_key, metadata)
+                return [
+                    (
+                        path,
+                        plan,
+                        _read_source_tensor_slice(
+                            stream, flattened[plan.src_fqn], plan
+                        ),
+                    )
+                    for path, plan in rank_plans
+                ]
+        except NotImplementedError as error:
+            logger.warning(
+                "Offset reads unavailable for %s, reading it in full: %s",
+                file_path,
+                error,
+            )
+
+        with storage.stream_read(file_path) as stream:
+            loaded_data = torch.load(
+                stream,  # type: ignore[arg-type]
+                map_location="cpu",
+                weights_only=False,
+            )
+        flattened = _flatten_state_dict(item_key, loaded_data)
+        return [
+            (
+                path,
+                plan,
+                _slice_source_tensor(_unwrap_dtensor(flattened[plan.src_fqn]), plan),
+            )
+            for path, plan in rank_plans
+        ]
