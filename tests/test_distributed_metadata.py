@@ -11,6 +11,7 @@ from torch_checkpointing.checkpoint_layout import (
     LayoutInfo,
     TorchSerialization,
 )
+from torch_checkpointing.default_metadata import DefaultShardingMetadata
 from torch_checkpointing.distributed_metadata import (
     DistributedItemMetadata,
     DistributedMetadata,
@@ -28,6 +29,106 @@ from torch_checkpointing.metadata_manager import DefaultMetadataManager
 from torch_checkpointing.types import CheckpointPath, NestedPath, RankInfo
 
 from .resharding_test_utils import CustomTensorObject, make_checkpoint_item
+
+
+def test_default_sharding_metadata_serialization_round_trip() -> None:
+    metadata = DefaultShardingMetadata(
+        global_shape=(8, 6),
+        global_offsets=((0, 1), (4, 1)),
+        local_offsets=((1, 0), (5, 0)),
+        local_sizes=((4, 5), (4, 5)),
+        dtype="torch.float32",
+    )
+    object_metadata = GlobalObjectMetadata(
+        sharding_metadata=metadata,
+        ranks=(3,),
+    )
+
+    serialized = object_metadata.to_dict()
+    restored = GlobalObjectMetadata.from_dict(serialized)
+
+    assert serialized["sharding_metadata"]["type"] == "default_tensor_v1"
+    assert serialized["sharding_metadata"]["data"] == {
+        "global_shape": [8, 6],
+        "global_offsets": [[0, 1], [4, 1]],
+        "local_offsets": [[1, 0], [5, 0]],
+        "local_sizes": [[4, 5], [4, 5]],
+        "dtype": "torch.float32",
+    }
+    assert restored == object_metadata
+    assert restored.sharding_metadata.equivalent_ranks is None
+
+
+@pytest.mark.parametrize(
+    (
+        "global_shape",
+        "global_offsets",
+        "local_offsets",
+        "local_sizes",
+        "error_match",
+    ),
+    [
+        pytest.param(
+            (8,),
+            ((0,),),
+            (),
+            ((4,),),
+            "same number of shards",
+            id="mismatched-shard-count",
+        ),
+        pytest.param(
+            (8, 4),
+            ((0,),),
+            ((0, 0),),
+            ((4, 4),),
+            "must have 2 dimensions",
+            id="mismatched-dimensions",
+        ),
+        pytest.param(
+            (8,),
+            ((6,),),
+            ((0,),),
+            ((4,),),
+            "extends beyond the logical global tensor",
+            id="shard-exceeds-global-shape",
+        ),
+    ],
+)
+def test_default_sharding_metadata_rejects_invalid_geometry(
+    global_shape: tuple[int, ...],
+    global_offsets: tuple[tuple[int, ...], ...],
+    local_offsets: tuple[tuple[int, ...], ...],
+    local_sizes: tuple[tuple[int, ...], ...],
+    error_match: str,
+) -> None:
+    with pytest.raises(ValueError, match=error_match):
+        DefaultShardingMetadata(
+            global_shape=global_shape,
+            global_offsets=global_offsets,
+            local_offsets=local_offsets,
+            local_sizes=local_sizes,
+            dtype="torch.float32",
+        )
+
+
+def test_default_sharding_metadata_allows_scalar_and_empty_shards() -> None:
+    scalar = DefaultShardingMetadata(
+        global_shape=(),
+        global_offsets=((),),
+        local_offsets=((),),
+        local_sizes=((),),
+        dtype="torch.float32",
+    )
+    empty = DefaultShardingMetadata(
+        global_shape=(0, 3),
+        global_offsets=((0, 0),),
+        local_offsets=((2, 1),),
+        local_sizes=((0, 2),),
+        dtype="torch.float32",
+    )
+
+    assert scalar.local_sizes == ((),)
+    assert empty.local_sizes == ((0, 2),)
 
 
 def test_to_and_from_dict():

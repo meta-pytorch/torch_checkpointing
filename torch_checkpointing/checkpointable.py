@@ -6,6 +6,8 @@
 
 """Protocol for local tensors that describe their logical global shards."""
 
+from __future__ import annotations
+
 from typing import Protocol, runtime_checkable
 
 

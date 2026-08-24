@@ -35,6 +35,7 @@ from .config import (
     CheckpointSaverConfig,
     SyncCheckpointSaverConfig,
 )
+from .default_metadata import DefaultShardingMetadata  # noqa: F401
 from .distributed_metadata import (
     CheckpointMetadata,
     DistributedItemMetadata,
