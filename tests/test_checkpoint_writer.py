@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from unittest import mock
 
+import pytest
 import torch
 import torch_checkpointing.checkpoint_writer as checkpoint_writer_module
 from torch.testing._internal.common_utils import run_tests, TestCase
@@ -393,6 +394,37 @@ class TestCheckpointWriter(TestCase):
         # Not renamed -- temp dir still exists
         self.assertFalse(final_path.exists())
         self.assertTrue(expected_tmp_path.exists())
+
+    def test_write_with_barrier_rejects_preexisting_final_dir(self):
+        """Test that committing onto a non-empty final path fails loudly."""
+        final_path = Path(self.temp_dir) / "checkpoint_0004000"
+        final_path.mkdir()
+        (final_path / "leftover.bin").write_bytes(b"leftover")
+
+        probe = _ConcurrencyProbe(1)
+        writer = self._writer(probe, barrier_config=_NoopBarrierConfig())
+
+        with pytest.raises(OSError):
+            writer.write(str(final_path), self._raw_checkpoint_info())
+
+        # The pre-existing checkpoint must be left untouched, not merged into or
+        # replaced, and the staged data must not be nested underneath it.
+        self.assertEqual(sorted(p.name for p in final_path.iterdir()), ["leftover.bin"])
+
+    def test_write_with_barrier_commits_into_empty_final_dir(self):
+        """Test that an empty final path is replaced rather than nested into."""
+        final_path = Path(self.temp_dir) / "checkpoint_0005000"
+        final_path.mkdir()
+
+        probe = _ConcurrencyProbe(1)
+        writer = self._writer(probe, barrier_config=_NoopBarrierConfig())
+        writer.write(str(final_path), self._raw_checkpoint_info())
+
+        self.assertEqual(
+            sorted(p.name for p in final_path.iterdir()),
+            ["first.bin", "metadata.bin", "second.bin"],
+        )
+        self.assertEqual((final_path / "first.bin").read_bytes(), b"first")
 
     def test_write_calls_callbacks(self):
         """Test that write calls the callbacks with correct parameters."""

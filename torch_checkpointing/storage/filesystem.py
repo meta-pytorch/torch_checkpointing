@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import errno
 import io
 import logging
 import os
@@ -17,6 +18,23 @@ from typing_extensions import Buffer, override
 from .base_storage import ReadArgs, Storage, StorageConfig
 
 logger = logging.getLogger(__name__)
+
+
+def _occupied_destination_error(
+    src_path: Path, dst_path: Path, error_number: int = errno.ENOTEMPTY
+) -> FileExistsError:
+    """The error for a destination a rename is not allowed to consume.
+
+    ``error_number`` is carried over from the syscall that refused, so the errno
+    still says which way it was occupied (``ENOTEMPTY`` a populated directory,
+    ``EISDIR`` a directory where a file was going, ``ENOTDIR`` the reverse).
+    """
+    return FileExistsError(
+        error_number,
+        f"Refusing to rename {src_path} onto {dst_path}: the destination is "
+        "occupied, and a rename commits onto unoccupied space rather than "
+        "overwriting it. Delete it explicitly if it is meant to be replaced.",
+    )
 
 
 @dataclass
@@ -223,17 +241,70 @@ class LocalFileSystemStorage(Storage):
         src_path: Path,
         dst_path: Path,
         is_directory: bool = False,
-        is_cross_link: bool = False,
         background_cleanup: bool = False,
     ) -> None:
-        if is_cross_link and os.path.isdir(src_path):
-            # Cross-filesystem move: copy contents then delete source
-            # This avoids shutil.move's nesting behavior when dst exists
-            os.makedirs(dst_path, exist_ok=True)
-            shutil.copytree(str(src_path), str(dst_path), dirs_exist_ok=True)
-            shutil.rmtree(str(src_path))
+        if os.path.isdir(src_path):
+            self._rename_directory(src_path, dst_path)
         else:
-            shutil.move(str(src_path), str(dst_path))
+            self._rename_file(src_path, dst_path)
+
+    def _rename_directory(self, src_path: Path, dst_path: Path) -> None:
+        """Move a directory so its contents land directly at ``dst_path``.
+
+        ``os.rename`` gives exactly the contract documented on
+        ``Storage.rename``: it replaces an absent or empty destination
+        atomically and refuses a populated one. ``shutil.move`` must not be
+        used here, because it moves the source *inside* an existing destination
+        directory rather than replacing it.
+        """
+        try:
+            os.rename(src_path, dst_path)
+            return
+        except OSError as e:
+            if e.errno in (errno.ENOTEMPTY, errno.EEXIST, errno.ENOTDIR):
+                raise _occupied_destination_error(src_path, dst_path, e.errno) from e
+            if e.errno != errno.EXDEV:
+                raise
+            logger.warning(
+                f"Cannot rename {src_path} to {dst_path} across filesystems, "
+                "falling back to a non-atomic copy"
+            )
+
+        # Cross-filesystem move: copy the contents over, then drop the source.
+        # The destination is vetted up front because copytree would merge into
+        # it, which loses the "commit onto unoccupied space" guarantee.
+        if os.path.exists(dst_path) and (
+            not os.path.isdir(dst_path) or os.listdir(dst_path)
+        ):
+            raise _occupied_destination_error(
+                src_path,
+                dst_path,
+                errno.ENOTEMPTY if os.path.isdir(dst_path) else errno.ENOTDIR,
+            )
+        os.makedirs(dst_path, exist_ok=True)
+        shutil.copytree(str(src_path), str(dst_path), dirs_exist_ok=True)
+        shutil.rmtree(str(src_path))
+
+    def _rename_file(self, src_path: Path, dst_path: Path) -> None:
+        """Move a file so it lands at ``dst_path`` itself.
+
+        ``os.replace`` overwrites an existing file, which the atomic-write
+        callers depend on, and refuses a directory. ``shutil.move`` must not be
+        used here either: given a directory it would drop the file inside.
+        """
+        try:
+            os.replace(src_path, dst_path)
+            return
+        except OSError as e:
+            if e.errno in (errno.EISDIR, errno.ENOTEMPTY, errno.EEXIST):
+                raise _occupied_destination_error(src_path, dst_path, e.errno) from e
+            if e.errno != errno.EXDEV:
+                raise
+
+        if os.path.isdir(dst_path):
+            raise _occupied_destination_error(src_path, dst_path, errno.EISDIR)
+        shutil.copy2(str(src_path), str(dst_path))
+        os.remove(src_path)
 
     @override
     def ls(self, path: Path) -> list[str]:

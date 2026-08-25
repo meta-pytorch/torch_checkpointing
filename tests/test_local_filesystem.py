@@ -5,15 +5,31 @@
 # LICENSE file in the root directory of this source tree.
 
 import array
+import errno
 import os
 import random
 import shutil
+from contextlib import contextmanager
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
+import pytest
 import torch
 from torch.testing._internal.common_utils import TestCase
 from torch_checkpointing.storage.filesystem import LocalFileSystemStorageConfig
+
+
+@contextmanager
+def _renames_across_filesystems():
+    """Force the copy-based fallback, as a rename spanning two mounts would."""
+    with mock.patch(
+        "os.rename", side_effect=OSError(errno.EXDEV, "Invalid cross-device link")
+    ):
+        with mock.patch(
+            "os.replace", side_effect=OSError(errno.EXDEV, "Invalid cross-device link")
+        ):
+            yield
 
 
 class TestStorage(TestCase):
@@ -200,3 +216,120 @@ class TestStorage(TestCase):
         with open(test_file, "rb") as f:
             content = f.read()
         self.assertEqual(content, b"test data")
+
+    def _populated_dir(self, name: str, file_name: str = "payload.bin") -> Path:
+        path = Path(self.temp_dir) / name
+        os.makedirs(path, exist_ok=True)
+        (path / file_name).write_bytes(b"payload")
+        return path
+
+    def test_rename_directory_onto_absent_destination(self):
+        """A directory rename onto an absent destination moves the contents."""
+        src = self._populated_dir("src")
+        dst = Path(self.temp_dir) / "dst"
+
+        self.storage.rename(src, dst, is_directory=True)
+
+        self.assertFalse(src.exists())
+        self.assertEqual(os.listdir(dst), ["payload.bin"])
+
+    def test_rename_directory_replaces_empty_destination(self):
+        """An empty destination directory is unoccupied, so it is replaced."""
+        src = self._populated_dir("src")
+        dst = Path(self.temp_dir) / "dst"
+        os.makedirs(dst)
+
+        self.storage.rename(src, dst, is_directory=True)
+
+        self.assertFalse(src.exists())
+        # The contents land directly at dst, not nested under dst/src.
+        self.assertEqual(os.listdir(dst), ["payload.bin"])
+
+    def test_rename_directory_rejects_populated_destination(self):
+        """A populated destination raises instead of nesting or merging."""
+        src = self._populated_dir("src")
+        dst = self._populated_dir("dst", file_name="existing.bin")
+
+        with pytest.raises(OSError):
+            self.storage.rename(src, dst, is_directory=True)
+
+        # Neither side is touched: no nesting under dst, no merge, no deletion.
+        self.assertEqual(os.listdir(src), ["payload.bin"])
+        self.assertEqual(os.listdir(dst), ["existing.bin"])
+
+    def test_rename_directory_rejects_file_destination(self):
+        """A destination that is not a directory raises."""
+        src = self._populated_dir("src")
+        dst = Path(self.temp_dir) / "dst"
+        dst.write_bytes(b"not a directory")
+
+        with pytest.raises(OSError):
+            self.storage.rename(src, dst, is_directory=True)
+
+        self.assertEqual(dst.read_bytes(), b"not a directory")
+
+    def test_rename_directory_across_filesystems_rejects_populated_destination(
+        self,
+    ):
+        """The copy-based fallback enforces the same destination contract."""
+        src = self._populated_dir("src")
+        dst = self._populated_dir("dst", file_name="existing.bin")
+
+        with _renames_across_filesystems():
+            with pytest.raises(OSError):
+                self.storage.rename(src, dst, is_directory=True)
+
+        self.assertEqual(os.listdir(src), ["payload.bin"])
+        self.assertEqual(os.listdir(dst), ["existing.bin"])
+
+    def test_rename_directory_across_filesystems_copies_into_empty_destination(
+        self,
+    ):
+        """The copy-based fallback still commits onto an unoccupied path."""
+        src = self._populated_dir("src")
+        dst = Path(self.temp_dir) / "dst"
+        os.makedirs(dst)
+
+        with _renames_across_filesystems():
+            self.storage.rename(src, dst, is_directory=True)
+
+        self.assertFalse(src.exists())
+        self.assertEqual(os.listdir(dst), ["payload.bin"])
+
+    def test_rename_file_rejects_directory_destination(self):
+        """A file must never be dropped inside a directory that is in its way."""
+        src = Path(self.temp_dir) / "src.bin"
+        src.write_bytes(b"new")
+        dst = Path(self.temp_dir) / "dst"
+        os.makedirs(dst)
+
+        with pytest.raises(OSError):
+            self.storage.rename(src, dst)
+
+        self.assertEqual(os.listdir(dst), [])
+        self.assertEqual(src.read_bytes(), b"new")
+
+    def test_rename_file_across_filesystems_replaces_existing_file(self):
+        """The copy-based fallback keeps the file overwrite semantics."""
+        src = Path(self.temp_dir) / "src.bin"
+        dst = Path(self.temp_dir) / "dst.bin"
+        src.write_bytes(b"new")
+        dst.write_bytes(b"old")
+
+        with _renames_across_filesystems():
+            self.storage.rename(src, dst)
+
+        self.assertFalse(src.exists())
+        self.assertEqual(dst.read_bytes(), b"new")
+
+    def test_rename_file_replaces_existing_file(self):
+        """File renames stay an overwrite: the atomic-write pattern needs it."""
+        src = Path(self.temp_dir) / "src.bin"
+        dst = Path(self.temp_dir) / "dst.bin"
+        src.write_bytes(b"new")
+        dst.write_bytes(b"old")
+
+        self.storage.rename(src, dst)
+
+        self.assertFalse(src.exists())
+        self.assertEqual(dst.read_bytes(), b"new")

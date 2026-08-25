@@ -112,10 +112,51 @@ class Storage(ABC):
         src_path: Path,
         dst_path: Path,
         is_directory: bool = False,
-        is_cross_link: bool = False,
         background_cleanup: bool = False,
     ) -> None:
         """Rename a file or directory.
+
+        This is the commit primitive for the staged-write protocol: data is
+        written to a temporary path and then renamed into its final path. Every
+        backend must implement exactly this table.
+
+        ============  ====================  =========================================
+        ``src_path``  ``dst_path``          Required behavior
+        ============  ====================  =========================================
+        directory     absent                commit: contents land AT ``dst_path``
+        directory     empty directory       commit: replace it
+        directory     populated directory   raise ``OSError``
+        directory     file                  raise ``OSError``
+        file          absent                commit
+        file          existing file         replace it
+        file          directory             raise ``OSError`` (empty or not)
+        ============  ====================  =========================================
+
+        Two rules generate that table, and both exist because getting them
+        wrong is silent data corruption rather than a visible failure.
+
+        **The contents of** ``src_path`` **land directly at** ``dst_path``, never
+        *inside* it as ``dst_path/<basename of src_path>``. A caller whose rename
+        returned without raising must be able to read its files at ``dst_path``.
+        This rules out ``shutil.move`` in both branches: given an existing
+        destination directory it nests the source under it, for a directory
+        source and a file source alike.
+
+        **An occupied destination raises; it is never merged into or deleted.** A
+        rename commits onto unoccupied space, so a caller about to clobber a
+        previously committed checkpoint finds out instead of destroying it or
+        ending up with half of each. Only a file onto a file is a replace — that
+        is an overwrite the atomic-write callers ask for by construction.
+
+        Note the empty-directory row is a POSIX convenience, not a universal:
+        some backends refuse a rename onto *any* existing directory. A backend
+        that cannot replace an empty destination should raise rather than emulate
+        it, and callers should not lean on that row.
+
+        Implementations should make the rename atomic where the backend allows
+        it, but callers cannot rely on atomicity across all backends: a backend
+        that emulates directories with key prefixes has to copy objects one at a
+        time, so a failure mid-rename can leave the destination partly written.
 
         Args:
             src_path: Source path
@@ -124,6 +165,9 @@ class Storage(ABC):
             background_cleanup: If True, delete source objects in a background
                 thread after copying completes, so the caller is not blocked
                 on the low-priority cleanup. Only applies to directory renames.
+
+        Raises:
+            OSError: If the destination is occupied, per the table above.
         """
         pass
 

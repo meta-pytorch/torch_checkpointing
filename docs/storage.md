@@ -111,7 +111,6 @@ def rename(
     src_path: Path,
     dst_path: Path,
     is_directory: bool = False,
-    is_cross_link: bool = False,
     background_cleanup: bool = False,
 ) -> None:
     """Rename a file or directory."""
@@ -120,12 +119,31 @@ def ls(self, path: Path) -> list[str]:
     """List contents of a directory."""
 ```
 
-`rename` carries several flags used by checkpoint commit logic. Per the base
-docstring, `is_directory` renames all objects under the source prefix, and
+`rename` is the commit primitive of the staged-write protocol, so its contract is
+exact. Every backend must implement this table:
+
+| `src_path` | `dst_path` | Required |
+| --- | --- | --- |
+| directory | absent | commit: contents land at `dst_path` |
+| directory | empty directory | commit: replace it |
+| directory | populated directory | raise `OSError` |
+| directory | file | raise `OSError` |
+| file | absent | commit |
+| file | existing file | replace it |
+| file | directory | raise `OSError` |
+
+Two rules generate the table: the contents of `src_path` land *directly* at
+`dst_path` and never nested inside it, and an occupied destination raises instead
+of being merged into or deleted. Only file-onto-file is a replace, because the
+atomic-write callers ask for that by construction. A nested or merged commit is
+silent data corruption rather than a cosmetic difference, which is why this is
+spelled out rather than left to each backend's judgement.
+
+`rename` also carries two flags used by checkpoint commit logic.
+`is_directory` renames all objects under the source prefix, and
 `background_cleanup` (directory renames only) deletes source objects on a
 background thread after copying completes, so the caller is not blocked on the
-low-priority cleanup. `is_cross_link` signals a cross-filesystem move; see how
-`LocalFileSystemStorage.rename` uses it below.
+low-priority cleanup.
 
 **Metadata and lookups:**
 
@@ -288,10 +306,19 @@ library:
   else `os.mkdir(path)`.
 - `rmdir` tries the cheap `os.rmdir(path)` first and falls back to
   `shutil.rmtree(path, ignore_errors=False)`; if both fail it logs and re-raises.
-- `rename` uses `shutil.move` for the common case. When `is_cross_link` is set
-  *and* the source is a directory, it instead `os.makedirs` the destination,
-  `shutil.copytree(..., dirs_exist_ok=True)`, then `shutil.rmtree` the source —
-  avoiding `shutil.move`'s nesting behavior when the destination already exists.
+- `rename` dispatches on whether the source is a directory, and neither branch
+  uses `shutil.move` — the contract table above says why. Each branch gets the
+  required behavior straight from the syscall, and falls back to a copy when the
+  kernel reports `EXDEV` (the paths are on different filesystems):
+
+  | Source | Primary | Why it satisfies the contract | `EXDEV` fallback |
+  | --- | --- | --- | --- |
+  | directory | `os.rename` | replaces an absent or empty destination atomically, `ENOTEMPTY` on a populated one | `copytree` + `rmtree` |
+  | file | `os.replace` | overwrites an existing file, `EISDIR` on a directory | `copy2` + `remove` |
+
+  The directory fallback re-checks the destination itself before copying, since
+  `copytree` would otherwise merge into it. Both branches translate the errno into
+  a `FileExistsError` naming the path, so the message says what to do about it.
 - `ls` → `os.listdir`, `delete` → `os.remove`, `exists` → `os.path.exists`,
   `getsize` → `os.path.getsize`, `isdir` → `os.path.isdir`.
 - `remap_path` returns `str(path)` — a local path is already its own URL.
@@ -383,7 +410,6 @@ class InMemoryStorage(Storage):
         src_path: Path,
         dst_path: Path,
         is_directory: bool = False,
-        is_cross_link: bool = False,
         background_cleanup: bool = False,
     ) -> None:
         self._files[str(dst_path)] = self._files.pop(str(src_path))
