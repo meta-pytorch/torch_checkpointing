@@ -13,9 +13,11 @@ it from a background process, and reshards on load across different distributed
 layouts. See the ``docs/`` directory for the guide and API reference.
 """
 
-from .barriers import (
+from .barriers import (  # noqa: F401
     Barrier,
     BarrierConfig,
+    DefaultStoreBarrier,
+    DefaultStoreBarrierConfig,
     TCPStoreBarrier,
     TCPStoreBarrierConfig,
 )

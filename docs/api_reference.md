@@ -73,7 +73,9 @@ than the manager exposes (for example, driving a load-only eval job by hand).
 | --- | --- | --- |
 | `RankInfo` | `.types` | Rank identity (auto-detected by the manager). |
 | `MetadataManager`, `DefaultMetadataManager` | `.metadata_manager` | Sharding-metadata pipeline (auto-wired by the manager when an item has a resharder). |
-| `Barrier`, `TCPStoreBarrier`, `BarrierConfig`, `TCPStoreBarrierConfig` | `.barriers` | Cross-rank save coordination. |
+| `Barrier`, `BarrierConfig` | `.barriers` | Cross-rank save coordination. |
+| `TCPStoreBarrier`, `TCPStoreBarrierConfig` | `.barriers` | Barrier on a `TCPStore` of its own, served by rank 0. |
+| `DefaultStoreBarrier`, `DefaultStoreBarrierConfig` | `.barriers` | Barrier on the store that already backs the default process group. |
 
 See the [tutorial](./tutorials.md) for an end-to-end workflow,
 [Key concepts](./key_concepts.md) for how these pieces fit together,
