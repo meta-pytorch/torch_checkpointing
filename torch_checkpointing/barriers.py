@@ -176,19 +176,9 @@ class TCPStoreBarrier(Barrier):
         The implementation follows:
         1. Uses TCPStore for synchronization
         2. Uses sequence numbers that increment per barrier execution
-        3. Each rank sets its barrier sequence number before synchronization
         """
         logger.info(f"Executing barrier timeout_secs={timeout_secs}")
         self._init_store()
-
-        def _rank_key(rank: int) -> str:
-            return f"rank{rank}"
-
-        # Set the rank's barrier sequence number
-        self._tcp_store.set(
-            self._namespace_key(_rank_key(self._rank_info.role_rank)),
-            str(self._tcp_store_barrier_seq),
-        )
 
         # Execute barrier for that sequence number
         store_util.barrier(

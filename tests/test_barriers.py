@@ -111,9 +111,6 @@ def test_execute_barrier(mock_barrier, mock_tcpstore, master_rank_info):
     timeout_secs = 30
     barrier.execute_barrier(timeout_secs)
 
-    # Verify that the TCPStore's set method was called with the correct parameters
-    mock_tcpstore_instance.set.assert_called_once_with("rank0", "0")
-
     # Verify that the barrier function was called with the correct parameters
     mock_barrier.assert_called_once_with(
         store=mock_tcpstore_instance,
@@ -122,11 +119,11 @@ def test_execute_barrier(mock_barrier, mock_tcpstore, master_rank_info):
         barrier_timeout=timeout_secs,
     )
 
+    # All store traffic belongs to the barrier itself; no extra per-rank writes.
+    mock_tcpstore_instance.set.assert_not_called()
+
     # Execute the barrier again to test sequence number increment
     barrier.execute_barrier(timeout_secs)
-
-    # Verify that the TCPStore's set method was called with the incremented sequence number
-    mock_tcpstore_instance.set.assert_called_with("rank0", "1")
 
     # Verify that the barrier function was called with the incremented sequence number
     mock_barrier.assert_called_with(
@@ -152,7 +149,6 @@ def test_execute_barrier_with_key_prefix(mock_barrier, mock_tcpstore, master_ran
 
     barrier.execute_barrier(timeout_secs=30)
 
-    mock_tcpstore_instance.set.assert_called_once_with("tenant-a/rank0", "0")
     mock_barrier.assert_called_once_with(
         store=mock_tcpstore_instance,
         world_size=master_rank_info.role_world_size,
@@ -193,7 +189,12 @@ def test_config_create_barrier_master_rank(
 
     # Test barrier execution works
     barrier.execute_barrier(600)  # Use the timeout from barrier_args
-    mock_tcpstore_instance.set.assert_called_once_with("rank0", "0")
+    mock_barrier.assert_called_once_with(
+        store=mock_tcpstore_instance,
+        world_size=master_rank_info.role_world_size,
+        key_prefix="0",
+        barrier_timeout=600,
+    )
 
 
 @mock.patch("torch.distributed.TCPStore")
@@ -231,7 +232,12 @@ def test_config_create_barrier_non_master_rank(
         use_libuv=False,  # use_checkpoint_barrier_tcpstore_libuv from barrier_args
         wait_for_workers=False,
     )
-    mock_tcpstore_instance.set.assert_called_once_with("rank1", "0")
+    mock_barrier.assert_called_once_with(
+        store=mock_tcpstore_instance,
+        world_size=non_master_rank_info.role_world_size,
+        key_prefix="0",
+        barrier_timeout=600,
+    )
 
 
 @mock.patch("torch.distributed.TCPStore")
@@ -259,9 +265,6 @@ def test_execute_barrier_with_custom_timeout(
     custom_timeout = 600
     barrier.execute_barrier(timeout_secs=custom_timeout)
 
-    # Verify that the TCPStore's set method was called
-    mock_tcpstore_instance.set.assert_called_once_with("rank0", "0")
-
     # Verify that the barrier function was called with the barrier_timeout parameter
     mock_barrier.assert_called_once_with(
         store=mock_tcpstore_instance,
@@ -275,7 +278,6 @@ def test_execute_barrier_with_custom_timeout(
     barrier.execute_barrier(timeout_secs)
 
     # Verify that it still works with default timeout
-    mock_tcpstore_instance.set.assert_called_with("rank0", "1")
     mock_barrier.assert_called_with(
         store=mock_tcpstore_instance,
         world_size=master_rank_info.role_world_size,
