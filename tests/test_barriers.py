@@ -9,6 +9,7 @@ import multiprocessing as mp
 import os
 import pickle
 import socket
+import time
 import unittest.mock as mock
 from datetime import timedelta
 
@@ -24,6 +25,7 @@ from torch_checkpointing.barriers import (
     _NullStoreConnectionInfo,
     _store_connection_info,
     _TCPStoreConnectionInfo,
+    BarrierConfig,
     DEFAULT_BARRIER_INIT_TIMEOUT_SEC,
     DEFAULT_STORE_BARRIER_KEY_PREFIX,
     DefaultStoreBarrierConfig,
@@ -381,7 +383,7 @@ def test_tcpstore_barrier_timeout_on_missing_rank(missed_rank: int):
 
 
 BARRIER_KEY_PREFIX = "ckpt-barrier"
-BARRIER_TIMEOUT_SECS = 15
+BARRIER_TIMEOUT_SECS = 10
 # The barrier itself is what should time out on a real failure; this only bounds
 # how long a parent waits for a child that never got that far.
 SUBPROCESS_TIMEOUT_SECS = 30
@@ -462,7 +464,8 @@ def default_process_group(tcpstore_server):
     try:
         yield store, port
     finally:
-        dist.destroy_process_group()
+        if dist.is_initialized():
+            dist.destroy_process_group()
 
 
 def test_store_connection_info_describes_a_tcpstore(tcpstore_server):
@@ -662,6 +665,19 @@ def test_default_store_barrier_opens_a_client_handle_under_its_own_prefix():
     )
 
 
+def test_use_in_subprocess_pins_the_address_of_the_store_it_holds(
+    default_process_group,
+):
+    orig_store, orig_port = default_process_group
+    del orig_store, default_process_group
+
+    config = DefaultStoreBarrierConfig()
+    with config.use_in_subprocess():
+        dist.destroy_process_group()
+        conn_info = config._resolve_store_connection()
+        assert conn_info == _TCPStoreConnectionInfo(host="localhost", port=orig_port)
+
+
 def test_config_captures_the_store_connection_when_serialized(default_process_group):
     _, port = default_process_group
     config = DefaultStoreBarrierConfig()
@@ -711,11 +727,14 @@ def test_config_serialization_with_a_captured_connection(tcpstore_server):
     )
 
 
-def _join_barrier_from_serialized_config(
-    pickled_config: bytes, rank: int, world_size: int, timeout_secs: int
+def _subprocess_run_barrier(
+    config: BarrierConfig,
+    rank: int,
+    world_size: int,
+    timeout_secs: int,
+    iterations: int = 3,
 ) -> None:
     """Rebuild a barrier from bytes and join it, as the write subprocess does."""
-    config = pickle.loads(pickled_config)
     assert config._store_connection is not None, "store address was not captured"
     barrier = config.create_barrier(
         RankInfo(
@@ -725,28 +744,29 @@ def _join_barrier_from_serialized_config(
             role_world_size=world_size,
         )
     )
-    barrier.execute_barrier(timeout_secs=timeout_secs)
+    for _ in range(iterations):
+        time.sleep(0.1)
+        barrier.execute_barrier(timeout_secs=timeout_secs)
 
 
 def test_default_store_barrier_joins_from_another_process(default_process_group):
     """A process with no process group of its own can still join the barrier."""
-    pickled_config = pickle.dumps(
-        DefaultStoreBarrierConfig(
-            timeout_barrier_init_sec=BARRIER_TIMEOUT_SECS,
-            key_prefix=BARRIER_KEY_PREFIX,
-        )
+    config = DefaultStoreBarrierConfig(
+        timeout_barrier_init_sec=BARRIER_TIMEOUT_SECS,
+        key_prefix=BARRIER_KEY_PREFIX,
     )
     # The barrier group is this process plus the child, which is unrelated to the
     # size of the process group whose store they meet on.
-    child = mp.get_context("spawn").Process(
-        target=_join_barrier_from_serialized_config,
-        args=(pickled_config, 1, 2, BARRIER_TIMEOUT_SECS),
-    )
-    child.start()
-    try:
-        _join_barrier_from_serialized_config(pickled_config, 0, 2, BARRIER_TIMEOUT_SECS)
-    finally:
-        child.join(timeout=SUBPROCESS_TIMEOUT_SECS)
+    with config.use_in_subprocess():
+        child = mp.get_context("spawn").Process(
+            target=_subprocess_run_barrier,
+            args=(config, 1, 2, BARRIER_TIMEOUT_SECS),
+        )
+        child.start()
+        try:
+            _subprocess_run_barrier(config, 0, 2, BARRIER_TIMEOUT_SECS)
+        finally:
+            child.join(timeout=SUBPROCESS_TIMEOUT_SECS)
 
     assert child.exitcode == 0
 
@@ -765,26 +785,28 @@ def _trainer_with_write_subprocess(rank: int, world_size: int, port: int) -> Non
         backend="gloo", rank=rank, world_size=world_size, init_method="env://"
     )
     try:
-        pickled_config = pickle.dumps(
-            DefaultStoreBarrierConfig(
-                timeout_barrier_init_sec=BARRIER_TIMEOUT_SECS,
-                key_prefix=BARRIER_KEY_PREFIX,
-                # Ranks build their configs independently here, so pin the value the
-                # per-process counter would otherwise assign.
-                generation="0",
+        config = DefaultStoreBarrierConfig(
+            timeout_barrier_init_sec=BARRIER_TIMEOUT_SECS,
+            key_prefix=BARRIER_KEY_PREFIX,
+            # Ranks build their configs independently here, so pin the value the
+            # per-process counter would otherwise assign.
+            generation="0",
+        )
+        with config.use_in_subprocess():
+            child = mp.get_context("spawn").Process(
+                target=_subprocess_run_barrier,
+                args=(config, rank, world_size, BARRIER_TIMEOUT_SECS, 10),
             )
-        )
-        child = mp.get_context("spawn").Process(
-            target=_join_barrier_from_serialized_config,
-            args=(pickled_config, rank, world_size, BARRIER_TIMEOUT_SECS),
-        )
-        child.start()
-        child.join(timeout=SUBPROCESS_TIMEOUT_SECS)
-        assert child.exitcode == 0, (
-            f"rank {rank}'s write subprocess exited {child.exitcode}"
-        )
+            child.start()
+            # Ensure that barriers in subprocess survive destroy_process_group
+            dist.destroy_process_group()
+            child.join(timeout=SUBPROCESS_TIMEOUT_SECS)
+            assert child.exitcode == 0, (
+                f"rank {rank}'s write subprocess exited {child.exitcode}"
+            )
     finally:
-        dist.destroy_process_group()
+        if dist.is_initialized():
+            dist.destroy_process_group()
 
 
 def test_default_store_barrier_across_ranks_and_subprocesses():

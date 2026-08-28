@@ -11,6 +11,7 @@ import pickle
 import time
 import traceback
 from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import ExitStack
 from dataclasses import dataclass
 from enum import Enum
 from multiprocessing.connection import Connection
@@ -98,6 +99,10 @@ class CheckpointProcess:
         self._subprocess_init_args = subprocess_init_args
         self._checkpoint_writer_args = checkpoint_writer_args
         self._metric_prefix = checkpoint_writer_args.metric_prefix
+        self._barrier_scope = ExitStack()
+        barrier_config = checkpoint_writer_args.config.barrier_config
+        if barrier_config is not None:
+            self._barrier_scope.enter_context(barrier_config.use_in_subprocess())
         self.process: mp.ProcessContext | None = None
         self._parent_end: Connection | None = None
         self._child_end: Connection | None = None
@@ -464,6 +469,12 @@ class CheckpointProcess:
         )
 
     def close(self) -> None:
+        try:
+            self._shutdown_subprocess()
+        finally:
+            self._barrier_scope.close()
+
+    def _shutdown_subprocess(self) -> None:
         logger.info(
             f"Shutting down checkpoint process for rank {self._rank_info.global_rank}"
         )

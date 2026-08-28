@@ -10,10 +10,12 @@ import tempfile
 import time
 from concurrent.futures import Future
 from typing import Any
+from unittest import mock
 
 import torch
 from torch.multiprocessing.spawn import ProcessExitedException
 from torch.testing._internal.common_utils import run_tests, TestCase
+from torch_checkpointing.barriers import DefaultStoreBarrierConfig
 from torch_checkpointing.checkpoint_base import CheckpointItem, CheckpointWriteInfo
 from torch_checkpointing.checkpoint_process import (
     CheckpointProcess,
@@ -211,6 +213,28 @@ class TestCheckpointProcess(TestCase):
             for key, value in state_dict.items()
         }
         return CheckpointWriteInfo(checkpoint_items=items)
+
+    def test_checkpoint_process_keeps_the_barrier_scope_until_close(self) -> None:
+        with mock.patch.object(
+            DefaultStoreBarrierConfig, "use_in_subprocess"
+        ) as mock_use:
+            checkpoint_process = self._create_checkpoint_process(
+                checkpoint_writer_args_override=CheckpointWriterArgs(
+                    config=CheckpointWriterConfig(
+                        barrier_config=DefaultStoreBarrierConfig()
+                    ),
+                    rank_info=self.rank_info,
+                    storage_config=self.storage_config,
+                )
+            )
+            try:
+                checkpoint_process.wait_for_init()
+                self.assertEqual(mock_use.call_count, 1)
+                self.assertEqual(mock_use.return_value.__enter__.call_count, 1)
+                self.assertEqual(mock_use.return_value.__exit__.call_count, 0)
+            finally:
+                checkpoint_process.close()
+            self.assertEqual(mock_use.return_value.__exit__.call_count, 1)
 
     def test_checkpoint_process_initialization(self) -> None:
         """Test that CheckpointProcess initializes and closes correctly."""

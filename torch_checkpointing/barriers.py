@@ -15,12 +15,13 @@ checkpoint operations before proceeding, which is essential for data consistency
 from __future__ import annotations
 
 import abc
+import contextlib
 import itertools
 import logging
 import os
 from dataclasses import dataclass, field
 from datetime import timedelta
-from typing import Any
+from typing import Any, Generator
 
 import torch.distributed as dist
 import torch.distributed.elastic.utils.store as store_util
@@ -50,6 +51,15 @@ class BarrierConfig(abc.ABC):
     def create_barrier(self, rank_info: RankInfo) -> "Barrier":
         """Create a barrier instance from this configuration."""
         pass
+
+    def use_in_subprocess(self) -> contextlib.AbstractContextManager[None]:
+        """
+        Init and teardown hooks to execute in the main process when the barrier is to
+        be instantiated and used in a subprocess.
+
+        By default it is a nullcontext.
+        """
+        return contextlib.nullcontext()
 
 
 @dataclass
@@ -102,6 +112,29 @@ class DefaultStoreBarrierConfig(BarrierConfig):
     def create_barrier(self, rank_info: RankInfo) -> "DefaultStoreBarrier":
         """Create a DefaultStoreBarrier instance from this configuration."""
         return DefaultStoreBarrier(config=self, rank_info=rank_info)
+
+    @contextlib.contextmanager
+    def use_in_subprocess(self) -> Generator[None]:
+        """
+        Hold a reference to the default process group's store so that it stays alive
+        while a subprocess is using it.
+
+        This is necessary for a TCPStore because the server gets destroyed when the
+        final reference to it disappears. This may happen, for example, if the trainer
+        calls torch.distributed.destroy_process_group() at the end of training but
+        before the final async checkpoint has completed.
+        """
+        store = (
+            _get_default_store()
+            if dist.is_available() and dist.is_initialized()
+            else None
+        )
+        if store is not None:
+            self._store_connection = _store_connection_info(store)
+        try:
+            yield
+        finally:
+            del store
 
     def _resolve_store_connection(self) -> _StoreConnectionInfo | None:
         """The captured store coordinates, or the default process group's store.
