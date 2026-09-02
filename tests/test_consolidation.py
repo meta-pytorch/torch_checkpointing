@@ -50,9 +50,12 @@ from torch_checkpointing.hf.consolidation import (
     _read_safetensors_file_metadata_by_rank,
     _read_tensor_data,
     consolidate_hf_safetensors_checkpoint,
-    HFSafetensorByteAddress,
-    SafetensorsFileMetadata,
-    SafetensorsTensorSlice,
+)
+from torch_checkpointing.safetensors_metadata import SafetensorsFileMetadata
+from torch_checkpointing.serialized_tensor_slice import (
+    ByteAddress,
+    contiguous_strides,
+    SerializedTensorSlice,
 )
 from torch_checkpointing.storage.filesystem import (
     LocalFileSystemStorage,
@@ -80,18 +83,19 @@ def _two_element_file_metadata(source_rank: int) -> SafetensorsFileMetadata:
     return SafetensorsFileMetadata(
         file_path=file_path,
         tensors={
-            "weight": SafetensorsTensorSlice(
+            "weight": SerializedTensorSlice(
                 global_shape=None,
                 global_offsets=None,
                 local_offsets=(0,),
                 slice_shape=(2,),
                 source_rank=source_rank,
                 torch_dtype=torch.float32,
-                byte_address=HFSafetensorByteAddress(
+                byte_address=ByteAddress(
                     file_path=file_path,
                     start_byte_offset=16,
                     end_byte_offset=24,
                 ),
+                serialized_strides=contiguous_strides((2,)),
             )
         },
     )
@@ -417,7 +421,7 @@ def test_safetensors_file_metadata_reads_unresolved_file_header(
     assert file_metadata.file_path == os.fspath(file_path)
     assert set(file_metadata.tensors) == {"weight", "scale"}
     weight = file_metadata.tensors["weight"]
-    assert isinstance(weight, SafetensorsTensorSlice)
+    assert isinstance(weight, SerializedTensorSlice)
     assert weight.source_rank == 3
     assert weight.torch_dtype == torch.float32
     assert weight.global_shape is None
@@ -433,7 +437,7 @@ def test_safetensors_file_metadata_reads_unresolved_file_header(
         global_shape=(4, 3),
         global_offsets=(2, 0),
     )
-    assert isinstance(resolved_weight, SafetensorsTensorSlice)
+    assert isinstance(resolved_weight, SerializedTensorSlice)
     assert resolved_weight.source_rank == weight.source_rank
     assert resolved_weight.torch_dtype == weight.torch_dtype
     assert resolved_weight.byte_address == weight.byte_address
@@ -587,7 +591,7 @@ def test_read_tensor_data_handles_short_reads() -> None:
             return super().readinto(buffer[:2])
 
     stream = ShortReadBytesIO(b"prefixpayloadsuffix")
-    address = HFSafetensorByteAddress(
+    address = ByteAddress(
         file_path="checkpoint.safetensors",
         start_byte_offset=6,
         end_byte_offset=13,
@@ -598,7 +602,7 @@ def test_read_tensor_data_handles_short_reads() -> None:
 
 def test_read_tensor_data_rejects_truncated_input() -> None:
     stream = io.BytesIO(b"short")
-    address = HFSafetensorByteAddress(
+    address = ByteAddress(
         file_path="checkpoint.safetensors",
         start_byte_offset=0,
         end_byte_offset=10,
@@ -659,18 +663,19 @@ def test_safetensors_tensor_slice_contiguous_global_byte_range(
     torch_dtype: torch.dtype,
     expected: tuple[int, int] | None,
 ) -> None:
-    tensor_slice = SafetensorsTensorSlice(
+    tensor_slice = SerializedTensorSlice(
         global_shape=global_shape,
         global_offsets=global_offsets,
         local_offsets=(0,) * len(local_shape),
         slice_shape=local_shape,
         source_rank=0,
         torch_dtype=torch_dtype,
-        byte_address=HFSafetensorByteAddress(
+        byte_address=ByteAddress(
             file_path="model.safetensors",
             start_byte_offset=0,
             end_byte_offset=0,
         ),
+        serialized_strides=contiguous_strides(local_shape),
     )
 
     assert tensor_slice.contiguous_global_byte_range == expected

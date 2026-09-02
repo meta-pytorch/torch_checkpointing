@@ -29,7 +29,6 @@ from collections.abc import (
     Mapping,
 )
 from contextlib import closing, contextmanager
-from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, TypeVar
 
@@ -40,7 +39,6 @@ from torch.distributed.checkpoint._consolidate_hf_safetensors import (
     _write_sub_tensor_to_file_optimized,
 )
 from torch.distributed.checkpoint._hf_utils import (
-    _get_safetensors_file_metadata,
     DATA_OFFSETS_KEY,
     DTYPE_KEY,
     SHAPE_KEY,
@@ -56,9 +54,10 @@ from ..distributed_metadata import (
 from ..dtensor_metadata import DTensorShardingMetadata
 from ..logging_utils import EventLogger, EventType
 from ..resharding_utils import get_fqn_from_nested_path
+from ..safetensors_metadata import SafetensorsFileMetadata
+from ..serialized_tensor_slice import ByteAddress, SerializedTensorSlice
 from ..storage.base_storage import ReadArgs, Storage, StorageConfig
 from ..storage.filesystem import LocalFileSystemStorageConfig
-from ..tensor_slice import TensorSlice
 from ..types import NestedPath
 
 logger: logging.Logger = logging.getLogger(__name__)
@@ -107,85 +106,6 @@ def _atomic_stream_write(storage: Storage, path: Path) -> Iterator[Any]:
         except Exception:
             logger.exception("Failed to clean up temporary file %s", temporary_path)
         raise
-
-
-@dataclass(frozen=True)
-class HFSafetensorByteAddress:
-    file_path: str
-    start_byte_offset: int
-    end_byte_offset: int
-
-    @property
-    def num_bytes(self) -> int:
-        return self.end_byte_offset - self.start_byte_offset
-
-
-@dataclass(frozen=True)
-class SafetensorsTensorSlice(TensorSlice):
-    source_rank: int
-    torch_dtype: torch.dtype
-    byte_address: HFSafetensorByteAddress
-
-    @property
-    def dtype_size(self) -> int:
-        return torch._utils._element_size(self.torch_dtype)
-
-    @property
-    def contiguous_global_byte_range(self) -> tuple[int, int] | None:
-        element_range = self.contiguous_global_element_range
-        if element_range is None:
-            return None
-        start, end = element_range
-        return start * self.dtype_size, end * self.dtype_size
-
-
-@dataclass(frozen=True)
-class SafetensorsFileMetadata:
-    file_path: str
-    tensors: dict[str, SafetensorsTensorSlice]
-
-    @classmethod
-    def from_file(
-        cls,
-        storage: Storage,
-        file_path: str,
-        source_rank: int,
-    ) -> "SafetensorsFileMetadata":
-        with storage.stream_read(
-            Path(file_path),
-            ReadArgs(pre_read_full_file=False, direct_io=False),
-        ) as f:
-            metadata, file_start_byte_offset = _get_safetensors_file_metadata(f)
-
-        tensors: dict[str, SafetensorsTensorSlice] = {}
-        for fqn, tensor_metadata in metadata.items():
-            if fqn == "__metadata__":
-                continue
-            start, end = tensor_metadata[DATA_OFFSETS_KEY]
-            dtype = tensor_metadata[DTYPE_KEY]
-            try:
-                torch_dtype = safetensors_torch._TYPES[dtype]
-            except KeyError as e:
-                raise ValueError(
-                    f"Safetensors file {file_path!r} has unsupported dtype "
-                    f"{dtype!r} for {fqn!r}"
-                ) from e
-            local_shape = tuple(tensor_metadata[SHAPE_KEY])
-            tensors[fqn] = SafetensorsTensorSlice(
-                global_shape=None,
-                global_offsets=None,
-                local_offsets=(0,) * len(local_shape),
-                slice_shape=local_shape,
-                source_rank=source_rank,
-                torch_dtype=torch_dtype,
-                byte_address=HFSafetensorByteAddress(
-                    file_path=file_path,
-                    start_byte_offset=file_start_byte_offset + start,
-                    end_byte_offset=file_start_byte_offset + end,
-                ),
-            )
-
-        return cls(file_path=file_path, tensors=tensors)
 
 
 def _distributed_rank_and_world_size() -> tuple[int, int]:
@@ -426,7 +346,7 @@ def consolidate_hf_safetensors_checkpoint(
         )
         tensor_slices_by_index: dict[
             int,
-            dict[str, list[SafetensorsTensorSlice]],
+            dict[str, list[SerializedTensorSlice]],
         ] = {}
         for fqn, index in assigned_fqn_to_index_mapping.items():
             tensor_slices_by_index.setdefault(index, {})[fqn] = fqn_to_tensor_slices[
@@ -581,7 +501,7 @@ def _create_consolidation_process_group(
 def _write_and_finalize_consolidated_output_files(
     tensor_slices_by_index: dict[
         int,
-        dict[str, list[SafetensorsTensorSlice]],
+        dict[str, list[SerializedTensorSlice]],
     ],
     fqn_to_index_mapping: dict[str, int],
     fqn_to_num_bytes: dict[str, int],
@@ -632,8 +552,8 @@ def _build_fqn_to_tensor_slices(
     ],
     rank_to_layout_info: Mapping[int, LayoutInfo | None],
     file_metadata_by_rank: Mapping[int, SafetensorsFileMetadata],
-) -> dict[str, list[SafetensorsTensorSlice]]:
-    result: dict[str, list[SafetensorsTensorSlice]] = {}
+) -> dict[str, list[SerializedTensorSlice]]:
+    result: dict[str, list[SerializedTensorSlice]] = {}
     for nested_path, groups in sorted(
         nested_path_to_metadata.items(),
         key=lambda item: get_fqn_from_nested_path(item[0]),
@@ -659,11 +579,11 @@ def _resolve_distributed_tensor_slices(
     groups: list[GlobalObjectMetadata],
     rank_to_layout_info: Mapping[int, LayoutInfo | None],
     file_metadata_by_rank: Mapping[int, SafetensorsFileMetadata],
-) -> list[SafetensorsTensorSlice]:
+) -> list[SerializedTensorSlice]:
     fqn = get_fqn_from_nested_path(nested_path)
     _validate_sharding_metadata_groups(nested_path, groups)
     selected_slices: dict[
-        tuple[tuple[int, ...], tuple[int, ...]], SafetensorsTensorSlice
+        tuple[tuple[int, ...], tuple[int, ...]], SerializedTensorSlice
     ] = {}
     # Every region comes from one metadata group, so a tensor is never stitched
     # together from ranks that disagree about how it was sharded.
@@ -739,7 +659,7 @@ def _resolve_distributed_tensor_slice(
     sharding_metadata: DTensorShardingMetadata,
     rank_to_layout_info: Mapping[int, LayoutInfo | None],
     file_metadata_by_rank: Mapping[int, SafetensorsFileMetadata],
-) -> SafetensorsTensorSlice | None:
+) -> SerializedTensorSlice | None:
     if source_rank not in rank_to_layout_info:
         raise ValueError(
             f"HF safetensors consolidation has no file layout for source rank {source_rank}"
@@ -775,7 +695,7 @@ def _resolve_distributed_tensor_slice(
 
 def _validate_written_tensor(
     fqn: str,
-    tensor_slice: SafetensorsTensorSlice,
+    tensor_slice: SerializedTensorSlice,
     expected_shape: tuple[int, ...],
     expected_dtype: torch.dtype,
 ) -> None:
@@ -891,7 +811,7 @@ def _validate_input_output_paths_are_disjoint(
 
 
 def _prepare_metadata(
-    tensor_slices_by_fqn: dict[str, list[SafetensorsTensorSlice]],
+    tensor_slices_by_fqn: dict[str, list[SerializedTensorSlice]],
 ) -> bytes:
     metadata = {}
     current_offset = 0
@@ -915,7 +835,7 @@ def _prepare_metadata(
 def _write_assigned_output_files(
     tensor_slices_by_index: dict[
         int,
-        dict[str, list[SafetensorsTensorSlice]],
+        dict[str, list[SerializedTensorSlice]],
     ],
     output_file_by_index: dict[int, str],
     storage: Storage,
@@ -1006,7 +926,7 @@ class _ReaderMemoryBudget:
             return self._exhausted_count
 
 
-def _tensor_memory_bytes(tensor_slices: list[SafetensorsTensorSlice]) -> int:
+def _tensor_memory_bytes(tensor_slices: list[SerializedTensorSlice]) -> int:
     """Peak bytes to consolidate one tensor.
 
     The output buffer, plus at most one staged source slice: slices are read one
@@ -1030,7 +950,7 @@ def _tensor_memory_bytes(tensor_slices: list[SafetensorsTensorSlice]) -> int:
 
 def _process_output_file(
     output_file: str,
-    tensor_slices_by_fqn: dict[str, list[SafetensorsTensorSlice]],
+    tensor_slices_by_fqn: dict[str, list[SerializedTensorSlice]],
     storage: Storage,
     read_executor: concurrent.futures.ThreadPoolExecutor,
     reader_threads: int,
@@ -1127,7 +1047,7 @@ def _process_output_file(
 
 
 def _read_full_tensors_in_order(
-    tensor_slices_by_fqn: Mapping[str, list[SafetensorsTensorSlice]],
+    tensor_slices_by_fqn: Mapping[str, list[SerializedTensorSlice]],
     storage: Storage,
     read_executor: concurrent.futures.ThreadPoolExecutor,
     reader_threads: int,
@@ -1180,7 +1100,7 @@ def _read_full_tensors_in_order(
 
 
 def _allocate_full_tensor(
-    tensor_slices: list[SafetensorsTensorSlice],
+    tensor_slices: list[SerializedTensorSlice],
 ) -> memoryview:
     output_tensor_slice = tensor_slices[0]
     global_shape = output_tensor_slice.global_shape
@@ -1234,7 +1154,7 @@ def _reader_handle_pool() -> tuple[
 
 
 def _read_full_tensor(
-    tensor_slices: list[SafetensorsTensorSlice],
+    tensor_slices: list[SerializedTensorSlice],
     storage: Storage,
     handles: _ReaderHandles,
 ) -> memoryview:
@@ -1249,7 +1169,7 @@ def _read_full_tensor(
 
 
 def _read_full_tensor_into_from_storage(
-    tensor_slices: list[SafetensorsTensorSlice],
+    tensor_slices: list[SerializedTensorSlice],
     storage: Storage,
     full_tensor_mv: memoryview,
     handles: _ReaderHandles,
@@ -1300,7 +1220,7 @@ def _read_full_tensor_into_from_storage(
 
 def _read_tensor_data_into(
     f: Any,
-    byte_address: HFSafetensorByteAddress,
+    byte_address: ByteAddress,
     destination: memoryview,
 ) -> None:
     if destination.nbytes != byte_address.num_bytes:
@@ -1322,7 +1242,7 @@ def _read_tensor_data_into(
 
 def _read_tensor_data(
     f: Any,
-    byte_address: HFSafetensorByteAddress,
+    byte_address: ByteAddress,
 ) -> bytearray:
     data = bytearray(byte_address.num_bytes)
     _read_tensor_data_into(f, byte_address, memoryview(data))
