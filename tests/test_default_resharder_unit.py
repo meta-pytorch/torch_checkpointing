@@ -15,7 +15,11 @@ import pytest
 import torch
 from torch._subclasses.fake_tensor import FakeTensor
 from torch_checkpointing.checkpoint_layout import LayoutInfo, TorchSerialization
-from torch_checkpointing.default_resharder import DefaultResharder
+from torch_checkpointing.default_resharder import (
+    _slice_source_tensor,
+    _validate_source_slice_bounds,
+    DefaultResharder,
+)
 from torch_checkpointing.distributed_metadata import (
     DistributedItemMetadata,
     GlobalObjectMetadata,
@@ -145,6 +149,20 @@ def _load_second_half_with_offset_reads(
     return target_tensor, storage
 
 
+def _source_load_plan(
+    src_offsets: tuple[int, ...],
+    src_sizes: tuple[int, ...],
+) -> LoadPlan:
+    return LoadPlan(
+        offsets=tuple(0 for _ in src_sizes),
+        sizes=src_sizes,
+        src_rank=0,
+        src_fqn="model.weight",
+        src_offsets=src_offsets,
+        src_sizes=src_sizes,
+    )
+
+
 def test_extract_sharding_metadata_treats_plain_tensors_as_replicated(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -191,6 +209,55 @@ def test_extract_sharding_metadata_treats_plain_tensors_as_replicated(
 
     assert "Found 2 plain tensors" in caplog.text
     assert "treating them as replicated tensors" in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("source_shape", "src_offsets", "src_sizes", "match"),
+    [
+        ((3, 4), (0,), (1,), "rank"),
+        ((3, 4), (-1, 0), (1, 1), "dimension 0"),
+        ((3, 4), (0, 0), (-1, 1), "dimension 0"),
+        ((3, 4), (2, 0), (2, 1), "dimension 0"),
+        ((3, 4), (4, 0), (0, 1), "dimension 0"),
+    ],
+)
+def test_validate_source_slice_bounds_rejects_invalid_geometry(
+    source_shape: tuple[int, ...],
+    src_offsets: tuple[int, ...],
+    src_sizes: tuple[int, ...],
+    match: str,
+) -> None:
+    with pytest.raises(ValueError, match=match):
+        _validate_source_slice_bounds(
+            source_shape,
+            _source_load_plan(src_offsets, src_sizes),
+        )
+
+
+@pytest.mark.parametrize(
+    ("source_shape", "src_offsets", "src_sizes"),
+    [
+        ((), (), ()),
+        ((3, 4), (3, 0), (0, 1)),
+    ],
+)
+def test_validate_source_slice_bounds_accepts_boundary_geometry(
+    source_shape: tuple[int, ...],
+    src_offsets: tuple[int, ...],
+    src_sizes: tuple[int, ...],
+) -> None:
+    _validate_source_slice_bounds(
+        source_shape,
+        _source_load_plan(src_offsets, src_sizes),
+    )
+
+
+def test_full_file_slice_rejects_out_of_bounds_plan() -> None:
+    with pytest.raises(ValueError, match="out of bounds in dimension 0"):
+        _slice_source_tensor(
+            torch.arange(8),
+            _source_load_plan(src_offsets=(7,), src_sizes=(2,)),
+        )
 
 
 def test_load_reads_one_span_for_noncontiguous_source_slice() -> None:

@@ -273,11 +273,36 @@ def _unwrap_dtensor(value: torch.Tensor) -> torch.Tensor:
 
 
 def _slice_source_tensor(source: torch.Tensor, load_plan: LoadPlan) -> torch.Tensor:
+    # The full-file fallback does not pass through the offset-read validation.
+    # Validate here because Python slicing silently clamps out-of-bounds ranges.
+    _validate_source_slice_bounds(tuple(source.shape), load_plan)
     source_slice = tuple(
         slice(offset, offset + size)
         for offset, size in zip(load_plan.src_offsets, load_plan.src_sizes)
     )
     return source[source_slice]
+
+
+def _validate_source_slice_bounds(
+    source_shape: tuple[int, ...],
+    load_plan: LoadPlan,
+) -> None:
+    if not (
+        len(load_plan.src_offsets) == len(load_plan.src_sizes) == len(source_shape)
+    ):
+        raise ValueError(
+            f"Load plan rank does not match source tensor {load_plan.src_fqn!r}"
+        )
+
+    for dimension, (source_size, offset, size) in enumerate(
+        zip(source_shape, load_plan.src_offsets, load_plan.src_sizes)
+    ):
+        if source_size < 0 or offset < 0 or size < 0 or offset + size > source_size:
+            raise ValueError(
+                f"Source slice for {load_plan.src_fqn!r} is out of bounds in "
+                f"dimension {dimension}: offset={offset}, size={size}, "
+                f"source_size={source_size}"
+            )
 
 
 def _read_source_tensor_slice(
@@ -294,9 +319,7 @@ def _read_source_tensor_slice(
         )
     if source.is_quantized:
         raise NotImplementedError(f"Source {load_plan.src_fqn!r} is quantized")
-    assert len(load_plan.src_offsets) == len(load_plan.src_sizes) == source.ndim, (
-        f"Load plan rank does not match source tensor {load_plan.src_fqn!r}"
-    )
+    _validate_source_slice_bounds(tuple(source.shape), load_plan)
     strides = tuple(source.stride())
 
     if any(size == 0 for size in load_plan.src_sizes):
