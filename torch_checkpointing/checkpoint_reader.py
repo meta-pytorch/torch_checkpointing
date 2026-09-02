@@ -13,7 +13,6 @@ determining checkpoint layout and configuring the reader.
 
 import json
 import logging
-import pickle
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -37,7 +36,7 @@ from .distributed_metadata import (
     CheckpointMetadata,
     DistributedItemMetadata,
     DistributedMetadata,
-    METADATA_FILE_NAME,
+    load_distributed_metadata,
     ShardingMetadata,
 )
 from .logging_utils import EventLogger, EventType
@@ -296,15 +295,9 @@ class CheckpointReader:
             checkpoint_dir: Path to the checkpoint directory.
 
         Returns:
-            DistributedMetadata if METADATA_FILE_NAME exists, None otherwise.
+            DistributedMetadata if the checkpoint carries one, None otherwise.
         """
-        metadata_path = Path(checkpoint_dir) / METADATA_FILE_NAME
-        metadata = None
-        if self._storage.exists(metadata_path):
-            data = self._storage.read(metadata_path)
-            metadata_dict = pickle.loads(data)
-            metadata = DistributedMetadata.from_dict(metadata_dict)
-        return metadata
+        return load_distributed_metadata(checkpoint_dir, self._storage)
 
     def _read_without_resharding(
         self,
