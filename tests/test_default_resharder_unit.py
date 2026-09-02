@@ -6,6 +6,7 @@
 
 import io
 import logging
+import zipfile
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch, PropertyMock
@@ -78,11 +79,14 @@ class _MultiFileTrackingStorage:
 
 def _load_second_half_with_offset_reads(
     source: torch.Tensor,
+    checkpoint_data: bytes | None = None,
 ) -> tuple[torch.Tensor, _TrackingStorage]:
-    checkpoint = io.BytesIO()
-    torch.save({"selected": source}, checkpoint)
+    if checkpoint_data is None:
+        checkpoint = io.BytesIO()
+        torch.save({"selected": source}, checkpoint)
+        checkpoint_data = checkpoint.getvalue()
     path = Path("checkpoint.pt")
-    storage = _TrackingStorage(path, checkpoint.getvalue())
+    storage = _TrackingStorage(path, checkpoint_data)
     target_tensor = torch.zeros(source.shape[0] // 2, dtype=source.dtype)
     source_sharding = DTensorShardingMetadata(
         global_shape=tuple(source.shape),
@@ -328,6 +332,44 @@ def test_quantized_offset_fallback_has_specific_message(
     assert len(storage.read_args) == 2
     assert "Source 'selected' is quantized" in caplog.text
     assert "does not use a strided storage" not in caplog.text
+
+
+def test_load_falls_back_for_compressed_torch_archive() -> None:
+    source = torch.arange(1024, dtype=torch.float32)
+    uncompressed = io.BytesIO()
+    torch.save({"selected": source}, uncompressed)
+    compressed = io.BytesIO()
+    with (
+        zipfile.ZipFile(uncompressed, "r") as source_archive,
+        zipfile.ZipFile(compressed, "w") as target_archive,
+    ):
+        for member in source_archive.infolist():
+            compression = (
+                zipfile.ZIP_DEFLATED
+                if "/data/" in member.filename
+                else zipfile.ZIP_STORED
+            )
+            target_archive.writestr(
+                member,
+                source_archive.read(member.filename),
+                compress_type=compression,
+            )
+
+    checkpoint_data = compressed.getvalue()
+    loaded = torch.load(
+        io.BytesIO(checkpoint_data),
+        map_location="cpu",
+        weights_only=False,
+    )
+    torch.testing.assert_close(loaded["selected"], source)
+
+    target, storage = _load_second_half_with_offset_reads(source, checkpoint_data)
+
+    torch.testing.assert_close(target, source[512:])
+    assert len(storage.read_args) == 2
+    assert storage.read_args[0] is not None
+    assert not storage.read_args[0].pre_read_full_file
+    assert storage.read_args[1] is None
 
 
 def test_load_falls_back_for_quantized_source_tensor() -> None:

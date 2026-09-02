@@ -21,6 +21,7 @@ The core algorithm:
 
 import io
 import logging
+import zipfile
 from pathlib import Path
 from typing import Any
 
@@ -81,6 +82,24 @@ def _read_exact(stream: io.RawIOBase, offset: int, buffer: memoryview) -> None:
                 f"but read {bytes_read}"
             )
         bytes_read += count
+
+
+def _validate_offset_read_archive(stream: io.RawIOBase) -> None:
+    """Require a seekable torch archive whose records are stored uncompressed."""
+    try:
+        if not stream.seekable():
+            raise NotImplementedError("Checkpoint stream is not seekable")
+        with zipfile.ZipFile(stream) as archive:
+            if any(
+                member.compress_type != zipfile.ZIP_STORED
+                for member in archive.infolist()
+            ):
+                raise NotImplementedError("Checkpoint archive contains compressed data")
+        stream.seek(0)
+    except (io.UnsupportedOperation, zipfile.BadZipFile) as error:
+        raise NotImplementedError(
+            "Checkpoint is not a seekable, uncompressed torch archive"
+        ) from error
 
 
 def _replicated_tensor_metadata(tensor: torch.Tensor) -> DTensorShardingMetadata:
@@ -637,6 +656,7 @@ class DefaultResharder(Resharder):
             file_path,
             ReadArgs(pre_read_full_file=False),
         ) as stream:
+            _validate_offset_read_archive(stream)
             with FakeTensorMode():
                 metadata = torch.load(
                     stream,  # type: ignore[arg-type]
