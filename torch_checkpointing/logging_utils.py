@@ -218,7 +218,6 @@ class EventLogger:
         current_time_ms = int(time.time() * 1000)
         time_since_creation_ms = current_time_ms - self.creation_time_ms
         time_since_last_event_ms = current_time_ms - self.last_event_time_ms
-        start_time = self.creation_time_ms if end_to_end else self.last_event_time_ms
         self.last_event_time_ms = current_time_ms
         if value is None:
             value = time_since_creation_ms if end_to_end else time_since_last_event_ms
@@ -247,7 +246,6 @@ class EventLogger:
             "total_time_ms": time_since_creation_ms,
             "last_interval_ms": time_since_last_event_ms,
             "value": value,
-            "measured_from_start_time_ms": start_time,
             **kwargs,
         }
 
