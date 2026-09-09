@@ -81,6 +81,16 @@ class Storage(ABC):
         """Return a file-like object for writing."""
         pass
 
+    def get_write_stream(self, path: Path, data: object) -> io.IOBase:
+        """Return the stream used to serialize ``data``.
+
+        Backends may inspect ``data`` to retain zero-copy buffer owners. When
+        they do, callers must not mutate or resize those buffers until the
+        returned stream has closed or aborted.
+        """
+        del data
+        return self.stream_write(path)
+
     def read(
         self,
         path: Path,

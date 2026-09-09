@@ -357,7 +357,7 @@ class CheckpointWriter:
             extra=event_logger(get_log_event_type_for_file_save(key, True)),
         )
         if isinstance(layout_info.serialization_format, TorchSerialization):
-            with self._storage.stream_write(full_path) as f:
+            with self._storage.get_write_stream(full_path, data_to_serialize) as f:
                 torch.save(data_to_serialize, f)  # type: ignore[arg-type]
         elif isinstance(layout_info.serialization_format, JsonSerialization):
             # For JSON, we need to serialize to string first, then encode to bytes

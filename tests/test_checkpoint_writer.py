@@ -283,6 +283,18 @@ class TestCheckpointWriter(TestCase):
         # Clean up the temporary directory
         shutil.rmtree(self.temp_dir)
 
+    def test_default_get_write_stream_delegates_to_stream_write(self):
+        path = Path(self.temp_dir) / "default_stream.pt"
+        value = {"tensor": torch.arange(4)}
+
+        with self.storage.get_write_stream(path, value) as stream:
+            torch.save(value, stream)
+
+        torch.testing.assert_close(
+            torch.load(path, weights_only=False)["tensor"],
+            value["tensor"],
+        )
+
     def test_file_write_max_threads_controls_parallel_key_writes(self):
         """Test that file_write_max_threads controls concurrent key writes."""
         for max_threads, expected_max_active in ((1, 1), (2, 2), (3, 3)):
