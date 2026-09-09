@@ -13,10 +13,11 @@ from typing import Any
 import torch
 from torch_checkpointing.checkpoint_layout import TorchSerialization
 from torch_checkpointing.checkpoint_reader import CheckpointReader
+from torch_checkpointing.storage.base_storage import Storage
 from torch_checkpointing.types import RankInfo
 
 
-class _BytesStorage:
+class _BytesStorage(Storage):
     def __init__(self, data_by_path: dict[Path, bytes]) -> None:
         self._data_by_path = data_by_path
         self.read_args: list[Any] = []
@@ -29,6 +30,42 @@ class _BytesStorage:
     def getsize(self, path: Path) -> int:
         self.getsize_calls += 1
         return len(self._data_by_path[path])
+
+    def stream_write(self, _path: Path) -> io.IOBase:
+        raise NotImplementedError
+
+    def write(self, _path: Path, _data: Any) -> None:
+        raise NotImplementedError
+
+    def delete(self, _path: Path) -> None:
+        raise NotImplementedError
+
+    def mkdir(self, _path: Path, recursive: bool = True) -> None:
+        raise NotImplementedError
+
+    def rmdir(self, _path: Path) -> None:
+        raise NotImplementedError
+
+    def rename(
+        self,
+        _src_path: Path,
+        _dst_path: Path,
+        is_directory: bool = False,
+        background_cleanup: bool = False,
+    ) -> None:
+        raise NotImplementedError
+
+    def ls(self, _path: Path) -> list[str]:
+        raise NotImplementedError
+
+    def exists(self, _path: Path) -> bool:
+        raise NotImplementedError
+
+    def isdir(self, _path: Path) -> bool:
+        raise NotImplementedError
+
+    def remap_path(self, _path: Path) -> str:
+        raise NotImplementedError
 
 
 class _StorageConfig:

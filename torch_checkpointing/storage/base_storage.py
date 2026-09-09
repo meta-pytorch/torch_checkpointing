@@ -40,17 +40,31 @@ class ReadArgs:
             reliable and configurable. This exists as a stopgap because the
             default server-side timeout can be too short for large-scale
             checkpoint reads under storage contention.
+        known_size_bytes: Exact object size already established by the caller.
+            Backends may use it to avoid a redundant size probe, but must
+            validate it against the storage response before copying data.
     """
 
     pre_read_full_file: bool = True
     direct_io: bool = False
     timeout_us: int = 900_000_000
+    known_size_bytes: int | None = None
 
 
 class Storage(ABC):
     """
     Abstract base class for storage backends.
     """
+
+    @property
+    def mmap_fill_workers(self) -> int | None:
+        """Override with the backend's preferred full-file read concurrency."""
+        return None
+
+    @property
+    def mmap_fill_chunk_bytes(self) -> int | None:
+        """Override with the backend's preferred full-file range size."""
+        return None
 
     # Returns RawIOBase to have readinto support which is crucial for performance
     @abstractmethod

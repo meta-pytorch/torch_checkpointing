@@ -79,7 +79,8 @@ def _fill_serial(
     pos = 0
     with storage.stream_read(path, read_args) as stream:
         while pos < expected:
-            n = stream.readinto(buf[pos:])
+            with buf[pos:] as target:
+                n = stream.readinto(target)
             if not n:
                 break
             pos += n
@@ -128,7 +129,8 @@ def _fill_parallel(
                     "backend cannot position reads reliably"
                 )
             while got < length:
-                n = stream.readinto(buf[offset + got : offset + length])
+                with buf[offset + got : offset + length] as target:
+                    n = stream.readinto(target)
                 if not n:
                     break
                 got += n
@@ -236,6 +238,31 @@ def _python_mmap_from_storage(
     return mm_file, pos, mode, attempted_parallel
 
 
+def _resolve_mmap_fill_geometry(
+    storage: Storage,
+    num_workers: int | None,
+) -> tuple[int, int]:
+    workers = num_workers
+    if workers is None:
+        workers = storage.mmap_fill_workers
+    if workers is None:
+        workers = int(
+            os.environ.get(_PARALLEL_FILL_WORKERS_ENV, _DEFAULT_PARALLEL_FILL_WORKERS)
+        )
+    chunk_bytes = storage.mmap_fill_chunk_bytes
+    if chunk_bytes is None:
+        chunk_mb = int(
+            os.environ.get(_PARALLEL_FILL_CHUNK_MB_ENV, _DEFAULT_PARALLEL_FILL_CHUNK_MB)
+        )
+        chunk_bytes = chunk_mb * 1024 * 1024
+    if workers < 1 or chunk_bytes < 1:
+        raise ValueError(
+            f"mmap fill workers={workers} and chunk_bytes={chunk_bytes} "
+            "must both be positive"
+        )
+    return workers, chunk_bytes
+
+
 def _stream_storage_into_mmap(
     expected: int,
     path: Path,
@@ -253,19 +280,20 @@ def _stream_storage_into_mmap(
     chunk is the working set during the fill. The same mmap later backs both
     the PyTorch zip reader and the returned tensors.
 
-    This issues ``TORCH_CKPT_PARALLEL_FILL_WORKERS`` concurrent ranged reads of
-    ``TORCH_CKPT_PARALLEL_FILL_CHUNK_MB`` each, which is faster on backends
-    where a single stream is limited by per-request latency rather than by
-    available bandwidth. One worker gives the historical single sequential
-    stream. If the backend's stream cannot seek -- or cannot seek accurately --
-    this falls back to the sequential fill.
+    Backend-specific worker and chunk settings take precedence over
+    ``TORCH_CKPT_PARALLEL_FILL_WORKERS`` and
+    ``TORCH_CKPT_PARALLEL_FILL_CHUNK_MB``. One worker gives the historical
+    single sequential stream. If the backend's stream cannot seek -- or cannot
+    seek accurately -- this falls back to the sequential fill.
 
     Args:
         num_workers: Concurrent ranged reads to use. ``None`` (the default)
-            reads ``TORCH_CKPT_PARALLEL_FILL_WORKERS``. Callers that ALREADY
-            load files concurrently should pass 1, so the two levels of
-            parallelism do not multiply into ``outer_threads x num_workers``
-            in-flight reads against one storage client.
+            uses ``Storage.mmap_fill_workers`` when the backend specifies it,
+            then falls back to ``TORCH_CKPT_PARALLEL_FILL_WORKERS``. Callers
+            that ALREADY load files concurrently should pass 1, so the two
+            levels of parallelism do not multiply into
+            ``outer_threads x num_workers`` in-flight reads against one
+            storage client.
         mmap_fill: Optional synchronous callback that privately allocates and
             fills an mmap. It receives the expected file size, path, worker
             count, and chunk size in bytes, and returns the completed mmap only
@@ -275,25 +303,12 @@ def _stream_storage_into_mmap(
     # This helper is the full-file read: enabling ``pre_read_full_file`` would
     # allocate a second whole-file buffer inside the storage layer before we copy
     # into the mmap.
-    read_args = ReadArgs(pre_read_full_file=False, direct_io=direct_io)
-    workers = (
-        num_workers
-        if num_workers is not None
-        else int(
-            os.environ.get(_PARALLEL_FILL_WORKERS_ENV, _DEFAULT_PARALLEL_FILL_WORKERS)
-        )
+    read_args = ReadArgs(
+        pre_read_full_file=False,
+        direct_io=direct_io,
+        known_size_bytes=expected,
     )
-    chunk_mb = int(
-        os.environ.get(_PARALLEL_FILL_CHUNK_MB_ENV, _DEFAULT_PARALLEL_FILL_CHUNK_MB)
-    )
-    # Not an ``assert``: ``python -O`` strips those, and a zero chunk size would
-    # then surface as an opaque ``range()`` error instead of a named cause.
-    if workers < 1 or chunk_mb < 1:
-        raise ValueError(
-            f"{_PARALLEL_FILL_WORKERS_ENV}={workers} and "
-            f"{_PARALLEL_FILL_CHUNK_MB_ENV}={chunk_mb} must both be positive"
-        )
-    chunk_bytes = chunk_mb * 1024 * 1024
+    workers, chunk_bytes = _resolve_mmap_fill_geometry(storage, num_workers)
     pos = 0
     mode = "serial"
     attempted_parallel = False

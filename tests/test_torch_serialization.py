@@ -26,8 +26,16 @@ class _BytesStorage:
     how the read was configured and how many streams the fill opened.
     """
 
-    def __init__(self, data_by_path: dict[Path, bytes]) -> None:
+    def __init__(
+        self,
+        data_by_path: dict[Path, bytes],
+        *,
+        mmap_fill_workers: int | None = None,
+        mmap_fill_chunk_bytes: int | None = None,
+    ) -> None:
         self._data_by_path = data_by_path
+        self.mmap_fill_workers = mmap_fill_workers
+        self.mmap_fill_chunk_bytes = mmap_fill_chunk_bytes
         self.read_args: list[Any] = []
 
     def stream_read(self, path: Path, read_args: Any | None = None) -> io.BytesIO:
@@ -36,6 +44,20 @@ class _BytesStorage:
 
     def getsize(self, path: Path) -> int:
         return len(self._data_by_path[path])
+
+
+class _ReadintoFailingStream(io.BytesIO):
+    # pyre-ignore[14]
+    def readinto(self, _buffer: Any) -> int:
+        raise RuntimeError("stream read failed")
+
+
+class _ReadintoFailingStorage(_BytesStorage):
+    def stream_read(  # pyre-ignore[15]
+        self, path: Path, read_args: Any | None = None
+    ) -> io.BytesIO:
+        self.read_args.append(read_args)
+        return _ReadintoFailingStream(self._data_by_path[path])
 
 
 def test_mmap_as_storage_aliases_buffer_without_copy() -> None:
@@ -97,6 +119,24 @@ def test_load_torch_serialized_from_storage_round_trips_from_streamed_mmap() -> 
     assert loaded["step"] == expected["step"]
     assert len(storage.read_args) == 1
     assert storage.read_args[0].pre_read_full_file is False
+    assert storage.read_args[0].known_size_bytes == len(buffer.getvalue())
+
+
+@pytest.mark.parametrize("num_workers", [1, 4])
+def test_load_preserves_stream_error_when_readinto_fails(
+    monkeypatch: Any, num_workers: int
+) -> None:
+    monkeypatch.setenv("TORCH_CKPT_PARALLEL_FILL_CHUNK_MB", "1")
+    path = Path("checkpoint.pt")
+    storage = _ReadintoFailingStorage({path: bytes(2 * 1024 * 1024)})
+
+    with pytest.raises(RuntimeError, match="stream read failed"):
+        load_torch_serialized_from_storage(
+            path,
+            storage,
+            map_location="cpu",
+            num_workers=num_workers,
+        )
 
 
 class _NonSeekableStream(io.RawIOBase):
@@ -388,6 +428,29 @@ def test_parallel_fill_round_trips_identically_to_serial(monkeypatch: Any) -> No
     assert parallel["step"] == expected["step"]
     assert len(storage.read_args) > 1, "parallel fill should open one stream per range"
     assert all(a.pre_read_full_file is False for a in storage.read_args)
+    assert all(a.known_size_bytes == len(raw) for a in storage.read_args)
+
+
+def test_backend_full_file_geometry_overrides_generic_environment(
+    monkeypatch: Any,
+) -> None:
+    expected, raw = _big_checkpoint()
+    path = Path("checkpoint.pt")
+    chunk_bytes = 1024 * 1024
+    storage = _BytesStorage(
+        {path: raw},
+        mmap_fill_workers=3,
+        mmap_fill_chunk_bytes=chunk_bytes,
+    )
+    monkeypatch.setenv("TORCH_CKPT_PARALLEL_FILL_WORKERS", "1")
+    monkeypatch.setenv("TORCH_CKPT_PARALLEL_FILL_CHUNK_MB", "64")
+
+    loaded = load_torch_serialized_from_storage(path, storage, map_location="cpu")
+
+    torch.testing.assert_close(loaded["w"], expected["w"])
+    assert loaded["step"] == expected["step"]
+    assert len(storage.read_args) == -(-len(raw) // chunk_bytes)
+    assert len(storage.read_args) > 3
 
 
 def test_parallel_fill_falls_back_when_stream_cannot_seek(monkeypatch: Any) -> None:
