@@ -81,6 +81,7 @@ class CheckpointReader:
         storage_config: StorageConfig,
         disable_use_mmap_backed_storage_on_load: bool = False,
         mmap_fill_factory: Callable[[Storage], MmapFill | None] | None = None,
+        storage: Storage | None = None,
     ):
         """
         Initialize a CheckpointReader.
@@ -95,10 +96,14 @@ class CheckpointReader:
                 cleanup.
             mmap_fill_factory: Optional factory for a storage-specific mmap
                 fill callback. It is resolved only for mmap-backed torch loads.
+            storage: Optional operation-scoped storage instance. When supplied,
+                it is reused instead of constructing another backend client.
         """
 
         self._rank_info = rank_info
-        self._storage: Storage = storage_config.create_storage()
+        self._storage = (
+            storage if storage is not None else storage_config.create_storage()
+        )
         self._disable_use_mmap_backed_storage_on_load = (
             disable_use_mmap_backed_storage_on_load
         )
