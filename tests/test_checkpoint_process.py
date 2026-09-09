@@ -214,6 +214,127 @@ class TestCheckpointProcess(TestCase):
         }
         return CheckpointWriteInfo(checkpoint_items=items)
 
+    def _run_subprocess_write_for_telemetry(
+        self,
+        write_error: BaseException | None = None,
+    ) -> tuple[list[dict[str, Any]], list[str]]:
+        checkpoint_info = self._build_checkpoint_info(self.test_state_dict)
+        request = WorkerRequest(
+            request_type=RequestType.WRITE_CHECKPOINT,
+            payload={
+                "path": "/checkpoint/step_1",
+                "checkpoint_info": checkpoint_info,
+            },
+        )
+        terminate = WorkerRequest(
+            request_type=RequestType.TERMINATE_PROCESS,
+            payload={},
+        )
+        parent_pipe = mock.Mock()
+        parent_pipe.recv.side_effect = [request, terminate]
+        writer = mock.Mock()
+        writer_args = mock.Mock()
+        writer_args.build.return_value = writer
+        events: list[dict[str, Any]] = []
+        order: list[str] = []
+
+        def write(**_: Any) -> None:
+            order.append("write")
+            if write_error is not None:
+                raise write_error
+
+        writer.write.side_effect = write
+
+        class RecordingEventLogger:
+            def __init__(self, logger_id: int) -> None:
+                self._logger_id = logger_id
+
+            def __call__(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+                event_type = str(args[0])
+                events.append(
+                    {
+                        **kwargs,
+                        "event_type": event_type,
+                        "logger_id": self._logger_id,
+                    }
+                )
+                if (
+                    kwargs.get("metric_name")
+                    == "custom.checkpoint_write.execute.subprocess_writer.latency_ms"
+                ):
+                    order.append("writer_metric")
+                elif event_type == "checkpoint_write_start":
+                    order.append("start")
+                elif event_type == "checkpoint_write_end":
+                    order.append("end")
+                return {}
+
+        loggers: list[RecordingEventLogger] = []
+
+        def event_logger_factory() -> RecordingEventLogger:
+            result = RecordingEventLogger(len(loggers))
+            loggers.append(result)
+            return result
+
+        with (
+            mock.patch(
+                "torch_checkpointing.checkpoint_process.EventLogger",
+                side_effect=event_logger_factory,
+            ),
+            mock.patch(
+                "torch_checkpointing.checkpoint_process.time.perf_counter_ns",
+                side_effect=[1_000_000_000, 1_250_000_000],
+            ),
+        ):
+            CheckpointProcess._subprocess(
+                0,
+                self.rank_info,
+                parent_pipe,
+                lambda: None,
+                (),
+                writer_args,
+                "ckpt",
+                "custom.checkpoint_write",
+            )
+        return events, order
+
+    def test_subprocess_preserves_lifecycle_and_emits_writer_timing_after_success(
+        self,
+    ) -> None:
+        events, order = self._run_subprocess_write_for_telemetry()
+
+        writer_events = [
+            event
+            for event in events
+            if event.get("metric_name")
+            == "custom.checkpoint_write.execute.subprocess_writer.latency_ms"
+        ]
+        lifecycle_events = [
+            event
+            for event in events
+            if event["event_type"] in {"checkpoint_write_start", "checkpoint_write_end"}
+        ]
+        self.assertEqual(order, ["start", "write", "end", "writer_metric"])
+        self.assertEqual(len(writer_events), 1)
+        self.assertEqual(writer_events[0]["value"], 250.0)
+        self.assertIn("checkpoint_path:/checkpoint/step_1", writer_events[0]["context"])
+        self.assertEqual({event["logger_id"] for event in lifecycle_events}, {0})
+        self.assertEqual(writer_events[0]["logger_id"], 1)
+
+    def test_subprocess_does_not_emit_writer_timing_after_failure(self) -> None:
+        events, order = self._run_subprocess_write_for_telemetry(
+            RuntimeError("write failed")
+        )
+
+        self.assertEqual(order, ["start", "write"])
+        self.assertFalse(
+            any(
+                event.get("metric_name")
+                == "custom.checkpoint_write.execute.subprocess_writer.latency_ms"
+                for event in events
+            )
+        )
+
     def test_checkpoint_process_keeps_the_barrier_scope_until_close(self) -> None:
         with mock.patch.object(
             DefaultStoreBarrierConfig, "use_in_subprocess"

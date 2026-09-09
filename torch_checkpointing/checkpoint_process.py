@@ -23,7 +23,12 @@ from torch.multiprocessing.spawn import ProcessExitedException
 
 from .checkpoint_base import CheckpointWriteInfo
 from .checkpoint_writer import CheckpointWriterArgs
-from .logging_utils import checkpoint_logging_context, EventLogger, EventType
+from .logging_utils import (
+    checkpoint_logging_context,
+    dict_to_list_safe,
+    EventLogger,
+    EventType,
+)
 from .types import RankInfo
 from .utils import set_thread_name_safe
 
@@ -281,14 +286,27 @@ class CheckpointProcess:
                         cached_serialized_metadata
                     )
 
+                    writer_event_logger = EventLogger()
+                    write_started_ns = time.perf_counter_ns()
                     checkpoint_writer.write(
                         path=path,
                         checkpoint_info=checkpoint_info,
                     )
-
+                    write_elapsed_ms = (
+                        time.perf_counter_ns() - write_started_ns
+                    ) / 1_000_000
                     logger.info(
                         f"(step {step}) Checkpoint written successfully to {path}",
                         extra=event_logger(EventType.CHECKPOINT_WRITE_END),
+                    )
+                    logger.info(
+                        "Checkpoint subprocess writer completed",
+                        extra=writer_event_logger(
+                            EventType.LOG_METRIC,
+                            metric_name=f"{metric_prefix}.execute.subprocess_writer.latency_ms",
+                            value=write_elapsed_ms,
+                            context=dict_to_list_safe({"checkpoint_path": path}),
+                        ),
                     )
                     parent_pipe.send(
                         WorkerResponse(RequestType.WRITE_CHECKPOINT, success=True)
