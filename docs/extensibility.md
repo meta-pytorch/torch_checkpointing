@@ -62,6 +62,7 @@ Barriers coordinate ranks around a save (e.g. so a rename to the final path happ
 
 - **Interface:** `BarrierConfig` / `Barrier` — `create_barrier(rank_info)`, `execute_barrier(timeout_secs)`.
 - **Built-in:** `DefaultStoreBarrier` / `DefaultStoreBarrierConfig` reuse the store that already backs the default process group, so there is no extra port to manage; `TCPStoreBarrier` / `TCPStoreBarrierConfig` stand up a `TCPStore` of their own on a port you supply.
+- **Default:** `CheckpointWriterConfig.barrier_config` defaults to `DefaultStoreBarrierConfig`, so a save is committed atomically without being configured to be. Setting it to `None` opts out of the barrier *and* the commit.
 - **A group of one is a special case in `DefaultStoreBarrier`:** it has nobody to wait for, so it passes without touching a store, and therefore without needing a process group at all — which is what lets single-process training use it without `init_process_group`. Only a group of more than one rank requires one.
 - **Barriers run in the write subprocess.** A `BarrierConfig` is serialized into it, so anything the barrier needs from the parent process — such as the address of a store that only the parent can look up — has to be captured before it crosses that boundary, not on arrival. `DefaultStoreBarrierConfig` does this in `__getstate__`, recording the absence of a process group rather than failing there, since whether that matters depends on a rank count only `create_barrier` is given.
 

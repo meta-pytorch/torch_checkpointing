@@ -17,7 +17,12 @@ import pytest
 import torch
 import torch_checkpointing.checkpoint_writer as checkpoint_writer_module
 from torch.testing._internal.common_utils import run_tests, TestCase
-from torch_checkpointing.barriers import Barrier, BarrierConfig
+from torch_checkpointing.barriers import (
+    Barrier,
+    BarrierConfig,
+    DefaultStoreBarrier,
+    DefaultStoreBarrierConfig,
+)
 from torch_checkpointing.checkpoint_base import (
     CheckpointItem,
     CheckpointWriteInfo,
@@ -83,6 +88,13 @@ def global_file_layout(rank: int) -> dict[str, LayoutInfo]:
 
 
 class _NoopBarrier(Barrier):
+    """Stands in for a barrier the ranks really do meet at.
+
+    The commit path only depends on a barrier having passed, so a test that is
+    about the commit -- not about coordination -- can hold this instead of
+    standing up a store and the ranks to meet on it.
+    """
+
     def __init__(self, config: BarrierConfig) -> None:
         pass
 
@@ -180,7 +192,7 @@ class TestCheckpointWriterConfig(TestCase):
         """Test that CheckpointWriterConfig has the correct default values."""
         options = CheckpointWriterConfig()
         self.assertEqual(options.checkpoint_write_barrier_timeout_sec, 600)
-        self.assertIsNone(options.barrier_config)
+        self.assertIsInstance(options.barrier_config, DefaultStoreBarrierConfig)
         self.assertEqual(options.file_write_max_threads, 1)
         self.assertEqual(options.temp_dir_prefix, DEFAULT_TEMP_DIR_PREFIX)
 
@@ -203,8 +215,25 @@ class TestCheckpointWriterConfig(TestCase):
 
     def test_empty_temp_dir_prefix_allowed_without_barrier(self):
         """Test that the prefix is inert without a barrier (no temp dir is used)."""
-        options = CheckpointWriterConfig(temp_dir_prefix="")
+        options = CheckpointWriterConfig(barrier_config=None, temp_dir_prefix="")
         self.assertEqual(options.temp_dir_prefix, "")
+
+    def test_default_barrier_needs_nothing_of_a_single_rank_writer(self):
+        """The default barrier has to be free to hold when there is nobody to meet."""
+        writer = CheckpointWriter(
+            CheckpointWriterArgs(
+                config=CheckpointWriterConfig(),
+                rank_info=RankInfo(
+                    global_rank=0, global_world_size=1, role_rank=0, role_world_size=1
+                ),
+                storage_config=LocalFileSystemStorageConfig(),
+            )
+        )
+
+        # No process group here, and none needed: the barrier is real, it simply
+        # has no store to meet on and nothing to wait for.
+        self.assertIsInstance(writer._barrier, DefaultStoreBarrier)
+        writer._barrier.execute_barrier(timeout_secs=0)
 
 
 class TestCheckpointWriter(TestCase):
@@ -219,7 +248,10 @@ class TestCheckpointWriter(TestCase):
             role_rank=0,
             role_world_size=1,
         )
-        self.config = CheckpointWriterConfig()
+        # Most of these tests are about what reaches storage, so they opt out of the
+        # barrier that would commit the write through a temporary directory. The
+        # default is exercised by test_default_barrier_commits_through_a_temp_dir.
+        self.config = CheckpointWriterConfig(barrier_config=None)
         self.mock_callback = MockCallback()
 
         # Create a test state dictionary
@@ -437,6 +469,27 @@ class TestCheckpointWriter(TestCase):
             ["first.bin", "metadata.bin", "second.bin"],
         )
         self.assertEqual((final_path / "first.bin").read_bytes(), b"first")
+
+    def test_default_barrier_commits_through_a_temp_dir(self):
+        """Test that a writer left at its defaults commits atomically."""
+        final_path = Path(self.temp_dir) / "checkpoint_0004000"
+        tmp_path = Path(self.temp_dir) / f"{DEFAULT_TEMP_DIR_PREFIX}checkpoint_0004000"
+        writer = CheckpointWriter(
+            CheckpointWriterArgs(
+                config=CheckpointWriterConfig(),
+                rank_info=self.rank_info,
+                storage_config=_ProbeStorageConfig(_ConcurrencyProbe(1)),
+                pre_finalize_callback=self.mock_callback.pre_finalize_callback,
+            )
+        )
+        # This rank is alone, so its barrier has nothing to coordinate.
+        self.assertIsInstance(writer._barrier, DefaultStoreBarrier)
+
+        writer.write(str(final_path), self._raw_checkpoint_info())
+
+        self.assertEqual(self.mock_callback.pre_finalize_path, str(tmp_path))
+        self.assertTrue(final_path.exists())
+        self.assertFalse(tmp_path.exists())
 
     def test_write_calls_callbacks(self):
         """Test that write calls the callbacks with correct parameters."""

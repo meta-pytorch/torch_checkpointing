@@ -15,13 +15,13 @@ for custom actions during the checkpoint writing process.
 import json
 import logging
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
 import torch
 
-from .barriers import Barrier, BarrierConfig
+from .barriers import Barrier, BarrierConfig, DefaultStoreBarrierConfig
 from .checkpoint_base import CheckpointWriteInfo
 from .checkpoint_layout import (
     default_layout_info,
@@ -49,9 +49,12 @@ class CheckpointWriterConfig:
     Attributes:
         checkpoint_write_barrier_timeout_sec: Maximum time in seconds to wait for all ranks
             to reach the checkpoint barrier before timing out. Default is 600 seconds.
-        barrier_config: Complete configuration for the synchronization barrier. If None,
-            no barrier will be used. Must contain all necessary common and barrier-specific
-            fields if provided.
+        barrier_config: Complete configuration for the synchronization barrier that
+            commits the write. Defaults to ``DefaultStoreBarrierConfig``, which
+            coordinates on the store the process group already has and costs a
+            single-rank writer nothing. ``None`` gives up the barrier *and* the
+            commit protocol: every rank writes straight to the final path, where a
+            reader can find a half-written checkpoint.
         file_write_max_threads: Maximum workers for independent file writes and
             parent-directory creation.
         temp_dir_prefix: Prefix of the temporary directory the checkpoint is
@@ -60,7 +63,9 @@ class CheckpointWriterConfig:
     """
 
     checkpoint_write_barrier_timeout_sec: int = 600
-    barrier_config: BarrierConfig | None = None
+    barrier_config: BarrierConfig | None = field(
+        default_factory=DefaultStoreBarrierConfig
+    )
     file_write_max_threads: int = 1
     temp_dir_prefix: str = DEFAULT_TEMP_DIR_PREFIX
 

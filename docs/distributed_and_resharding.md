@@ -167,6 +167,27 @@ to reach the same sequence number, then increments the sequence counter. Because
 it uses a dedicated `TCPStore` rather than the collective process group,
 checkpoint coordination stays independent of ongoing collective communication.
 
+### `DefaultStoreBarrierConfig` — the default
+
+`DefaultStoreBarrier` needs no endpoint of its own: it opens a *client* handle to
+the store `init_process_group` already stood up, so there is no second port to
+pick, agree on across ranks and keep free. Its keys live under
+`key_prefix/generation`, so they cannot collide with the process group's own keys
+in that store, nor with those of a barrier built earlier (keys are never deleted,
+and a rebuilt barrier's sequence numbers restart at zero).
+
+Two consequences worth knowing:
+
+- **A role of one rank never touches the store.** There is nobody to meet, so the
+  barrier passes immediately, writes no keys and needs no process group at all —
+  which is what lets single-process training hold one without calling
+  `init_process_group`. Only `role_world_size > 1` needs the store; asking for a
+  barrier across several ranks with no process group to share one is an error.
+- **The store's address is captured when the config is serialized.** The barrier is
+  built in the write subprocess, which never called `init_process_group` and so
+  cannot look the store up; `DefaultStoreBarrierConfig.__getstate__` records the
+  coordinates on the way out instead.
+
 ### Where the barrier fits in a save
 
 The barrier is configured on `CheckpointWriterConfig`
@@ -176,9 +197,17 @@ The barrier is configured on `CheckpointWriterConfig`
 @dataclass
 class CheckpointWriterConfig:
     checkpoint_write_barrier_timeout_sec: int = 600
-    barrier_config: BarrierConfig | None = None
+    barrier_config: BarrierConfig | None = field(
+        default_factory=DefaultStoreBarrierConfig
+    )
     file_write_max_threads: int = 1
 ```
+
+`DefaultStoreBarrierConfig` is the default because it costs nothing to hold: it
+coordinates on the store the process group already has, and a role of one rank
+skips the store entirely (see §2 above) while still putting the writer on the
+commit path below. Opting out means `barrier_config=None`, which gives up the
+commit too.
 
 Inside `CheckpointWriter.write()` the ordering is:
 
@@ -199,17 +228,18 @@ written directly to the final path and no rename occurs.
 
 ### Disabling the barrier
 
-Set `barrier_config=None` (the default). With no barrier, the writer skips
-synchronization and the rename step, writing directly to the final path. This is
-correct for single-rank jobs and for storage backends that provide their own
-coordination, but for multi-rank saves to shared storage a barrier is what
-guarantees all shards are present before the checkpoint is published.
+Set `barrier_config=None`. The writer then skips both synchronization and the
+rename, writing directly to the final path — so a reader, or a job that dies
+mid-write, can find a checkpoint with only some of its files. Choose this only
+when nothing reads the path until the write is known to be complete; for a
+multi-rank save to shared storage, the barrier is what guarantees every shard is
+present before the checkpoint is published.
 
 ```python
 from torch_checkpointing.config import SyncCheckpointSaverConfig
 from torch_checkpointing.checkpoint_writer import CheckpointWriterConfig
 
-# No barrier (single-rank or externally coordinated)
+# No barrier and no commit: files land at the final path as they are written
 config = SyncCheckpointSaverConfig(
     writer_config=CheckpointWriterConfig(barrier_config=None),
 )
@@ -631,8 +661,8 @@ altogether (identical save/load configuration on retry).
 | --- | --- | --- |
 | High-level entry point | `CheckpointManager`, `ItemSpec(resharder=...)` | `checkpoint_manager.py` |
 | Rank identity | `RankInfo`, `_get_default_rank_info()` | `types.py`, `builder.py` |
-| Cross-rank coordination | `BarrierConfig`, `TCPStoreBarrierConfig`, `TCPStoreBarrier` | `barriers.py` |
-| Disable coordination | `CheckpointWriterConfig(barrier_config=None)` | `checkpoint_writer.py` |
+| Cross-rank coordination | `BarrierConfig`, `DefaultStoreBarrierConfig` (the default), `TCPStoreBarrierConfig` | `barriers.py` |
+| Disable coordination *and* the atomic commit | `CheckpointWriterConfig(barrier_config=None)` | `checkpoint_writer.py` |
 | Finalize hooks | `pre_finalize_callback`, `finalize_callback` | `builder.py`, `checkpoint_writer.py` |
 | Metadata pipeline | `MetadataManager`, `DefaultMetadataManager` | `metadata_manager.py` |
 | Metadata payload | `CheckpointMetadata`, `DistributedMetadata`, `DistributedItemMetadata` | `distributed_metadata.py` |

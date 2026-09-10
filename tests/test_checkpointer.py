@@ -571,9 +571,10 @@ def test_load_full_model_from_partial_checkpoint(
             use_layout=use_layout,
         )
 
+    checkpoint_path = os.path.join(temp_dir, "checkpoint")
     save_sync(
         checkpointer,
-        temp_dir,
+        checkpoint_path,
         _create_checkpoint(model_partial, epoch=0, step=3),
         clear_cache=True,  # Clear cache since load has different state dict structure
     )
@@ -581,10 +582,12 @@ def test_load_full_model_from_partial_checkpoint(
     loaded_checkpoint = _create_checkpoint(model_full, epoch=1, step=2)
     if strict:
         with pytest.raises(RuntimeError, match="missing keys.*block2"):
-            load_checkpoint(loader, temp_dir, checkpoint=loaded_checkpoint, strict=True)
+            load_checkpoint(
+                loader, checkpoint_path, checkpoint=loaded_checkpoint, strict=True
+            )
         return
     else:
-        load_checkpoint(loader, temp_dir, checkpoint=loaded_checkpoint)
+        load_checkpoint(loader, checkpoint_path, checkpoint=loaded_checkpoint)
 
     # Block shouldn't be loaded, as it is None in the load call
     assert loaded_checkpoint.model.outer.block2 is not None  # type: ignore
@@ -618,15 +621,16 @@ def test_nested_dict_partial_load(
             use_layout=use_layout,
         )
 
+    checkpoint_path = os.path.join(temp_dir, "checkpoint")
     save_sync(
         checkpointer,
-        temp_dir,
+        checkpoint_path,
         _create_checkpoint(model_full, epoch=0, step=3),
         clear_cache=True,  # Clear cache since load has different state dict structure
     )
 
     partial_checkpoint = _create_checkpoint(model_partial, epoch=1, step=2)
-    load_checkpoint(loader, temp_dir, checkpoint=partial_checkpoint)
+    load_checkpoint(loader, checkpoint_path, checkpoint=partial_checkpoint)
 
     # Block shouldn't be loaded, as it is None in the load call
     assert partial_checkpoint.model.outer.block2 is None  # type: ignore
