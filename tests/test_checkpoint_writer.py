@@ -566,7 +566,7 @@ class TestCheckpointWriter(TestCase):
 
         self.assertEqual(
             events,
-            ["barrier", "pre_finalize", "finalize"],
+            ["pre_finalize", "barrier", "finalize"],
         )
         self.assertFalse(temporary_path.exists())
 

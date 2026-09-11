@@ -89,8 +89,7 @@ def make_sync_checkpoint_saver(
                   the default PyTorch distributed process group if initialized, otherwise
                   falls back to single-rank (world_size=1, rank=0).
         pre_finalize_callback: Optional callback for custom actions before checkpoint finalization.
-            With a barrier, it receives the complete temporary checkpoint path.
-            Distributed callbacks must synchronize before rank zero returns.
+            Called after files are written but before barrier synchronization.
         finalize_callback: Optional callback for custom actions after checkpoint finalization.
             Called after barrier synchronization (all ranks coordinated).
         storage_config: StorageConfig for storage backend. If None, defaults to LocalFileSystemStorage.
@@ -172,9 +171,7 @@ def make_async_checkpoint_saver(
                   the default PyTorch distributed process group if initialized, otherwise
                   falls back to single-rank (world_size=1, rank=0).
         pre_finalize_callback: Optional callback for custom actions before checkpoint finalization.
-                              With a barrier, it receives the complete temporary checkpoint
-                              path. Distributed callbacks must synchronize before rank zero
-                              returns.
+                              Called after files are written but before barrier synchronization.
         finalize_callback: Optional callback for custom actions after checkpoint finalization.
                           Called after barrier synchronization (all ranks coordinated).
         subprocess_init_fn: Function to initialize the subprocess. Defaults to no-op.
