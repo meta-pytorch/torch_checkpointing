@@ -14,6 +14,7 @@ for custom actions during the checkpoint writing process.
 
 import json
 import logging
+import warnings
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -59,7 +60,11 @@ class CheckpointWriterConfig:
             parent-directory creation.
         temp_dir_prefix: Prefix of the temporary directory the checkpoint is
             written to before it is renamed to its final path. Must be identical
-            on every rank. Only used when a barrier is configured.
+            on every rank. Only used when writing to a temporary directory.
+        write_to_temp_dir: Whether to stage the checkpoint under a temporary
+            directory and rename it onto the final path once every rank has finished.
+            Defaults to True. If false, writer will write directly to the final path.
+            Requires a barrier to be configured when True.
     """
 
     checkpoint_write_barrier_timeout_sec: int = 600
@@ -68,13 +73,19 @@ class CheckpointWriterConfig:
     )
     file_write_max_threads: int = 1
     temp_dir_prefix: str = DEFAULT_TEMP_DIR_PREFIX
+    write_to_temp_dir: bool = True
 
     def __post_init__(self) -> None:
         if self.file_write_max_threads < 1:
             raise ValueError("file_write_max_threads must be positive")
-        if self.barrier_config is not None and not self.temp_dir_prefix:
+        if self.write_to_temp_dir and self.barrier_config is None:
+            msg = "`barrier_config=None` requires `write_to_temp_dir=False`. Explicitly set `write_to_temp_dir=False` to hide this warning. This will become an error in a future version."
+            logger.warning(msg)
+            warnings.warn(msg, stacklevel=2)
+            self.write_to_temp_dir = False
+        if self.write_to_temp_dir and not self.temp_dir_prefix:
             raise ValueError(
-                "temp_dir_prefix must be non-empty when a barrier is configured"
+                "temp_dir_prefix must be non-empty when writing to a temp dir"
             )
 
 
@@ -121,8 +132,10 @@ class CheckpointWriter:
     to the specified checkpoint layout. It supports synchronization barriers to ensure
     all ranks in a distributed setting complete their checkpoint operations.
 
-    If a barrier is configured, ranks first write to a temporary path, then rank 0
-    atomically renames the directory to the final path.
+    By default, when a barrier is configured, ranks first write to a temporary
+    path, then rank 0 renames the directory onto the final path. Set
+    ``write_to_temp_dir=False`` to keep the barrier but write in place, leaving
+    completion for a ``finalize_callback`` to publish.
     """
 
     def __init__(self, args: CheckpointWriterArgs):
@@ -179,11 +192,10 @@ class CheckpointWriter:
         )
 
         final_path = Path(path)
-        # tmp path is only safe to use if we have configured a barrier
-        if self._barrier is None:
-            tmp_dir_path = final_path
-        else:
+        if self._args.config.write_to_temp_dir:
             tmp_dir_path = _temp_dir_path(final_path, self._args.config.temp_dir_prefix)
+        else:
+            tmp_dir_path = final_path
 
         state_dict = checkpoint_info.state_dict
         save_items: list[tuple[str, LayoutInfo, Path]] = []
@@ -256,7 +268,7 @@ class CheckpointWriter:
         # rename back to original path for atomicity. It's important this is done
         # immediately after the barrier to ensure all ranks have finished writing
         if (
-            self._barrier is not None
+            self._args.config.write_to_temp_dir
             and self._storage.exists(tmp_dir_path)
             and self._args.rank_info.role_rank == 0
         ):

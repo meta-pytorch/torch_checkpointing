@@ -9,7 +9,7 @@ import os
 import shutil
 import tempfile
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from unittest import mock
 
@@ -176,12 +176,23 @@ class _ProbeStorage(LocalFileSystemStorage):
         with self._probe:
             super().write(path, data)
 
+    def rename(
+        self,
+        src_path: Path,
+        dst_path: Path,
+        is_directory: bool = False,
+        background_cleanup: bool = False,
+    ) -> None:
+        self._config.rename_calls.append((src_path, dst_path))
+        super().rename(src_path, dst_path, is_directory, background_cleanup)
+
 
 class _ProbeStorageConfig(LocalFileSystemStorageConfig):
     def __init__(self, probe: _ConcurrencyProbe) -> None:
         super().__init__(use_direct_io=False)
         self.probe = probe
         self.mkdir_paths: list[Path] = []
+        self.rename_calls: list[tuple[Path, Path]] = []
 
     def create_storage(self) -> _ProbeStorage:
         return _ProbeStorage(self)
@@ -195,6 +206,7 @@ class TestCheckpointWriterConfig(TestCase):
         self.assertIsInstance(options.barrier_config, DefaultStoreBarrierConfig)
         self.assertEqual(options.file_write_max_threads, 1)
         self.assertEqual(options.temp_dir_prefix, DEFAULT_TEMP_DIR_PREFIX)
+        self.assertTrue(options.write_to_temp_dir)
 
     def test_custom_values(self):
         """Test that CheckpointWriterConfig can be initialized with custom values."""
@@ -213,10 +225,41 @@ class TestCheckpointWriterConfig(TestCase):
                 barrier_config=_NoopBarrierConfig(), temp_dir_prefix=""
             )
 
-    def test_empty_temp_dir_prefix_allowed_without_barrier(self):
-        """Test that the prefix is inert without a barrier (no temp dir is used)."""
-        options = CheckpointWriterConfig(barrier_config=None, temp_dir_prefix="")
+    def test_empty_temp_dir_prefix_allowed_when_writing_in_place(self):
+        """Test that the prefix is inert when no temp dir is used."""
+        options = CheckpointWriterConfig(
+            barrier_config=None, write_to_temp_dir=False, temp_dir_prefix=""
+        )
         self.assertEqual(options.temp_dir_prefix, "")
+
+    def test_write_in_place_keeps_the_barrier(self):
+        """Dropping the temp dir does not drop the coordination."""
+        options = CheckpointWriterConfig(write_to_temp_dir=False)
+        self.assertIsNotNone(options.barrier_config)
+        self.assertFalse(options.write_to_temp_dir)
+
+    def test_dropping_the_barrier_forces_writing_in_place(self):
+        """Warned and forced, not rejected, while callers are being migrated.
+
+        Nothing would ever rename the temp dir with no barrier to wait on, so
+        writing in place is what this combination has always silently done.
+        """
+        with self.assertLogs(
+            checkpoint_writer_module.__name__, level="WARNING"
+        ) as logs:
+            options = CheckpointWriterConfig(barrier_config=None)
+
+        self.assertFalse(options.write_to_temp_dir)
+        self.assertIn("write_to_temp_dir=False", "".join(logs.output))
+
+    def test_explicit_write_to_temp_dir_without_a_barrier_is_forced_off(self):
+        """Asking for it explicitly is warned about too, not honoured."""
+        with self.assertLogs(checkpoint_writer_module.__name__, level="WARNING"):
+            options = CheckpointWriterConfig(
+                barrier_config=None, write_to_temp_dir=True
+            )
+
+        self.assertFalse(options.write_to_temp_dir)
 
     def test_default_barrier_needs_nothing_of_a_single_rank_writer(self):
         """The default barrier has to be free to hold when there is nobody to meet."""
@@ -251,7 +294,9 @@ class TestCheckpointWriter(TestCase):
         # Most of these tests are about what reaches storage, so they opt out of the
         # barrier that would commit the write through a temporary directory. The
         # default is exercised by test_default_barrier_commits_through_a_temp_dir.
-        self.config = CheckpointWriterConfig(barrier_config=None)
+        self.config = CheckpointWriterConfig(
+            barrier_config=None, write_to_temp_dir=False
+        )
         self.mock_callback = MockCallback()
 
         # Create a test state dictionary
@@ -284,6 +329,9 @@ class TestCheckpointWriter(TestCase):
                     file_write_max_threads=file_write_max_threads,
                     barrier_config=barrier_config,
                     temp_dir_prefix=temp_dir_prefix,
+                    # These cases are about what reaches storage, so they stage
+                    # only when the caller asked for a barrier to commit behind.
+                    write_to_temp_dir=barrier_config is not None,
                 ),
                 rank_info=self.rank_info,
                 storage_config=storage_config,
@@ -491,6 +539,39 @@ class TestCheckpointWriter(TestCase):
         self.assertTrue(final_path.exists())
         self.assertFalse(tmp_path.exists())
 
+    def test_write_in_place_keeps_the_barrier_and_never_renames(self):
+        """``write_to_temp_dir=False`` writes at the final path under a barrier.
+
+        The rename must not fire. Renaming a directory onto itself looks
+        harmless on a POSIX filesystem, where it is a no-op, and destroys the
+        checkpoint on a backend that copies every object and then deletes the
+        source.
+        """
+        final_path = Path(self.temp_dir) / "checkpoint_0005000"
+        tmp_path = Path(self.temp_dir) / f"{DEFAULT_TEMP_DIR_PREFIX}checkpoint_0005000"
+        storage_config = _ProbeStorageConfig(_ConcurrencyProbe(1))
+        writer = CheckpointWriter(
+            CheckpointWriterArgs(
+                config=CheckpointWriterConfig(
+                    barrier_config=_NoopBarrierConfig(), write_to_temp_dir=False
+                ),
+                rank_info=self.rank_info,
+                storage_config=storage_config,
+                pre_finalize_callback=self.mock_callback.pre_finalize_callback,
+                finalize_callback=self.mock_callback.finalize_callback,
+            )
+        )
+        self.assertIsInstance(writer._barrier, _NoopBarrier)
+
+        writer.write(str(final_path), self._raw_checkpoint_info())
+
+        self.assertEqual(storage_config.rename_calls, [])
+        self.assertFalse(tmp_path.exists())
+        self.assertEqual((final_path / "first.bin").read_bytes(), b"first")
+        # Both hooks see the final path, because it is the only path there is.
+        self.assertEqual(self.mock_callback.pre_finalize_path, str(final_path))
+        self.assertEqual(self.mock_callback.finalize_path, str(final_path))
+
     def test_write_calls_callbacks(self):
         """Test that write calls the callbacks with correct parameters."""
         # Create writer with callbacks
@@ -544,13 +625,19 @@ class TestCheckpointWriter(TestCase):
 
         writer = CheckpointWriter(
             CheckpointWriterArgs(
-                config=self.config,
+                config=replace(
+                    self.config,
+                    barrier_config=_NoopBarrierConfig(),
+                    write_to_temp_dir=True,
+                ),
                 rank_info=self.rank_info,
                 storage_config=self.storage_config,
                 pre_finalize_callback=pre_finalize_callback,
                 finalize_callback=finalize_callback,
             )
         )
+        # The config is what puts the writer on the commit path; this barrier
+        # replaces the one it built only to record when the wait happened.
         barrier = mock.Mock()
         barrier.execute_barrier.side_effect = lambda _timeout: events.append("barrier")
         writer._barrier = barrier

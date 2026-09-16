@@ -201,6 +201,7 @@ class CheckpointWriterConfig:
         default_factory=DefaultStoreBarrierConfig
     )
     file_write_max_threads: int = 1
+    write_to_temp_dir: bool = True
 ```
 
 `DefaultStoreBarrierConfig` is the default because it costs nothing to hold: it
@@ -209,7 +210,7 @@ skips the store entirely (see §2 above) while still putting the writer on the
 commit path below. Opting out means `barrier_config=None`, which gives up the
 commit too.
 
-Inside `CheckpointWriter.write()` the ordering is:
+By default, inside `CheckpointWriter.write()` the ordering is:
 
 1. Write all shard files (and, on `role_rank == 0`, the metadata file) into a
    temporary directory.
@@ -221,18 +222,45 @@ Inside `CheckpointWriter.write()` the ordering is:
 5. Run `finalize_callback`.
 
 The temporary-directory-then-rename dance is what makes a checkpoint atomic:
-readers never observe a half-written directory. Note that the writer only uses a
-temp directory *when a barrier is configured* — without a barrier, files are
-written directly to the final path and no rename occurs.
+readers never observe a half-written directory.
+
+### Disabling the temporary directory
+
+`write_to_temp_dir` decides whether steps 1 and 4 above happen. It defaults to
+`True`; set it to `False` and every rank writes directly to the final path. The
+barrier and callbacks still run as above.
+
+This is for a backend where renaming a directory is NOT an atomic operation.
+For example, AWS S3 does not support this: a directory rename requires copying
+every file to its new home and then deleting the old ones, which is slow,
+expensive, and non-atomic.
+
+Choose this option if your `finalize_callback` implements some external
+mechanism for guaranteeing atomicity -- for example writing to a registry or
+adding a marker file.
+
+```python
+config = SyncCheckpointSaverConfig(
+    writer_config=CheckpointWriterConfig(write_to_temp_dir=False),
+)
+```
 
 ### Disabling the barrier
 
-Set `barrier_config=None`. The writer then skips both synchronization and the
-rename, writing directly to the final path — so a reader, or a job that dies
-mid-write, can find a checkpoint with only some of its files. Choose this only
-when nothing reads the path until the write is known to be complete; for a
+Set `barrier_config=None`, which also requires `write_to_temp_dir=False`: there
+is no rank to rename the temporary directory into place, so staging into one
+would strand the checkpoint there. The writer then skips both synchronization
+and the rename, writing directly to the final path — so a reader, or a job that
+dies mid-write, can find a checkpoint with only some of its files. Choose this
+only when nothing reads the path until the write is known to be complete; for a
 multi-rank save to shared storage, the barrier is what guarantees every shard is
 present before the checkpoint is published.
+
+**NOTE:** This option requires also setting `write_to_temp_dir=False`: without
+a barrier there is no safe way to know when to rename the temporary directory.
+Setting `barrier_config=None` and `write_to_temp_dir=True` issues a warning and
+force-sets `write_to_temp_dir` to `False`; this will become a hard error in a
+future version.
 
 ```python
 from torch_checkpointing.config import SyncCheckpointSaverConfig
@@ -240,7 +268,9 @@ from torch_checkpointing.checkpoint_writer import CheckpointWriterConfig
 
 # No barrier and no commit: files land at the final path as they are written
 config = SyncCheckpointSaverConfig(
-    writer_config=CheckpointWriterConfig(barrier_config=None),
+    writer_config=CheckpointWriterConfig(
+        barrier_config=None, write_to_temp_dir=False
+    ),
 )
 ```
 
@@ -659,6 +689,7 @@ altogether (identical save/load configuration on retry).
 | Rank identity | `RankInfo`, `_get_default_rank_info()` | `types.py`, `builder.py` |
 | Cross-rank coordination | `BarrierConfig`, `DefaultStoreBarrierConfig` (the default), `TCPStoreBarrierConfig` | `barriers.py` |
 | Disable coordination *and* the atomic commit | `CheckpointWriterConfig(barrier_config=None)` | `checkpoint_writer.py` |
+| Keep coordination, drop the temp dir | `CheckpointWriterConfig(write_to_temp_dir=False)` | `checkpoint_writer.py` |
 | Finalize hooks | `pre_finalize_callback`, `finalize_callback` | `builder.py`, `checkpoint_writer.py` |
 | Metadata pipeline | `MetadataManager`, `DefaultMetadataManager` | `metadata_manager.py` |
 | Metadata payload | `CheckpointMetadata`, `DistributedMetadata`, `DistributedItemMetadata` | `distributed_metadata.py` |
