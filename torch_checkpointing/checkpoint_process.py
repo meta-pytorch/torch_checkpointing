@@ -22,7 +22,7 @@ import torch.multiprocessing as mp
 from torch.multiprocessing.spawn import ProcessExitedException
 
 from .checkpoint_base import CheckpointWriteInfo
-from .checkpoint_writer import CheckpointWriterArgs
+from .checkpoint_writer import CheckpointWriter, CheckpointWriterArgs
 from .logging_utils import (
     checkpoint_logging_context,
     dict_to_list_safe,
@@ -209,10 +209,12 @@ class CheckpointProcess:
         set_thread_name_safe(f"{thread_name_prefix}-proc-{rank_info.global_rank}")
 
         assert sub_rank == 0, "We need only one checkpointer per parent training"
-        request = WorkerRequest(request_type=RequestType.PING, payload={})
+        # Only the type is kept across iterations, for the error path below. The
+        # request itself must not outlive the iteration that serves it.
+        request_type = RequestType.PING
 
         # Cache for serialized metadata - once received, reuse for subsequent writes
-        cached_serialized_metadata: bytes | None = None
+        metadata_cache: list[bytes | None] = [None]
 
         try:
             event_logger = EventLogger()
@@ -235,7 +237,8 @@ class CheckpointProcess:
                 ),
             )
 
-            while True:
+            should_terminate = False
+            while not should_terminate:
                 logger.info(
                     f"Waiting for a checkpoint request for sub rank {sub_rank}",
                     extra=event_logger(EventType.CHECKPOINT_WAIT_FOR_REQUEST),
@@ -251,78 +254,25 @@ class CheckpointProcess:
                     )
                     break
 
-                log_ctx = request.payload.get(PAYLOAD_KEY_LOGGING_CONTEXT)
-                if log_ctx is not None:
-                    checkpoint_logging_context.import_context(log_ctx)
-
-                if request.request_type == RequestType.PING:
-                    parent_pipe.send(
-                        WorkerResponse(request_type=RequestType.PING, success=True)
+                request_type = request.request_type
+                response = None
+                try:
+                    response = CheckpointProcess._subprocess_handle_request(
+                        request=request,
+                        checkpoint_writer=checkpoint_writer,
+                        metadata_cache=metadata_cache,
+                        event_logger=event_logger,
+                        metric_prefix=metric_prefix,
                     )
-                elif request.request_type == RequestType.WRITE_CHECKPOINT:
-                    path = request.payload[PAYLOAD_KEY_PATH]
-                    step = checkpoint_logging_context.get("step")
-                    logger.info(
-                        f"(step {step}) Writing checkpoint to {path}",
-                        extra=event_logger(EventType.CHECKPOINT_WRITE_START),
+                    parent_pipe.send(response)
+                    should_terminate = (
+                        response.request_type == RequestType.TERMINATE_PROCESS
                     )
-
-                    checkpoint_info: CheckpointWriteInfo = request.payload[
-                        PAYLOAD_KEY_CHECKPOINT_INFO
-                    ]
-
-                    # Cache serialized metadata on first write that has it
-                    if (
-                        cached_serialized_metadata is None
-                        and checkpoint_info.serialized_distributed_metadata is not None
-                    ):
-                        cached_serialized_metadata = (
-                            checkpoint_info.serialized_distributed_metadata
-                        )
-                        logger.debug(
-                            "Cached serialized_distributed_metadata for subsequent writes"
-                        )
-                    checkpoint_info = checkpoint_info.for_writes(
-                        cached_serialized_metadata
-                    )
-
-                    writer_event_logger = EventLogger()
-                    write_started_ns = time.perf_counter_ns()
-                    checkpoint_writer.write(
-                        path=path,
-                        checkpoint_info=checkpoint_info,
-                    )
-                    write_elapsed_ms = (
-                        time.perf_counter_ns() - write_started_ns
-                    ) / 1_000_000
-                    logger.info(
-                        f"(step {step}) Checkpoint written successfully to {path}",
-                        extra=event_logger(EventType.CHECKPOINT_WRITE_END),
-                    )
-                    logger.info(
-                        "Checkpoint subprocess writer completed",
-                        extra=writer_event_logger(
-                            EventType.LOG_METRIC,
-                            metric_name=f"{metric_prefix}.execute.subprocess_writer.latency_ms",
-                            value=write_elapsed_ms,
-                            context=dict_to_list_safe({"checkpoint_path": path}),
-                        ),
-                    )
-                    parent_pipe.send(
-                        WorkerResponse(RequestType.WRITE_CHECKPOINT, success=True)
-                    )
-                elif request.request_type == RequestType.TERMINATE_PROCESS:
-                    logger.debug("Received termination request.")
-                    parent_pipe.send(
-                        WorkerResponse(RequestType.TERMINATE_PROCESS, success=True)
-                    )
-                    logger.info("Subprocess terminated gracefully")
-                    break
-                else:
-                    error_msg = f"Unknown request type: {request.request_type}"
-                    logger.error(error_msg)
-                    raise ValueError(error_msg)
-
+                finally:
+                    # Drop the request before blocking on the next one so that
+                    # shared memory can be freed.
+                    del request, response
+            logger.info("Subprocess terminated gracefully")
         except Exception as e:
             error_text = traceback.format_exc()
             logger.error(f"Exception in subprocess  ({type(e).__name__}): {error_text}")
@@ -330,13 +280,78 @@ class CheckpointProcess:
             # Communicating exception via the queue to the main process
             parent_pipe.send(
                 WorkerResponse(
-                    request_type=request.request_type,
+                    request_type=request_type,
                     success=False,
                     error_msg=error_text,
                 )
             )
             parent_pipe.close()
             logger.error(f"Subprocess terminated due to exception: {e}")
+
+    @staticmethod
+    def _subprocess_handle_request(
+        request: WorkerRequest,
+        checkpoint_writer: CheckpointWriter,
+        metadata_cache: list[bytes | None],
+        event_logger: EventLogger,
+        metric_prefix: str,
+    ) -> WorkerResponse:
+        """Handle one request, returning the response."""
+        log_ctx = request.payload.get(PAYLOAD_KEY_LOGGING_CONTEXT)
+        if log_ctx is not None:
+            checkpoint_logging_context.import_context(log_ctx)
+
+        if request.request_type == RequestType.PING:
+            return WorkerResponse(request_type=RequestType.PING, success=True)
+        if request.request_type == RequestType.TERMINATE_PROCESS:
+            logger.debug("Received termination request.")
+            return WorkerResponse(RequestType.TERMINATE_PROCESS, success=True)
+        if request.request_type != RequestType.WRITE_CHECKPOINT:
+            error_msg = f"Unknown request type: {request.request_type}"
+            logger.error(error_msg)
+            raise ValueError(error_msg)
+
+        path = request.payload[PAYLOAD_KEY_PATH]
+        step = checkpoint_logging_context.get("step")
+        logger.info(
+            f"(step {step}) Writing checkpoint to {path}",
+            extra=event_logger(EventType.CHECKPOINT_WRITE_START),
+        )
+
+        checkpoint_info: CheckpointWriteInfo = request.payload[
+            PAYLOAD_KEY_CHECKPOINT_INFO
+        ]
+
+        # Cache serialized metadata on first write that has it
+        if (
+            metadata_cache[0] is None
+            and checkpoint_info.serialized_distributed_metadata is not None
+        ):
+            metadata_cache[0] = checkpoint_info.serialized_distributed_metadata
+            logger.debug("Cached serialized_distributed_metadata for subsequent writes")
+        checkpoint_info = checkpoint_info.for_writes(metadata_cache[0])
+
+        writer_event_logger = EventLogger()
+        write_started_ns = time.perf_counter_ns()
+        checkpoint_writer.write(
+            path=path,
+            checkpoint_info=checkpoint_info,
+        )
+        write_elapsed_ms = (time.perf_counter_ns() - write_started_ns) / 1_000_000
+        logger.info(
+            f"(step {step}) Checkpoint written successfully to {path}",
+            extra=event_logger(EventType.CHECKPOINT_WRITE_END),
+        )
+        logger.info(
+            "Checkpoint subprocess writer completed",
+            extra=writer_event_logger(
+                EventType.LOG_METRIC,
+                metric_name=f"{metric_prefix}.execute.subprocess_writer.latency_ms",
+                value=write_elapsed_ms,
+                context=dict_to_list_safe({"checkpoint_path": path}),
+            ),
+        )
+        return WorkerResponse(RequestType.WRITE_CHECKPOINT, success=True)
 
     def _send(self, request_type: RequestType, payload: dict[str, Any]) -> None:
         # Attach checkpoint logging context to every request so the subprocess

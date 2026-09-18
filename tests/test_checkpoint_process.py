@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 
+import gc
 import os
 import tempfile
 import time
@@ -645,6 +646,91 @@ class TestCheckpointProcess(TestCase):
         # join() returns True if all processes joined successfully, False on timeout
         self.assertTrue(checkpoint_process.process.join(timeout=10))
         self.assertEqual(checkpoint_process.process.processes[0].exitcode, 0)
+
+    def test_serving_a_request_releases_its_shared_memory(self) -> None:
+        """The subprocess must not hold onto references to the payload after it is finished
+        writing and waiting for the next request. Shared tensors must get freed if the
+        parent process drops them.
+        """
+        payload_mib = 256
+        n_tensors = 8
+        rank_info = RankInfo(
+            global_world_size=1, global_rank=0, role_rank=0, role_world_size=1
+        )
+        checkpoint_process = CheckpointProcess(
+            rank_info=rank_info,
+            config=CheckpointProcessConfig(subprocess_init_timeout_secs=60),
+            subprocess_init_fn=subprocess_init_fn,
+            subprocess_init_args=("test-checkpointer", os.getpid()),
+            checkpoint_writer_args=CheckpointWriterArgs(
+                config=CheckpointWriterConfig(),
+                rank_info=rank_info,
+                storage_config=LocalFileSystemStorageConfig(),
+            ),
+        )
+        try:
+            checkpoint_process._creation_future.result()
+            child_pid = checkpoint_process.process.processes[0].pid
+            try:
+                baseline = _rss_mib(child_pid)
+            except Exception as e:
+                self.skipTest(
+                    f"Could not measure RSS of the child process; it currently only works on Linux. {e!r}"
+                )
+
+            tensors = [
+                torch.zeros(
+                    payload_mib * 1024**2 // n_tensors // 4, dtype=torch.float32
+                ).share_memory_()
+                for _ in range(n_tensors)
+            ]
+
+            info = CheckpointWriteInfo(
+                checkpoint_items={
+                    f"t{i}": CheckpointItem(value=tensor, layout=None)
+                    for i, tensor in enumerate(tensors)
+                }
+            )
+            with tempfile.TemporaryDirectory() as tmpdir:
+                write_fut = checkpoint_process.write(
+                    checkpoint_info=info, path=os.path.join(tmpdir, "ckpt")
+                )
+
+                mem_hi = _rss_mib(child_pid) - baseline
+                del info
+                del tensors
+                gc.collect()
+
+                # We expect the child process RSS to increase by about payload_mib when
+                # the shared tensors get mapped and then drop back down to baseline when
+                # they are released. Leave some wiggle room.
+                upper_threshold = payload_mib * 0.75
+                lower_threshold = payload_mib * 0.25
+                deadline = time.monotonic() + 30
+                while time.monotonic() < deadline:
+                    retained = _rss_mib(child_pid) - baseline
+                    mem_hi = max(mem_hi, retained)
+                    if mem_hi > upper_threshold and retained < lower_threshold:
+                        break
+                    time.sleep(0.05)
+
+                assert mem_hi > upper_threshold, (
+                    f"Expected to see a memory spike of {payload_mib} MiB but only saw {mem_hi} MiB"
+                )
+                assert retained < lower_threshold, (
+                    f"Expected memory to be freed, but still holding onto {retained} MiB"
+                )
+                write_fut.result()  # Assert no throw
+        finally:
+            checkpoint_process.close()
+
+
+def _rss_mib(pid: int) -> float:
+    with open(f"/proc/{pid}/status") as status:
+        for line in status:
+            if line.startswith("VmRSS:"):
+                return int(line.split()[1]) / 1024
+    raise RuntimeError(f"no VmRSS for pid {pid}")
 
 
 if __name__ == "__main__":
