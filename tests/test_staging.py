@@ -370,6 +370,32 @@ class TestDefaultStager(TestCase):
         # Close and verify cleanup
         stager.close()
 
+    def test_staging_an_empty_state_dict_frees_the_pool(self) -> None:
+        """Staging an empty dict drops all memory in the storage pool."""
+        options = CheckpointStagerConfig(
+            use_async_staging=False,
+            use_pinned_memory=torch.accelerator.is_available(),
+        )
+        stager = DefaultStager(options)
+        storage_manager = stager._state_dict_stager._storage_manager
+
+        stager.stage(self.state_dict)
+        self.assertIsNotNone(stager.get_staged_state_dict())
+        self.assertGreater(storage_manager.total_num_bytes(), 0)
+
+        stager.stage({})
+
+        self.assertEqual(storage_manager.total_num_bytes(), 0)
+        # The staged dict is dropped too, so no references are held
+        self.assertEqual(stager.get_staged_state_dict(), {})
+
+        # Unlike close(), the stager still works and the pool reallocates.
+        staged = stager.stage(self.state_dict)
+        self.assertIsInstance(staged, dict)
+        self.assertGreater(storage_manager.total_num_bytes(), 0)
+
+        stager.close()
+
     def test_multiple_staging_operations(self) -> None:
         """Test multiple staging operations with the same stager."""
         options = CheckpointStagerConfig(
