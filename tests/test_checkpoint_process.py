@@ -336,6 +336,61 @@ class TestCheckpointProcess(TestCase):
             )
         )
 
+    def test_write_reuses_serialized_metadata_on_subsequent_requests(self) -> None:
+        """Serialized metadata from the first write is reused for later writes."""
+        first_info = self._build_checkpoint_info(self.test_state_dict)
+        first_info.serialized_distributed_metadata = b"cached-metadata"
+
+        second_info = self._build_checkpoint_info(self.test_state_dict)
+        self.assertIsNone(second_info.serialized_distributed_metadata)
+
+        third_info = self._build_checkpoint_info(self.test_state_dict)
+        third_info.serialized_distributed_metadata = b"other-metadata"
+
+        requests = [
+            WorkerRequest(
+                request_type=RequestType.WRITE_CHECKPOINT,
+                payload={
+                    "path": f"/checkpoint/step_{i}",
+                    "checkpoint_info": info,
+                },
+            )
+            for i, info in enumerate([first_info, second_info, third_info], start=1)
+        ]
+        requests.append(
+            WorkerRequest(
+                request_type=RequestType.TERMINATE_PROCESS,
+                payload={},
+            )
+        )
+
+        parent_pipe = mock.Mock()
+        parent_pipe.recv.side_effect = requests
+        writer = mock.Mock()
+        writer_args = mock.Mock()
+        writer_args.build.return_value = writer
+
+        CheckpointProcess._subprocess(
+            0,
+            self.rank_info,
+            parent_pipe,
+            lambda: None,
+            (),
+            writer_args,
+            "ckpt",
+            "test.checkpoint_write",
+        )
+
+        self.assertEqual(writer.write.call_count, 3)
+        for call in writer.write.call_args_list:
+            written_info = call.kwargs["checkpoint_info"]
+            self.assertEqual(
+                written_info.serialized_distributed_metadata, b"cached-metadata"
+            )
+        # Originals are unchanged; reuse happens via the subprocess cache.
+        self.assertIsNone(second_info.serialized_distributed_metadata)
+        self.assertEqual(third_info.serialized_distributed_metadata, b"other-metadata")
+
     def test_checkpoint_process_keeps_the_barrier_scope_until_close(self) -> None:
         with mock.patch.object(
             DefaultStoreBarrierConfig, "use_in_subprocess"
