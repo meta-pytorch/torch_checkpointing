@@ -241,10 +241,18 @@ class CheckpointWriter:
             extra=event_logger(EventType.CHECKPOINT_SAVED_TMP),
         )
 
-        # Execute pre-finalize callback if available
         if self._args.pre_finalize_callback is not None:
             logger.debug(f"Executing pre-finalize callback for {tmp_dir_path}")
+            pre_finalize_event_logger = EventLogger()
             self._args.pre_finalize_callback(str(tmp_dir_path), event_logger)
+            logger.info(
+                "Pre-finalize callback duration",
+                extra=pre_finalize_event_logger(
+                    EventType.LOG_METRIC,
+                    metric_name=f"{self._metric_prefix}.execute.pre_finalize.latency_ms",
+                    end_to_end=True,
+                ),
+            )
 
         # Wait for all ranks to finish writing if barrier is available
         if self._barrier is not None:
