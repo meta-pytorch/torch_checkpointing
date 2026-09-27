@@ -98,6 +98,9 @@ class CheckpointProcess:
         checkpoint_writer_args: CheckpointWriterArgs,
     ):
         self._executor = ThreadPoolExecutor(max_workers=1)
+        # Torch ties the subprocess death signal to its spawning thread. Keep that
+        # thread alive while the communication executor drains and cancels writes.
+        self._creation_executor = ThreadPoolExecutor(max_workers=1)
         self._rank_info = rank_info
         self._config = config
         self._subprocess_init_fn = subprocess_init_fn
@@ -117,7 +120,7 @@ class CheckpointProcess:
             # Use more efficient protocol 5 if available
             self._pickle_protocol = 5
 
-        self._creation_future: Future[None] | None = self._executor.submit(
+        self._creation_future: Future[None] | None = self._creation_executor.submit(
             self._create_subprocess,
             config,
         )
@@ -505,7 +508,10 @@ class CheckpointProcess:
         try:
             self._shutdown_subprocess()
         finally:
-            self._barrier_scope.close()
+            try:
+                self._creation_executor.shutdown(wait=True, cancel_futures=True)
+            finally:
+                self._barrier_scope.close()
 
     def _shutdown_subprocess(self) -> None:
         logger.info(
@@ -513,6 +519,17 @@ class CheckpointProcess:
         )
         self._closed = True
         self._executor.shutdown(wait=True, cancel_futures=True)
+        creation_future = self._creation_future
+        if creation_future is not None and not creation_future.cancel():
+            # Wait for in-flight initialization without re-raising its error, as
+            # executor shutdown did previously; a partially started child still
+            # needs cleanup before its spawning thread can exit.
+            creation_error = creation_future.exception()
+            if creation_error is not None:
+                logger.warning(
+                    "Checkpoint process initialization failed during shutdown: "
+                    f"{creation_error!r}"
+                )
 
         if self.process is None:
             logger.warning("Checkpoint process did not start, skipping termination!")

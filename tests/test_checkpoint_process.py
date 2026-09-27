@@ -8,6 +8,7 @@
 import gc
 import os
 import tempfile
+import threading
 import time
 from concurrent.futures import Future
 from typing import Any
@@ -540,6 +541,34 @@ class TestCheckpointProcess(TestCase):
         self.assertTrue(checkpoint_process.process.processes[0].is_alive())
         checkpoint_process.close()
         self.assertFalse(checkpoint_process.process.processes[0].is_alive())
+
+    def test_spawning_thread_outlives_the_child(self) -> None:
+        # torch.multiprocessing.spawn ties the child's death signal to the thread
+        # that spawned it, so that thread must stay alive until the child exits.
+        original = CheckpointProcess._create_subprocess
+        spawning_threads = []
+
+        def create_subprocess(process, config):
+            spawning_threads.append(threading.current_thread())
+            return original(process, config)
+
+        with mock.patch.object(
+            CheckpointProcess, "_create_subprocess", create_subprocess
+        ):
+            checkpoint_process = self._create_checkpoint_process()
+            checkpoint_process.wait_for_init()
+        context = checkpoint_process.process
+        join = context.join
+        alive_at_join = []
+
+        def recording_join(timeout=None):
+            alive_at_join.append(spawning_threads[0].is_alive())
+            return join(timeout)
+
+        context.join = recording_join
+        checkpoint_process.close()
+        self.assertEqual(alive_at_join, [True])
+        self.assertFalse(context.processes[0].is_alive())
 
     def test_forced_termination(self) -> None:
         """Test forced termination when graceful termination fails."""
