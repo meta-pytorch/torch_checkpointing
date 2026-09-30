@@ -470,7 +470,7 @@ class TestDefaultStager(TestCase):
 
                 # Stage the state dict
                 staged_dict = stager.stage(state_dict)
-                assert isinstance(staged_dict, dict)
+                assert not isinstance(staged_dict, Future)
                 staged_dicts.append(staged_dict)
 
                 # Check pinning behavior for this iteration only
@@ -652,6 +652,39 @@ def test_default_stager_copies_run_on_side_stream(tmp_path: Path) -> None:
         assert len(dtoh_streams) == 1
         assert dtoh_streams.isdisjoint(compute_streams)
     finally:
+        stager.close()
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 GPUs")
+@pytest.mark.gpus_needed_2
+@pytest.mark.parametrize("use_async_staging", [False, True])
+def test_default_stager_waits_for_its_device_when_called_from_another_thread(
+    use_async_staging: bool,
+) -> None:
+    with torch.cuda.device(1):
+        stager = DefaultStager(
+            CheckpointStagerConfig(
+                use_async_staging=use_async_staging,
+                use_pinned_memory=True,
+                use_shared_memory=False,
+                use_non_blocking_copy=True,
+            )
+        )
+        value = torch.zeros(1024, device="cuda")
+        # Allocate the pinned destination before delaying the source GPU.
+        ensure_future(stager.stage({"value": value})).result()
+        torch.cuda.synchronize()
+        torch.cuda._sleep(2_000_000_000)
+        value.fill_(1.0)
+    try:
+        # A fresh thread's current device is 0, not the stager's device.
+        with ThreadPoolExecutor(max_workers=1) as caller:
+            staged = caller.submit(stager.stage, {"value": value}).result()
+        torch.testing.assert_close(
+            ensure_future(staged).result()["value"], torch.ones(1024), rtol=0, atol=0
+        )
+    finally:
+        torch.cuda.synchronize(1)
         stager.close()
 
 

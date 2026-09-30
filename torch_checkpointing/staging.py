@@ -28,14 +28,13 @@ from collections.abc import Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import nullcontext
 from dataclasses import dataclass, field
-from typing import TypeVar
+from typing import Any, TypeVar
 
 import torch
 
 from ._pin_memory_utils import can_pin_memory
 from ._state_dict_stager import StateDictStager
 from .logging_utils import EventLogger, EventType
-from .types import STATE_DICT
 from .utils import set_thread_name_safe
 
 T = TypeVar("T")
@@ -58,28 +57,28 @@ class CheckpointStager(abc.ABC):
     @abc.abstractmethod
     def stage(
         self,
-        state_dict: STATE_DICT,
+        state_dict: T,
         keys_not_requiring_copy: Sequence[str] = (),
-    ) -> STATE_DICT | Future[STATE_DICT]:
+    ) -> T | Future[T]:
         """
-        Stage a state dictionary for checkpointing.
+        Stage a deepcopy-able payload for checkpointing.
 
         Args:
-            state_dict: The state dictionary to stage
+            state_dict: The deepcopy-able payload to stage, preserving its type.
             keys_not_requiring_copy: Top-level keys of ``state_dict`` that do
                 NOT need to be copied during staging. Their values are passed
                 through unaffected (same object) into the returned state
-                dictionary. Defaults to staging all keys.
+                dictionary. Requires a copyable mapping payload. Defaults to
+                staging the entire payload.
 
         Returns:
-            Either a staged state dictionary (synchronous) or a Future
-            that will resolve to the staged state dictionary (asynchronous).
-            The returned dict always contains all keys of ``state_dict``.
+            Either a staged payload (synchronous) or a Future resolving to it
+            (asynchronous). Mapping payloads retain all original keys.
         """
 
     @abc.abstractmethod
-    def get_staged_state_dict(self) -> STATE_DICT | None:
-        """Return the most recently staged state dict, if any."""
+    def get_staged_state_dict(self) -> object | None:
+        """Return the most recently staged payload, if any."""
 
     @abc.abstractmethod
     def close(self) -> None:
@@ -204,7 +203,7 @@ class DefaultStager(CheckpointStager):
             share_memory=config.use_shared_memory,
             use_non_blocking_copy=config.use_non_blocking_copy,
         )
-        self._staged_state_dict: STATE_DICT | None = None
+        self._staged_state_dict: object | None = None
         self._staging_executor: ThreadPoolExecutor | None = None
         self._owns_staging_executor = False
         self._staging_stream: torch.Stream | None = None
@@ -261,10 +260,10 @@ class DefaultStager(CheckpointStager):
 
     def _stage_on_worker(
         self,
-        state_dict: STATE_DICT,
+        state_dict: T,
         current_stream_ready: torch.Event | None,
         keys_not_requiring_copy: Sequence[str],
-    ) -> STATE_DICT:
+    ) -> T:
         self._init_worker_thread()
         return self._stage(
             state_dict,
@@ -274,15 +273,17 @@ class DefaultStager(CheckpointStager):
 
     def stage(
         self,
-        state_dict: STATE_DICT,
+        state_dict: T,
         keys_not_requiring_copy: Sequence[str] = (),
-    ) -> STATE_DICT | Future[STATE_DICT]:
+    ) -> T | Future[T]:
         if self._accelerator_available:
             # If staging runs on a separate stream, we need to have that stream wait
             # for all operations on the current stream (e.g. optimiser step) to finish.
-            # This event lets us know when we are ready.
-            current_stream_ready = torch.Event(enable_timing=True)
-            current_stream_ready.record()
+            # Both sync and async staging use the device selected at construction,
+            # including when submitted from a thread with a different current device.
+            with torch.cuda.device(self._cuda_device):
+                current_stream_ready = torch.Event(enable_timing=True)
+                current_stream_ready.record(torch.accelerator.current_stream())
         else:
             current_stream_ready = None
 
@@ -311,10 +312,10 @@ class DefaultStager(CheckpointStager):
 
     def _stage(
         self,
-        state_dict: STATE_DICT,
+        state_dict: Any,
         current_stream_ready: torch.Event | None,
         keys_not_requiring_copy: Sequence[str] = (),
-    ) -> STATE_DICT:
+    ) -> Any:
         event_logger = EventLogger()
         logger.info(
             "Initiating checkpoint staging",
@@ -335,7 +336,10 @@ class DefaultStager(CheckpointStager):
 
         if self._accelerator_available:
             assert current_stream_ready is not None
-            with self._staging_stream or nullcontext():
+            with (
+                torch.cuda.device(self._cuda_device),
+                self._staging_stream or nullcontext(),
+            ):
                 # Block GPU until the main stream is done with all operations.
                 # This does NOT block CPU.
                 current_stream_ready.wait()
@@ -381,7 +385,7 @@ class DefaultStager(CheckpointStager):
         self._staged_state_dict = staged_state_dict
         return staged_state_dict
 
-    def get_staged_state_dict(self) -> STATE_DICT | None:
+    def get_staged_state_dict(self) -> object | None:
         return self._staged_state_dict
 
     def pinned_num_bytes(self) -> int:

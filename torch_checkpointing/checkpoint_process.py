@@ -93,7 +93,7 @@ class CheckpointProcess:
         self,
         rank_info: RankInfo,
         config: CheckpointProcessConfig,
-        subprocess_init_fn: Callable[[Any], None],
+        subprocess_init_fn: Callable[..., None],
         subprocess_init_args: tuple[Any, ...],
         checkpoint_writer_args: CheckpointWriterArgs,
     ):
@@ -200,7 +200,7 @@ class CheckpointProcess:
         sub_rank: int,
         rank_info: RankInfo,
         parent_pipe: Connection,
-        subprocess_init_fn: Callable[[Any], None],
+        subprocess_init_fn: Callable[..., None],
         subprocess_init_args: tuple[Any, ...],
         checkpoint_writer_args: CheckpointWriterArgs,
         thread_name_prefix: str = "ckpt",
@@ -425,19 +425,32 @@ class CheckpointProcess:
         # step) so the comm thread sees the step that was set at submission
         # time, not whatever the trainer updates it to later.
         ctx = contextvars.copy_context()
-        write_future = self._executor.submit(
-            ctx.run,
-            self._write,
-            checkpoint_info,
-            path,
-        )
-        logger.info(
-            "Submitted executor",
-            extra=event_logger(
+        submission_metadata: Future[dict[str, Any]] = Future()
+
+        def write_with_submission_log() -> None:
+            # A failed submission must not read a payload whose owner has unwound.
+            metadata = submission_metadata.result()
+            try:
+                logger.info("Submitted executor", extra=metadata)
+            finally:
+                self._write(checkpoint_info, path)
+
+        try:
+            write_future = self._executor.submit(ctx.run, write_with_submission_log)
+        except BaseException as error:
+            submission_metadata.set_exception(error)
+            raise
+        try:
+            # Submission latency excludes time queued behind earlier writes.
+            metadata = event_logger(
                 EventType.LOG_METRIC,
                 metric_name=f"{self._metric_prefix}.submit.executor_submit.latency_ms",
-            ),
-        )
+            )
+        except BaseException as error:  # noqa: B036 - write_future raises this error.
+            # Return the future so the caller retains its staging-buffer ownership.
+            submission_metadata.set_exception(error)
+        else:
+            submission_metadata.set_result(metadata)
         return write_future
 
     def _write(
@@ -456,6 +469,7 @@ class CheckpointProcess:
         )
 
         # Wait for checkpoint_info Future to be available
+        ckpt_info: CheckpointWriteInfo
         if isinstance(checkpoint_info, Future):
             logger.debug("Waiting for checkpoint_info Future to resolve")
             ckpt_info = checkpoint_info.result()

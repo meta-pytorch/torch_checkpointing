@@ -7,14 +7,18 @@
 import threading
 from concurrent.futures import Future
 from typing import Any, Mapping
+from unittest import mock
 from unittest.mock import Mock
 
 import pytest
 import torch
+from torch_checkpointing import checkpoint_process as process_module
 from torch_checkpointing.checkpoint_base import CheckpointBase, CheckpointItem
 from torch_checkpointing.checkpoint_saver import AsyncCheckpointSaver
 from torch_checkpointing.lock import RWLock, RWLockMode
 from torch_checkpointing.staging import CheckpointStagerConfig, DefaultStager
+
+from .checkpoint_process_test_support import make_detached_checkpoint_process
 
 
 class _MiniCheckpoint(CheckpointBase):
@@ -266,3 +270,90 @@ def test_stage_stages_only_copy_required_items():
         assert staged["not_copied"] is not_copied
     finally:
         stager.close()
+
+
+@pytest.mark.parametrize("failure", ["submit", "metadata", "logging"])
+def test_submission_failure_preserves_saver_ownership(failure: str) -> None:
+    started = threading.Event()
+    release = threading.Event()
+    captured = []
+    error = ValueError(failure)
+    real_events = process_module.EventLogger
+
+    class FailSubmissionMetadata:
+        def __init__(self):
+            self.events = real_events()
+
+        def __call__(self, *args, **kwargs):
+            if failure == "metadata" and kwargs.get("metric_name", "").endswith(
+                ".submit.executor_submit.latency_ms"
+            ):
+                raise error
+            return self.events(*args, **kwargs)
+
+    def emit(message, *args, **kwargs):
+        if failure == "logging" and message == "Submitted executor":
+            raise error
+
+    def send(*, request_type, payload):
+        assert request_type == process_module.RequestType.WRITE_CHECKPOINT
+        started.set()
+        assert release.wait(5)
+        captured.append(
+            payload[process_module.PAYLOAD_KEY_CHECKPOINT_INFO]
+            .checkpoint_items["t"]
+            .value.clone()
+        )
+
+    stager = DefaultStager(
+        CheckpointStagerConfig(
+            use_async_staging=False,
+            use_pinned_memory=False,
+            use_shared_memory=True,
+            use_non_blocking_copy=False,
+        )
+    )
+    process = make_detached_checkpoint_process()
+    saver = AsyncCheckpointSaver(stager, process)
+    submit = process._executor.submit
+
+    def submit_then_raise(*args, **kwargs):
+        submit(*args, **kwargs)
+        raise error
+
+    try:
+        with (
+            mock.patch.object(process_module, "EventLogger", FailSubmissionMetadata),
+            mock.patch.object(process_module.logger, "info", emit),
+            mock.patch.object(process, "_send", send),
+            mock.patch.object(process, "_recv", return_value={}),
+            mock.patch.object(process._executor, "submit", wraps=submit) as submission,
+        ):
+            if failure == "submit":
+                submission.side_effect = submit_then_raise
+                with pytest.raises(ValueError) as raised:
+                    saver.save("/first", _MiniCheckpoint())
+            else:
+                _, future = saver.save("/first", _MiniCheckpoint())
+                if failure == "logging":
+                    assert started.wait(5)
+                    assert saver.staging_lock.locked_mode() is RWLockMode.READ
+                    assert not saver.staging_lock.write.acquire(blocking=False)
+                release.set()
+                with pytest.raises(ValueError) as raised:
+                    future.result(timeout=5)
+            assert raised.value is error
+            release.set()
+            submit(lambda: None).result(timeout=5)
+            assert saver.staging_lock.locked_mode() is None
+            saver.stage(_MiniCheckpoint()).result(timeout=5)["t"].fill_(9.0)
+            submit(lambda: None).result(timeout=5)
+            if failure == "logging":
+                assert len(captured) == 1
+                assert torch.equal(captured[0], torch.zeros(2))
+            else:
+                assert not started.is_set()
+                assert not captured
+    finally:
+        release.set()
+        saver.close()

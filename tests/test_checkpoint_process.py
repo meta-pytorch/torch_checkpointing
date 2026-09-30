@@ -10,10 +10,12 @@ import os
 import tempfile
 import threading
 import time
+from collections.abc import Iterator
 from concurrent.futures import Future
 from typing import Any
 from unittest import mock
 
+import pytest
 import torch
 from torch.multiprocessing.spawn import ProcessExitedException
 from torch.testing._internal.common_utils import run_tests, TestCase
@@ -30,8 +32,59 @@ from torch_checkpointing.checkpoint_writer import (
     CheckpointWriterArgs,
     CheckpointWriterConfig,
 )
+from torch_checkpointing.logging_utils import checkpoint_logging_context
 from torch_checkpointing.storage.filesystem import LocalFileSystemStorageConfig
 from torch_checkpointing.types import RankInfo
+
+from .checkpoint_process_test_support import make_detached_checkpoint_process
+
+
+@pytest.fixture
+def communication_thread() -> Iterator[tuple[CheckpointProcess, mock.MagicMock]]:
+    context = checkpoint_logging_context.export_context()
+    with mock.patch.object(CheckpointProcess, "_write") as write:
+        process = make_detached_checkpoint_process()
+        try:
+            yield process, write
+        finally:
+            process.close()
+            checkpoint_logging_context.import_context(context)
+
+
+def test_submission_log_retains_timing_and_context(communication_thread) -> None:
+    process, write = communication_thread
+    release = threading.Event()
+    process._executor.submit(release.wait, 5)
+    records = []
+
+    def emit(message, *, extra):
+        records.append(
+            (threading.get_ident(), checkpoint_logging_context.get("step"), extra)
+        )
+
+    with (
+        mock.patch("torch_checkpointing.checkpoint_process.logger.info", emit),
+        mock.patch(
+            "torch_checkpointing.logging_utils.time.time", return_value=100
+        ) as clock,
+    ):
+        checkpoint_logging_context.update(step=51)
+        info = CheckpointWriteInfo(checkpoint_items={})
+        try:
+            future = process.write(info, "/checkpoint")
+            checkpoint_logging_context.update(step=52)
+            clock.return_value = 101
+            assert not records
+        finally:
+            release.set()
+        future.result(timeout=5)
+
+    [(thread_id, step, metadata)] = records
+    assert thread_id != threading.get_ident()
+    assert step == metadata["step"] == 51
+    assert metadata["value"] == 0
+    assert metadata["metric_name"].endswith(".submit.executor_submit.latency_ms")
+    write.assert_called_once_with(info, "/checkpoint")
 
 
 def subprocess_init_fn(name: str, parent_pid: int) -> None:
@@ -753,7 +806,9 @@ class TestCheckpointProcess(TestCase):
             ),
         )
         try:
+            assert checkpoint_process._creation_future is not None
             checkpoint_process._creation_future.result()
+            assert checkpoint_process.process is not None
             child_pid = checkpoint_process.process.processes[0].pid
             try:
                 baseline = _rss_mib(child_pid)
