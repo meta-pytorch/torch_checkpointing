@@ -49,10 +49,10 @@ from ..default_resharder import compute_local_shard_info
 from ..distributed_metadata import (
     DistributedItemMetadata,
     GlobalObjectMetadata,
-    load_distributed_metadata,
 )
 from ..dtensor_metadata import DTensorShardingMetadata
 from ..logging_utils import EventLogger, EventType
+from ..metadata_serialization import TorchDistributedMetadataFormat
 from ..resharding_utils import get_fqn_from_nested_path
 from ..safetensors_metadata import SafetensorsFileMetadata
 from ..serialized_tensor_slice import ByteAddress, SerializedTensorSlice
@@ -122,7 +122,9 @@ def _load_item_metadata(
     event_logger: EventLogger,
     rank: int,
 ) -> DistributedItemMetadata:
-    distributed_metadata = load_distributed_metadata(input_checkpoint_dir, storage)
+    distributed_metadata = TorchDistributedMetadataFormat.maybe_load(
+        Path(input_checkpoint_dir), storage
+    )
     _log_phase(event_logger, "load_metadata", rank=rank)
     if distributed_metadata is None:
         raise FileNotFoundError(

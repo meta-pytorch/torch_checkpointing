@@ -15,7 +15,7 @@ import json
 import logging
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 import torch
 
@@ -35,10 +35,14 @@ from .distributed_metadata import (
     CheckpointMetadata,
     DistributedItemMetadata,
     DistributedMetadata,
-    load_distributed_metadata,
     ShardingMetadata,
 )
 from .logging_utils import EventLogger, EventType
+from .metadata_serialization import (
+    DistributedMetadataFormat,
+    load_distributed_metadata,
+    TorchDistributedMetadataFormat,
+)
 from .storage.base_storage import Storage, StorageConfig
 from .storage.torch_serialization import MmapFill
 from .types import CheckpointPath, NestedPath, RankInfo, STATE_DICT
@@ -56,6 +60,16 @@ class CheckpointReader:
     to the specified checkpoint layout. It supports synchronization barriers to ensure
     all ranks in a distributed setting complete their checkpoint operations.
     """
+
+    _METADATA_FORMATS: ClassVar[tuple[type[DistributedMetadataFormat], ...]] = (
+        TorchDistributedMetadataFormat,
+    )
+
+    # Readers whose checkpoints always carry distributed metadata reject a
+    # directory with none. Without this, a missing or renamed metadata artifact
+    # leaves every item without source metadata, so nothing reshards and each
+    # rank silently reads its own conventional file instead.
+    _REQUIRE_METADATA: ClassVar[bool] = False
 
     def __init__(
         self,
@@ -177,7 +191,16 @@ class CheckpointReader:
 
         # Normal path with resharding support
         checkpoint_metadata = checkpoint_info.checkpoint_metadata
-        source_distributed_metadata = self._load_metadata(path)
+        source_distributed_metadata = load_distributed_metadata(
+            path,
+            self._storage,
+            formats=self._METADATA_FORMATS,
+        )
+        if source_distributed_metadata is None and self._REQUIRE_METADATA:
+            raise FileNotFoundError(
+                f"No distributed metadata found in {path}; tried "
+                f"{[fmt.__name__ for fmt in self._METADATA_FORMATS]}"
+            )
         logger.info(
             "Finished reading checkpoint metadata",
             extra=event_logger(
@@ -259,21 +282,6 @@ class CheckpointReader:
             extra=event_logger(EventType.LOG_METRIC),
         )
         return result_dict, missing_keys
-
-    def _load_metadata(
-        self,
-        checkpoint_dir: str | Path,
-    ) -> DistributedMetadata | None:
-        """
-        Load distributed metadata from the checkpoint directory.
-
-        Args:
-            checkpoint_dir: Path to the checkpoint directory.
-
-        Returns:
-            DistributedMetadata if the checkpoint carries one, None otherwise.
-        """
-        return load_distributed_metadata(checkpoint_dir, self._storage)
 
     def _read_without_resharding(
         self,
