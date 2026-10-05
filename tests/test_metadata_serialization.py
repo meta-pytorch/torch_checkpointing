@@ -11,7 +11,12 @@ from pathlib import Path
 
 import pytest
 import torch_checkpointing.metadata_serialization as metadata_serialization
-from torch_checkpointing.checkpoint_layout import default_torch_layout_info
+from torch_checkpointing.checkpoint_layout import (
+    default_torch_layout_info,
+    LayoutInfo,
+    TorchSerialization,
+)
+from torch_checkpointing.checkpoint_reader import CheckpointReader
 from torch_checkpointing.distributed_metadata import (
     DistributedItemMetadata,
     DistributedMetadata,
@@ -147,3 +152,22 @@ def test_load_distributed_metadata_propagates_corrupt_format_error(
                 MustNotRunDistributedMetadataFormat,
             ),
         )
+
+
+def test_native_format_is_rank_addressable_with_the_writer_default() -> None:
+    format_type = metadata_serialization.TorchDistributedMetadataFormat
+    assert issubclass(
+        format_type, metadata_serialization.RankAddressableDistributedMetadataFormat
+    )
+    assert format_type.default_layout_info("model", 7) == LayoutInfo(
+        "model_7.pt", TorchSerialization()
+    )
+
+
+def test_reader_formats_are_rank_addressable() -> None:
+    assert all(
+        issubclass(
+            format_type, metadata_serialization.RankAddressableDistributedMetadataFormat
+        )
+        for format_type in CheckpointReader._METADATA_FORMATS
+    )

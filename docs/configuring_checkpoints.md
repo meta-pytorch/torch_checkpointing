@@ -131,11 +131,13 @@ class LayoutInfo:
     serialization_format: SerializationFormat
 ```
 
-- **`file_path`** is relative to the checkpoint directory and gives you full
+- **`file_path`** is an exact path relative to the checkpoint directory. It
+  takes precedence over the default per-rank layout and gives you full
   control over naming and organization:
   - `"model_{rank}.pt"` -> a file per rank
   - `"rank_{rank}/model.pt"` -> a file inside a per-rank subdirectory
-  - `"model.pt"` -> one fixed path, suitable for single-rank use
+  - `"model.pt"` -> one fixed path, suitable only when the caller selects one
+    writer
 - **`serialization_format`** is one of the formats described in
   [Serialization formats](#serialization-formats).
 
@@ -169,7 +171,7 @@ and the manager expands it. `{rank}` is the only recognized placeholder;
 `{key}` and other brace-delimited text are not substituted. In a distributed
 save, every rank processes every configured layout, so a path without `{rank}`
 causes the ranks to target the same file. Use fixed paths only for single-rank
-checkpoints or when coordination is handled outside this API.
+checkpoints or when the caller arranges for one rank to write the shared file.
 
 ### The canonical FLAT layout
 
@@ -203,6 +205,12 @@ So an item keyed `"model_state"` on global rank `3` is written to
 the rank appended, giving you per-rank files without any explicit `LayoutInfo` —
 exactly the `f"{item_key}_{rank}.pt"` shape you would otherwise construct for a
 specific item key and rank. `{key}` is not a layout placeholder.
+
+The writer uses this layout only when an item's layout is `None`. Because it
+depends only on the item key and rank, a reader can find a rank's file without
+loading checkpoint metadata. Metadata formats with that property are *rank
+addressable*: each defines the default layout its writer uses, and the native
+format's default is the one above.
 
 ### Custom layouts
 

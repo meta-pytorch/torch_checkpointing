@@ -678,6 +678,27 @@ class TestCheckpointWriter(TestCase):
         # Should not raise any errors
         writer.write(checkpoint_path, checkpoint_info)
 
+    def test_default_layout_writes_item_rank_file(self):
+        checkpoint_path = Path(self.temp_dir) / "checkpoint_default_layout"
+        writer = CheckpointWriter(
+            CheckpointWriterArgs(
+                config=self.config,
+                rank_info=self.rank_info,
+                storage_config=self.storage_config,
+            )
+        )
+
+        writer.write(
+            str(checkpoint_path),
+            CheckpointWriteInfo(
+                checkpoint_items={
+                    "model": CheckpointItem(value={"weight": torch.ones(1)})
+                }
+            ),
+        )
+
+        self.assertTrue((checkpoint_path / "model_0.pt").is_file())
+
     def test_close(self):
         """Test that close doesn't raise any exceptions."""
         args = CheckpointWriterArgs(

@@ -16,9 +16,6 @@ from torch_checkpointing.checkpoint_layout import (
 
 
 class _ExternalSerializationFormat(SerializationFormat):
-    def default_file_path(self, item_key: str, rank: int) -> str:
-        return f"{item_key}_{rank}.external"
-
     def to_dict(self) -> dict[str, object]:
         return {"type": type(self).__name__}
 

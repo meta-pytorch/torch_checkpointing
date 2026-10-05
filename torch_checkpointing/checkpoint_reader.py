@@ -39,8 +39,8 @@ from .distributed_metadata import (
 )
 from .logging_utils import EventLogger, EventType
 from .metadata_serialization import (
-    DistributedMetadataFormat,
     load_distributed_metadata,
+    RankAddressableDistributedMetadataFormat,
     TorchDistributedMetadataFormat,
 )
 from .storage.base_storage import Storage, StorageConfig
@@ -61,9 +61,11 @@ class CheckpointReader:
     all ranks in a distributed setting complete their checkpoint operations.
     """
 
-    _METADATA_FORMATS: ClassVar[tuple[type[DistributedMetadataFormat], ...]] = (
-        TorchDistributedMetadataFormat,
-    )
+    # Reader-owned formats back loads without resharding, which find each
+    # rank's file by convention, so every one must be rank addressable.
+    _METADATA_FORMATS: ClassVar[
+        tuple[type[RankAddressableDistributedMetadataFormat], ...]
+    ] = (TorchDistributedMetadataFormat,)
 
     # Readers whose checkpoints always carry distributed metadata reject a
     # directory with none. Without this, a missing or renamed metadata artifact

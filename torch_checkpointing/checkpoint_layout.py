@@ -10,16 +10,16 @@ Checkpoint layout functionality for controlling the on-disk format of checkpoint
 This module provides components for defining custom checkpoint layouts that control
 how different parts of a state dictionary are saved to and loaded from storage.
 
-## Default Behavior (checkpoint_layout=None)
+## Default behavior
 
-When no layout is specified, the checkpointing system uses a simple single-file schema:
-- File name: `checkpoint_{rank}.pt` (where {rank} is the global rank)
-- Serialization: The entire state_dict is saved using `torch.save()`
-- Location: Saved directly in the checkpoint directory
+When an item has no explicit layout, the checkpointing system writes one
+Torch-serialized file for that item and rank:
+- File name: `<item_key>_<rank>.pt`
+- Serialization: The item is saved using `torch.save()`
+- Location: The file is saved directly in the checkpoint directory
 
-Example:
-    writer = CheckpointWriter(config, rank_info)  # checkpoint_layout=None (default)
-    # Creates: /checkpoint_path/checkpoint_0.pt, /checkpoint_path/checkpoint_1.pt, etc.
+For example, items named `model` and `optimizer` on rank 0 produce
+`model_0.pt` and `optimizer_0.pt`.
 
 ## Custom Layouts (checkpoint_layout=callable)
 
@@ -29,18 +29,18 @@ For more control, provide a layout function that splits data across multiple fil
 - Each state_dict key maps to its own unique file (no file sharing between keys)
 - Use different serialization formats (Torch tensors vs JSON) for different data
 - Control file naming and organization within the checkpoint directory
-- Support both per-rank and global files in distributed settings
+- Use a fixed shared path only when the caller arranges for one rank to write it
 
 Example usage:
     def my_layout(rank: int) -> dict[str, LayoutInfo]:
         return {
-            'model': LayoutInfo('model.pt', TorchSerialization()),
+            'model': LayoutInfo(f'model_{rank}.pt', TorchSerialization()),
             'optimizer': LayoutInfo(f'optimizer_{rank}.pt', TorchSerialization()),
-            'metadata': LayoutInfo('config.json', JsonSerialization(dict)),
+            'metadata': LayoutInfo(f'config_{rank}.json', JsonSerialization(dict)),
         }
 
     writer = CheckpointWriter(config, rank_info, checkpoint_layout=my_layout)
-    # Creates: /checkpoint_path/model.pt, /checkpoint_path/optimizer_rank_0.pt, etc.
+    # Creates one file per configured item and rank.
 """
 
 import abc
@@ -298,14 +298,16 @@ class LayoutInfo:
     """Information about how a specific state dict key should be stored.
 
     Args:
-        file_path: Path to the file relative to the checkpoint directory.
-                   This gives you full control over file naming and organization:
+        file_path: Exact path to the file relative to the checkpoint directory.
+                   It takes precedence over the default per-rank layout:
 
                    Examples:
-                   - "model.pt" -> saves to checkpoint_dir/model.pt
+                   - "model_{rank}.pt" -> a file per rank after materialization
                    - "rank_0/model.pt" -> saves to checkpoint_dir/rank_0/model.pt
                    - f"model_rank_{rank}.pt" -> per-rank files
-                   - "shared/config.json" -> global file in subdirectory
+
+                   A fixed path such as "model.pt" requires the caller to
+                   arrange for only one rank to write it.
 
         serialization_format: How the data should be serialized
     """

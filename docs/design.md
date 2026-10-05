@@ -388,6 +388,12 @@ serialization format:
 - **`SafetensorsSerialization`** — flattens tensors with
   `prepare_tensors_for_save`, then `safetensors.torch.save`.
 
+An item without a layout is written to the native default,
+`<item_key>_<rank>.pt`. Rank-addressable metadata formats each define such a
+default, so a load without resharding can find a rank's file without reading
+metadata. An explicit `LayoutInfo.file_path` remains exact. A fixed shared path
+is safe only when the caller selects one rank to write it.
+
 Metadata is written by `role_rank == 0` only. When a barrier is configured, the
 writer stages files under a `tmp_` directory, waits for all ranks at the barrier,
 then renames to the final path for atomicity; `pre_finalize_callback` runs before

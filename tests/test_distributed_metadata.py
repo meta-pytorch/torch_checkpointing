@@ -131,6 +131,18 @@ def test_default_sharding_metadata_allows_scalar_and_empty_shards() -> None:
     assert empty.local_sizes == ((0, 2),)
 
 
+def test_missing_rank_layout_uses_default_torch_rank_path() -> None:
+    metadata = DistributedItemMetadata(
+        nested_path_to_metadata={},
+        rank_to_layout_info={7: None},
+    )
+
+    assert metadata.get_layout_info(7, "model") == LayoutInfo(
+        file_path="model_7.pt",
+        serialization_format=TorchSerialization(),
+    )
+
+
 def test_to_and_from_dict():
     """Test that metadata is correctly converted to and from a dictionary."""
     state_dict = {

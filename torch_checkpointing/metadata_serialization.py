@@ -13,6 +13,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from pathlib import Path
 
+from .checkpoint_layout import default_torch_layout_info, LayoutInfo
 from .distributed_metadata import DistributedMetadata, METADATA_FILE_NAME
 from .storage.base_storage import Storage
 
@@ -62,8 +63,26 @@ def load_distributed_metadata(
     return None
 
 
-class TorchDistributedMetadataFormat(DistributedMetadataFormat):
+class RankAddressableDistributedMetadataFormat(DistributedMetadataFormat):
+    """A format whose checkpoints keep each rank's data for an item in one file.
+
+    A reader can find that file by convention without loading the metadata,
+    which is what lets a load without resharding skip metadata entirely.
+    """
+
+    @staticmethod
+    @abstractmethod
+    def default_layout_info(item_key: str, rank: int) -> LayoutInfo:
+        """Where this format's writer puts ``item_key`` for ``rank`` by default."""
+        raise NotImplementedError
+
+
+class TorchDistributedMetadataFormat(RankAddressableDistributedMetadataFormat):
     """The native trusted-pickle ``metadata.pkl`` representation."""
+
+    @staticmethod
+    def default_layout_info(item_key: str, rank: int) -> LayoutInfo:
+        return default_torch_layout_info(item_key, rank)
 
     @classmethod
     def maybe_load(
