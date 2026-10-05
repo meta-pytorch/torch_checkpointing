@@ -22,8 +22,9 @@ The core algorithm:
 import io
 import logging
 import zipfile
+from enum import auto, Enum
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import torch
 import torch.distributed as dist
@@ -60,12 +61,21 @@ from .resharding_utils import (
     get_fqn_from_nested_path,
 )
 from .storage.base_storage import ReadArgs, Storage
+from .storage.torch_serialization import load_torch_serialized_from_storage
 from .types import CheckpointPath, NestedPath
 from .walk_utils import walk_checkpoint_structure
 
 logger: logging.Logger = logging.getLogger(__name__)
 
-__all__ = ["DefaultResharder"]
+__all__ = ["DefaultResharder", "ReshardingReadStrategy"]
+
+
+class ReshardingReadStrategy(Enum):
+    """How DefaultResharder reads source checkpoint files."""
+
+    AUTO = auto()
+    OFFSET = auto()
+    FULL_FILE = auto()
 
 
 def _read_exact(stream: io.RawIOBase, offset: int, buffer: memoryview) -> None:
@@ -367,7 +377,18 @@ class DefaultResharder(Resharder):
     Uses DTensor's native placement APIs to compute shard geometry and perform
     resharding during checkpoint loading. Supports transitions between different
     Shard/Replicate placements and device mesh configurations.
+
+    Args:
+        read_strategy: Whether to use offset reads, full-file reads, or try
+            offset reads and fall back to full-file reads when unsupported.
     """
+
+    def __init__(
+        self,
+        *,
+        read_strategy: ReshardingReadStrategy = ReshardingReadStrategy.AUTO,
+    ) -> None:
+        self._read_strategy = read_strategy
 
     @override
     def extract_sharding_metadata(
@@ -596,7 +617,7 @@ class DefaultResharder(Resharder):
 
     def _execute_load_plans(
         self,
-        src_path_fn: Any,
+        src_path_fn: Callable[[int], Path],
         item_key: str,
         nested_path_to_load_plans: dict[NestedPath, list[LoadPlan]],
         target: Any,
@@ -604,11 +625,8 @@ class DefaultResharder(Resharder):
     ) -> None:
         """Execute load plans by reading source files and copying data into target.
 
-        Groups load plans by source rank to minimize file reads, then for each
-        source rank:
-        1. Read checkpoint metadata and the storage span needed by each load plan.
-        2. Fall back to a full checkpoint load for unsupported archive features.
-        3. Copy the staged source data into target tensors.
+        Groups load plans by source rank, then reads and copies the planned
+        source data into target tensors.
 
         Args:
             src_path_fn: Callable that returns the file path for a given source rank.
@@ -627,12 +645,31 @@ class DefaultResharder(Resharder):
                     plans_by_rank[lp.src_rank] = []
                 plans_by_rank[lp.src_rank].append((nested_path, lp))
 
-        try_offset_reads = True
+        self._execute_load_plans_with_read_strategy(
+            self._read_strategy,
+            src_path_fn,
+            item_key,
+            plans_by_rank,
+            target_by_path,
+            storage,
+        )
 
-        # Process each source rank
+    def _execute_load_plans_with_read_strategy(
+        self,
+        read_strategy: ReshardingReadStrategy,
+        src_path_fn: Callable[[int], Path],
+        item_key: str,
+        plans_by_rank: dict[int, list[tuple[NestedPath, LoadPlan]]],
+        target_by_path: dict[NestedPath, Any],
+        storage: Storage,
+    ) -> None:
+        current_strategy = read_strategy
         for src_rank, rank_plans in plans_by_rank.items():
             file_path = src_path_fn(src_rank)
-            if try_offset_reads:
+            if current_strategy in (
+                ReshardingReadStrategy.AUTO,
+                ReshardingReadStrategy.OFFSET,
+            ):
                 try:
                     staged = self._read_source_slices_with_offset_reads(
                         file_path,
@@ -641,7 +678,9 @@ class DefaultResharder(Resharder):
                         storage,
                     )
                 except NotImplementedError as error:
-                    try_offset_reads = False
+                    if current_strategy is ReshardingReadStrategy.OFFSET:
+                        raise
+                    current_strategy = ReshardingReadStrategy.FULL_FILE
                     logger.warning(
                         "Offset reads unavailable for %s; reading it and "
                         "remaining source files in full: %s",
@@ -654,14 +693,17 @@ class DefaultResharder(Resharder):
                         rank_plans,
                         storage,
                     )
-            else:
+            elif current_strategy is ReshardingReadStrategy.FULL_FILE:
                 staged = self._read_source_slices_with_full_file_read(
                     file_path,
                     item_key,
                     rank_plans,
                     storage,
                 )
-
+            else:
+                raise ValueError(
+                    f"Cannot directly execute read strategy {current_strategy}"
+                )
             for nested_path, lp, src_data in staged:
                 target_tensor = _unwrap_dtensor(target_by_path[nested_path])
                 tgt_slice = tuple(slice(o, o + s) for o, s in zip(lp.offsets, lp.sizes))
@@ -704,12 +746,11 @@ class DefaultResharder(Resharder):
         storage: Storage,
     ) -> list[tuple[NestedPath, LoadPlan, torch.Tensor]]:
         """Read the source data every plan needs by loading the full file."""
-        with storage.stream_read(file_path) as stream:
-            loaded_data = torch.load(
-                stream,  # type: ignore[arg-type]
-                map_location="cpu",
-                weights_only=False,
-            )
+        loaded_data = load_torch_serialized_from_storage(
+            file_path,
+            storage,
+            map_location="cpu",
+        )
         flattened = _flatten_state_dict(item_key, loaded_data)
         return [
             (

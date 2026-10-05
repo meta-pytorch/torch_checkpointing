@@ -6,7 +6,6 @@
 
 import io
 import logging
-import zipfile
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch, PropertyMock
@@ -19,6 +18,7 @@ from torch_checkpointing.default_resharder import (
     _slice_source_tensor,
     _validate_source_slice_bounds,
     DefaultResharder,
+    ReshardingReadStrategy,
 )
 from torch_checkpointing.distributed_metadata import (
     DistributedItemMetadata,
@@ -51,11 +51,15 @@ class _TrackingReader(io.BytesIO):
 
 
 class _TrackingStorage:
+    mmap_fill_workers: int | None = None
+    mmap_fill_chunk_bytes: int | None = None
+
     def __init__(self, path: Path, data: bytes) -> None:
         self._path = path
         self._data = data
         self.bytes_read = 0
         self.read_args: list[ReadArgs | None] = []
+        self.getsize_calls: list[Path] = []
 
     def stream_read(
         self,
@@ -66,11 +70,20 @@ class _TrackingStorage:
         self.read_args.append(read_args)
         return _TrackingReader(self._data, self)
 
+    def getsize(self, path: Path) -> int:
+        assert path == self._path
+        self.getsize_calls.append(path)
+        return len(self._data)
+
 
 class _MultiFileTrackingStorage:
+    mmap_fill_workers: int | None = None
+    mmap_fill_chunk_bytes: int | None = None
+
     def __init__(self, files: dict[Path, bytes]) -> None:
         self._files = files
         self.reads: list[tuple[Path, ReadArgs | None]] = []
+        self.getsize_calls: list[Path] = []
 
     def stream_read(
         self,
@@ -80,17 +93,20 @@ class _MultiFileTrackingStorage:
         self.reads.append((path, read_args))
         return io.BytesIO(self._files[path])
 
+    def getsize(self, path: Path) -> int:
+        self.getsize_calls.append(path)
+        return len(self._files[path])
 
-def _load_second_half_with_offset_reads(
+
+def _load_second_half(
     source: torch.Tensor,
-    checkpoint_data: bytes | None = None,
+    *,
+    read_strategy: ReshardingReadStrategy = ReshardingReadStrategy.AUTO,
 ) -> tuple[torch.Tensor, _TrackingStorage]:
-    if checkpoint_data is None:
-        checkpoint = io.BytesIO()
-        torch.save({"selected": source}, checkpoint)
-        checkpoint_data = checkpoint.getvalue()
+    checkpoint = io.BytesIO()
+    torch.save({"selected": source}, checkpoint)
     path = Path("checkpoint.pt")
-    storage = _TrackingStorage(path, checkpoint_data)
+    storage = _TrackingStorage(path, checkpoint.getvalue())
     target_tensor = torch.zeros(source.shape[0] // 2, dtype=source.dtype)
     source_sharding = DTensorShardingMetadata(
         global_shape=tuple(source.shape),
@@ -136,7 +152,7 @@ def _load_second_half_with_offset_reads(
             return_value=1,
         ),
     ):
-        missing_paths = DefaultResharder().load(
+        missing_paths = DefaultResharder(read_strategy=read_strategy).load(
             source_path=Path("."),
             item_key="model",
             target_metadata={("selected",): target_sharding},
@@ -350,7 +366,7 @@ def test_load_preserves_conjugate_view_in_offset_slice() -> None:
     base = torch.arange(12, dtype=torch.float32).to(torch.complex64) * (1 + 2j)
     source = base[1::2].conj()
 
-    target, storage = _load_second_half_with_offset_reads(source)
+    target, storage = _load_second_half(source)
 
     torch.testing.assert_close(target, source[3:])
     assert len(storage.read_args) == 1
@@ -362,7 +378,7 @@ def test_load_preserves_negative_view_in_offset_slice() -> None:
     base = torch.arange(12, dtype=torch.float32)
     source = base[1::2]._neg_view()
 
-    target, storage = _load_second_half_with_offset_reads(source)
+    target, storage = _load_second_half(source)
 
     torch.testing.assert_close(target, source[3:])
     assert len(storage.read_args) == 1
@@ -374,7 +390,7 @@ def test_load_preserves_conjugate_negative_view_in_offset_slice() -> None:
     base = torch.arange(12, dtype=torch.float32).to(torch.complex64) * (1 + 2j)
     source = base[1::2].conj()._neg_view()
 
-    target, storage = _load_second_half_with_offset_reads(source)
+    target, storage = _load_second_half(source)
 
     torch.testing.assert_close(target, source[3:])
     assert len(storage.read_args) == 1
@@ -393,50 +409,46 @@ def test_quantized_offset_fallback_has_specific_message(
         new_callable=PropertyMock,
         return_value=True,
     ):
-        target, storage = _load_second_half_with_offset_reads(source)
+        target, storage = _load_second_half(source)
 
     torch.testing.assert_close(target, source[4:])
     assert len(storage.read_args) == 2
+    assert storage.getsize_calls == [Path("checkpoint.pt")]
     assert "Source 'selected' is quantized" in caplog.text
     assert "does not use a strided storage" not in caplog.text
 
 
-def test_load_falls_back_for_compressed_torch_archive() -> None:
-    source = torch.arange(1024, dtype=torch.float32)
-    uncompressed = io.BytesIO()
-    torch.save({"selected": source}, uncompressed)
-    compressed = io.BytesIO()
+def test_offset_strategy_propagates_unsupported_tensor() -> None:
+    source = torch.arange(8, dtype=torch.float32)
+
     with (
-        zipfile.ZipFile(uncompressed, "r") as source_archive,
-        zipfile.ZipFile(compressed, "w") as target_archive,
+        patch.object(
+            FakeTensor,
+            "is_quantized",
+            new_callable=PropertyMock,
+            return_value=True,
+        ),
+        pytest.raises(NotImplementedError, match="quantized"),
     ):
-        for member in source_archive.infolist():
-            compression = (
-                zipfile.ZIP_DEFLATED
-                if "/data/" in member.filename
-                else zipfile.ZIP_STORED
-            )
-            target_archive.writestr(
-                member,
-                source_archive.read(member.filename),
-                compress_type=compression,
-            )
+        _load_second_half(
+            source,
+            read_strategy=ReshardingReadStrategy.OFFSET,
+        )
 
-    checkpoint_data = compressed.getvalue()
-    loaded = torch.load(
-        io.BytesIO(checkpoint_data),
-        map_location="cpu",
-        weights_only=False,
+
+def test_full_file_strategy_skips_offset_metadata_read() -> None:
+    source = torch.arange(1024, dtype=torch.float32)
+
+    target, storage = _load_second_half(
+        source,
+        read_strategy=ReshardingReadStrategy.FULL_FILE,
     )
-    torch.testing.assert_close(loaded["selected"], source)
-
-    target, storage = _load_second_half_with_offset_reads(source, checkpoint_data)
 
     torch.testing.assert_close(target, source[512:])
-    assert len(storage.read_args) == 2
+    assert storage.getsize_calls == [Path("checkpoint.pt")]
+    assert len(storage.read_args) == 1
     assert storage.read_args[0] is not None
     assert not storage.read_args[0].pre_read_full_file
-    assert storage.read_args[1] is None
 
 
 def test_load_falls_back_for_quantized_source_tensor() -> None:
@@ -517,21 +529,15 @@ def test_load_falls_back_for_quantized_source_tensor() -> None:
     assert len(storage.read_args) == 2
     assert storage.read_args[0] is not None
     assert not storage.read_args[0].pre_read_full_file
-    assert storage.read_args[1] is None
+    assert storage.getsize_calls == [path]
 
 
-def test_load_stops_trying_offset_reads_after_first_unsupported_file(
+def test_auto_stops_trying_offset_reads_after_first_unsupported_file(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    paths = [Path("rank_0.pt"), Path("rank_1.pt")]
+    paths = [Path(f"rank_{rank}.pt") for rank in range(3)]
     source_shards = [
-        torch.quantize_per_tensor(
-            torch.arange(start, start + 4, dtype=torch.float32),
-            scale=0.25,
-            zero_point=3,
-            dtype=torch.quint8,
-        )
-        for start in (0, 4)
+        torch.arange(start, start + 4, dtype=torch.float32) for start in (0, 4, 8)
     ]
     files = {}
     for path, source_shard in zip(paths, source_shards):
@@ -539,12 +545,7 @@ def test_load_stops_trying_offset_reads_after_first_unsupported_file(
         torch.save({"selected": source_shard}, checkpoint)
         files[path] = checkpoint.getvalue()
     storage = _MultiFileTrackingStorage(files)
-    target_tensor = torch.quantize_per_tensor(
-        torch.zeros(8, dtype=torch.float32),
-        scale=0.25,
-        zero_point=3,
-        dtype=torch.quint8,
-    )
+    target_tensor = torch.zeros(12, dtype=torch.float32)
     load_plans = [
         LoadPlan(
             offsets=(rank * 4,),
@@ -554,10 +555,16 @@ def test_load_stops_trying_offset_reads_after_first_unsupported_file(
             src_offsets=(0,),
             src_sizes=(4,),
         )
-        for rank in range(2)
+        for rank in range(3)
     ]
 
-    with caplog.at_level(logging.WARNING):
+    with (
+        caplog.at_level(logging.WARNING),
+        patch(
+            "torch_checkpointing.default_resharder._validate_offset_read_archive",
+            side_effect=(None, NotImplementedError("unsupported offset read")),
+        ) as validate_archive,
+    ):
         DefaultResharder()._execute_load_plans(
             src_path_fn=lambda rank: paths[rank],
             item_key="model",
@@ -566,19 +573,13 @@ def test_load_stops_trying_offset_reads_after_first_unsupported_file(
             storage=storage,  # type: ignore[arg-type]
         )
 
-    expected = torch.quantize_per_tensor(
-        torch.arange(8, dtype=torch.float32),
-        scale=0.25,
-        zero_point=3,
-        dtype=torch.quint8,
-    )
-    assert torch.equal(target_tensor.int_repr(), expected.int_repr())
-    assert [
-        (path, read_args is not None and not read_args.pre_read_full_file)
-        for path, read_args in storage.reads
-    ] == [
-        (paths[0], True),
-        (paths[0], False),
-        (paths[1], False),
+    torch.testing.assert_close(target_tensor, torch.arange(12, dtype=torch.float32))
+    assert validate_archive.call_count == 2
+    assert [path for path, _ in storage.reads] == [
+        paths[0],
+        paths[1],
+        paths[1],
+        paths[2],
     ]
+    assert storage.getsize_calls == paths[1:]
     assert caplog.text.count("Offset reads unavailable") == 1
