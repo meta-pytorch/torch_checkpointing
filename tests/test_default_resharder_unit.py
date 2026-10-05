@@ -6,14 +6,21 @@
 
 import io
 import logging
+import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch, PropertyMock
 
 import pytest
 import torch
+from safetensors.torch import save as serialize_safetensors, save_file
 from torch._subclasses.fake_tensor import FakeTensor
-from torch_checkpointing.checkpoint_layout import LayoutInfo, TorchSerialization
+from torch_checkpointing.checkpoint_layout import (
+    LayoutInfo,
+    SafetensorsSerialization,
+    TorchSerialization,
+)
 from torch_checkpointing.default_resharder import (
     _slice_source_tensor,
     _validate_source_slice_bounds,
@@ -31,7 +38,23 @@ from torch_checkpointing.dtensor_metadata import (
     ShardSpec,
 )
 from torch_checkpointing.resharding import LoadPlan
+from torch_checkpointing.safetensors_metadata import SafetensorsFileMetadata
 from torch_checkpointing.storage.base_storage import ReadArgs
+from torch_checkpointing.storage.filesystem import LocalFileSystemStorageConfig
+
+
+def test_import_does_not_require_safetensors() -> None:
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys; "
+            "sys.modules['safetensors'] = None; "
+            "sys.modules['safetensors.torch'] = None; "
+            "import torch_checkpointing.default_resharder",
+        ],
+        check=True,
+    )
 
 
 class _TrackingReader(io.BytesIO):
@@ -69,6 +92,14 @@ class _TrackingStorage:
         assert path == self._path
         self.read_args.append(read_args)
         return _TrackingReader(self._data, self)
+
+    def read(
+        self,
+        path: Path,
+        read_args: ReadArgs | None = None,
+    ) -> bytes:
+        with self.stream_read(path, read_args) as stream:
+            return stream.read()
 
     def getsize(self, path: Path) -> int:
         assert path == self._path
@@ -362,6 +393,81 @@ def test_load_reads_one_span_for_noncontiguous_source_slice() -> None:
     )
 
 
+def test_full_file_strategy_loads_dotted_safetensors() -> None:
+    source = torch.arange(8, dtype=torch.float32)
+    fqn = "layers.0.weight"
+    path = Path("model.safetensors")
+    checkpoint_data = serialize_safetensors({fqn: source})
+    storage = _TrackingStorage(path, checkpoint_data)
+    plan = LoadPlan(
+        offsets=(0,),
+        sizes=(4,),
+        src_rank=0,
+        src_fqn=fqn,
+        src_offsets=(4,),
+        src_sizes=(4,),
+    )
+
+    target = {fqn: torch.empty(4)}
+    DefaultResharder(
+        read_strategy=ReshardingReadStrategy.FULL_FILE
+    )._execute_load_plans(
+        source_path=Path("."),
+        source_metadata=DistributedItemMetadata(
+            nested_path_to_metadata={},
+            rank_to_layout_info={0: LayoutInfo(str(path), SafetensorsSerialization())},
+        ),
+        item_key="model",
+        nested_path_to_load_plans={(fqn,): [plan]},
+        target=target,
+        storage=storage,  # type: ignore[arg-type]
+    )
+
+    torch.testing.assert_close(target[fqn], source[4:])
+    assert storage.read_args == [ReadArgs(pre_read_full_file=False)]
+    assert storage.bytes_read == len(checkpoint_data)
+
+
+def test_auto_uses_offset_reads_for_safetensors() -> None:
+    source = torch.arange(1024, dtype=torch.float32)
+    path = Path("model.safetensors")
+    checkpoint_data = serialize_safetensors({"weight": source})
+    storage = _TrackingStorage(path, checkpoint_data)
+    plan = LoadPlan(
+        offsets=(0,),
+        sizes=tuple(source.shape),
+        src_rank=0,
+        src_fqn="weight",
+        src_offsets=(0,),
+        src_sizes=tuple(source.shape),
+    )
+    target = {
+        "first": torch.empty_like(source),
+        "second": torch.empty_like(source),
+    }
+    span_bytes = source.numel() * source.element_size()
+    assert span_bytes < len(checkpoint_data) <= 2 * span_bytes
+
+    DefaultResharder()._execute_load_plans(
+        source_path=Path("."),
+        source_metadata=DistributedItemMetadata(
+            nested_path_to_metadata={},
+            rank_to_layout_info={0: LayoutInfo(str(path), SafetensorsSerialization())},
+        ),
+        item_key="model",
+        nested_path_to_load_plans={
+            ("first",): [plan],
+            ("second",): [plan],
+        },
+        target=target,
+        storage=storage,  # type: ignore[arg-type]
+    )
+
+    torch.testing.assert_close(target["first"], source)
+    torch.testing.assert_close(target["second"], source)
+    assert storage.read_args == [ReadArgs(pre_read_full_file=False)]
+
+
 def test_load_preserves_conjugate_view_in_offset_slice() -> None:
     base = torch.arange(12, dtype=torch.float32).to(torch.complex64) * (1 + 2j)
     source = base[1::2].conj()
@@ -591,3 +697,73 @@ def test_auto_stops_trying_offset_reads_after_first_unsupported_file(
     ]
     assert storage.getsize_calls == paths[1:]
     assert caplog.text.count("Offset reads unavailable") == 1
+
+
+def test_load_reshards_safetensors_shards_described_by_native_metadata(
+    tmp_path: Path,
+) -> None:
+    """An unconsolidated checkpoint: safetensors shards, native metadata, no HF."""
+    whole = torch.arange(24, dtype=torch.float32).reshape(6, 4)
+    for rank in range(2):
+        save_file(
+            {"weight": whole[rank * 3 : (rank + 1) * 3].contiguous()},
+            tmp_path / f"model_{rank}.safetensors",
+        )
+
+    def sharded(mesh_shape: tuple[int, ...], mesh_data: tuple[int, ...], placements):
+        return DTensorShardingMetadata(
+            global_shape=(6, 4),
+            dtype="torch.float32",
+            stride=(4, 1),
+            mesh_spec=DeviceMeshSpec(
+                device_type="cpu", mesh_shape=mesh_shape, mesh_data=mesh_data
+            ),
+            placements=placements,
+        )
+
+    source_sharding = sharded((2,), (0, 1), (ShardSpec(0),))
+    source_metadata = DistributedItemMetadata(
+        nested_path_to_metadata={
+            ("weight",): [
+                GlobalObjectMetadata(sharding_metadata=source_sharding, ranks=(0, 1))
+            ]
+        },
+        rank_to_layout_info={
+            rank: LayoutInfo(f"model_{rank}.safetensors", SafetensorsSerialization())
+            for rank in range(2)
+        },
+    )
+    target = {"weight": torch.zeros((6, 4), dtype=torch.float32)}
+    storage = LocalFileSystemStorageConfig(use_direct_io=False).create_storage()
+
+    with (
+        patch(
+            "torch_checkpointing.default_resharder.dist.is_initialized",
+            return_value=True,
+        ),
+        patch("torch_checkpointing.default_resharder.dist.get_rank", return_value=0),
+        patch(
+            "torch_checkpointing.default_resharder.dist.get_world_size", return_value=1
+        ),
+    ):
+        missing = DefaultResharder().load(
+            source_path=tmp_path,
+            item_key="model",
+            target_metadata={("weight",): sharded((1,), (0,), (ReplicateSpec(),))},
+            source_metadata=source_metadata,
+            target=target,
+            storage=storage,
+        )
+
+    assert missing == []
+    torch.testing.assert_close(target["weight"], whole)
+
+
+def test_safetensors_fake_tensors_name_the_file_for_a_missing_fqn() -> None:
+    metadata = SafetensorsFileMetadata(file_path="model.safetensors", tensors={})
+
+    with pytest.raises(
+        KeyError,
+        match="'missing' is not in the safetensors header of model.safetensors",
+    ):
+        metadata.as_fake_tensors(["missing"])

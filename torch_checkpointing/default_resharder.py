@@ -39,7 +39,11 @@ from torch.distributed.tensor.placement_types import (
 )
 from typing_extensions import override
 
-from .checkpoint_layout import LayoutInfo
+from .checkpoint_layout import (
+    LayoutInfo,
+    SafetensorsSerialization,
+    TorchSerialization,
+)
 from .distributed_metadata import (
     DistributedItemMetadata,
     ShardingMetadata,
@@ -61,6 +65,7 @@ from .resharding_utils import (
     deduplicate_source_chunks,
     get_fqn_from_nested_path,
 )
+from .safetensors_metadata import SafetensorsFileMetadata
 from .storage.base_storage import ReadArgs, Storage
 from .storage.torch_serialization import load_torch_serialized_from_storage
 from .types import CheckpointPath, NestedPath
@@ -671,7 +676,8 @@ class DefaultResharder(Resharder):
     ) -> None:
         current_strategy = read_strategy
         for src_rank, rank_plans in plans_by_rank.items():
-            file_path = source_path / source_layouts_by_rank[src_rank].file_path
+            layout_info = source_layouts_by_rank[src_rank]
+            file_path = source_path / layout_info.file_path
             if current_strategy in (
                 ReshardingReadStrategy.AUTO,
                 ReshardingReadStrategy.OFFSET,
@@ -679,6 +685,8 @@ class DefaultResharder(Resharder):
                 try:
                     staged = self._read_source_slices_with_offset_reads(
                         file_path,
+                        layout_info,
+                        src_rank,
                         item_key,
                         rank_plans,
                         storage,
@@ -695,6 +703,7 @@ class DefaultResharder(Resharder):
                     )
                     staged = self._read_source_slices_with_full_file_read(
                         file_path,
+                        layout_info,
                         item_key,
                         rank_plans,
                         storage,
@@ -702,6 +711,7 @@ class DefaultResharder(Resharder):
             elif current_strategy is ReshardingReadStrategy.FULL_FILE:
                 staged = self._read_source_slices_with_full_file_read(
                     file_path,
+                    layout_info,
                     item_key,
                     rank_plans,
                     storage,
@@ -718,6 +728,8 @@ class DefaultResharder(Resharder):
     def _read_source_slices_with_offset_reads(
         self,
         file_path: Path,
+        layout_info: LayoutInfo,
+        source_rank: int,
         item_key: str,
         rank_plans: list[tuple[NestedPath, LoadPlan]],
         storage: Storage,
@@ -727,19 +739,41 @@ class DefaultResharder(Resharder):
             file_path,
             ReadArgs(pre_read_full_file=False),
         ) as stream:
-            _validate_offset_read_archive(stream)
-            with FakeTensorMode():
-                metadata = torch.load(
-                    stream,  # type: ignore[arg-type]
-                    map_location="cpu",
-                    weights_only=False,
+            serialization_format = layout_info.serialization_format
+            source_fqns = {load_plan.src_fqn for _, load_plan in rank_plans}
+            if isinstance(serialization_format, TorchSerialization):
+                _validate_offset_read_archive(stream)
+                with FakeTensorMode():
+                    metadata = torch.load(
+                        stream,  # type: ignore[arg-type]
+                        map_location="cpu",
+                        weights_only=False,
+                    )
+                flattened = _flatten_state_dict(item_key, metadata)
+                source_tensors = {
+                    source_fqn: _unwrap_dtensor(flattened[source_fqn])
+                    for source_fqn in source_fqns
+                }
+            elif isinstance(serialization_format, SafetensorsSerialization):
+                source_tensors = SafetensorsFileMetadata.from_stream(
+                    stream,
+                    layout_info.file_path,
+                    source_rank,
+                ).as_fake_tensors(source_fqns)
+            else:
+                raise ValueError(
+                    "Unsupported serialization format "
+                    f"{type(serialization_format).__name__}"
                 )
-            flattened = _flatten_state_dict(item_key, metadata)
             return [
                 (
                     path,
                     plan,
-                    _read_source_tensor_slice(stream, flattened[plan.src_fqn], plan),
+                    _read_source_tensor_slice(
+                        stream,
+                        source_tensors[plan.src_fqn],
+                        plan,
+                    ),
                 )
                 for path, plan in rank_plans
             ]
@@ -747,16 +781,31 @@ class DefaultResharder(Resharder):
     def _read_source_slices_with_full_file_read(
         self,
         file_path: Path,
+        layout_info: LayoutInfo,
         item_key: str,
         rank_plans: list[tuple[NestedPath, LoadPlan]],
         storage: Storage,
     ) -> list[tuple[NestedPath, LoadPlan, torch.Tensor]]:
         """Read the source data every plan needs by loading the full file."""
-        loaded_data = load_torch_serialized_from_storage(
-            file_path,
-            storage,
-            map_location="cpu",
-        )
+        serialization_format = layout_info.serialization_format
+        if isinstance(serialization_format, TorchSerialization):
+            loaded_data = load_torch_serialized_from_storage(
+                file_path,
+                storage,
+                map_location="cpu",
+            )
+        elif isinstance(serialization_format, SafetensorsSerialization):
+            from safetensors.torch import load as safetensors_load
+
+            loaded_data = safetensors_load(
+                storage.read(file_path, ReadArgs(pre_read_full_file=False))
+            )
+        else:
+            raise ValueError(
+                "Unsupported serialization format "
+                f"{type(serialization_format).__name__}"
+            )
+
         flattened = _flatten_state_dict(item_key, loaded_data)
         return [
             (

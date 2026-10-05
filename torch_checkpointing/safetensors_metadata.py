@@ -14,10 +14,13 @@ resharding loads need.
 
 from __future__ import annotations
 
+import io
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Collection
 
-import safetensors.torch as safetensors_torch
+import torch
+from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.distributed.checkpoint._hf_utils import (
     _get_safetensors_file_metadata,
     DATA_OFFSETS_KEY,
@@ -38,6 +41,28 @@ class SafetensorsFileMetadata:
     file_path: str
     tensors: dict[str, SerializedTensorSlice]
 
+    def as_fake_tensors(self, fqns: Collection[str]) -> dict[str, torch.Tensor]:
+        """Represent selected entries as fake tensors carrying their file offsets."""
+        result: dict[str, torch.Tensor] = {}
+        with FakeTensorMode():
+            for fqn in fqns:
+                serialized = self.tensors.get(fqn)
+                if serialized is None:
+                    raise KeyError(
+                        f"{fqn!r} is not in the safetensors header of {self.file_path}"
+                    )
+                tensor = torch.empty_strided(
+                    serialized.slice_shape,
+                    serialized.serialized_strides,
+                    dtype=serialized.torch_dtype,
+                    device="cpu",
+                )
+                tensor.untyped_storage()._checkpoint_offset = (
+                    serialized.byte_address.start_byte_offset
+                )
+                result[fqn] = tensor
+        return result
+
     @classmethod
     def from_file(
         cls,
@@ -48,8 +73,23 @@ class SafetensorsFileMetadata:
         with storage.stream_read(
             Path(file_path),
             ReadArgs(pre_read_full_file=False, direct_io=False),
-        ) as f:
-            metadata, file_start_byte_offset = _get_safetensors_file_metadata(f)
+        ) as stream:
+            return cls.from_stream(
+                stream,
+                file_path,
+                source_rank,
+            )
+
+    @classmethod
+    def from_stream(
+        cls,
+        stream: io.RawIOBase,
+        file_path: str,
+        source_rank: int,
+    ) -> "SafetensorsFileMetadata":
+        import safetensors.torch as safetensors_torch
+
+        metadata, file_start_byte_offset = _get_safetensors_file_metadata(stream)
 
         tensors: dict[str, SerializedTensorSlice] = {}
         for fqn, tensor_metadata in metadata.items():
