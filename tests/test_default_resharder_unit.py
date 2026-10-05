@@ -557,6 +557,13 @@ def test_auto_stops_trying_offset_reads_after_first_unsupported_file(
         )
         for rank in range(3)
     ]
+    source_metadata = DistributedItemMetadata(
+        nested_path_to_metadata={},
+        rank_to_layout_info={
+            rank: LayoutInfo(str(path), TorchSerialization())
+            for rank, path in enumerate(paths)
+        },
+    )
 
     with (
         caplog.at_level(logging.WARNING),
@@ -566,7 +573,8 @@ def test_auto_stops_trying_offset_reads_after_first_unsupported_file(
         ) as validate_archive,
     ):
         DefaultResharder()._execute_load_plans(
-            src_path_fn=lambda rank: paths[rank],
+            source_path=Path("."),
+            source_metadata=source_metadata,
             item_key="model",
             nested_path_to_load_plans={("selected",): load_plans},
             target={"selected": target_tensor},

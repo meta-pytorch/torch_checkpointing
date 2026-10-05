@@ -205,6 +205,13 @@ class DistributedItemMetadata:
     nested_path_to_metadata: dict[NestedPath, list[GlobalObjectMetadata]]
     rank_to_layout_info: dict[int, LayoutInfo | None]
 
+    def get_layout_info(self, rank: int, item_key: str) -> LayoutInfo:
+        """Layout for a given rank, defaulted when the checkpoint omits one."""
+        layout = self.rank_to_layout_info.get(rank)
+        if layout is None:
+            layout = default_layout_info(item_key, rank)
+        return layout
+
     def get_file_path(self, rank: int, checkpoint_path: Path, item_key: str) -> Path:
         """
         Construct source file path for a given rank.
@@ -217,10 +224,7 @@ class DistributedItemMetadata:
         Returns:
             Full path to the checkpoint file for this rank and item.
         """
-        layout = self.rank_to_layout_info.get(rank)
-        if layout is None:
-            layout = default_layout_info(item_key, rank)
-        return checkpoint_path / layout.file_path
+        return checkpoint_path / self.get_layout_info(rank, item_key).file_path
 
     def get_metadata_for_path_and_rank(
         self, nested_path: NestedPath, rank: int

@@ -6,10 +6,13 @@
 
 import json
 import os
+import pickle
 import shutil
 import tempfile
+from dataclasses import replace
 from typing import Any
 
+import pytest
 import torch
 from torch.testing._internal.common_utils import run_tests, TestCase
 from torch_checkpointing.checkpoint_base import (
@@ -25,7 +28,21 @@ from torch_checkpointing.checkpoint_layout import (
 from torch_checkpointing.checkpoint_reader import (
     CheckpointReader,
 )
-from torch_checkpointing.distributed_metadata import ShardingMetadata
+from torch_checkpointing.default_resharder import DefaultResharder
+from torch_checkpointing.distributed_metadata import (
+    CheckpointMetadata,
+    DistributedItemMetadata,
+    DistributedMetadata,
+    GlobalObjectMetadata,
+    METADATA_FILE_NAME,
+    ShardingMetadata,
+)
+from torch_checkpointing.dtensor_metadata import (
+    DeviceMeshSpec,
+    DTensorShardingMetadata,
+    ReplicateSpec,
+    ShardSpec,
+)
 from torch_checkpointing.resharding import Resharder
 from torch_checkpointing.storage.filesystem import LocalFileSystemStorageConfig
 from torch_checkpointing.types import NestedPath, RankInfo, STATE_DICT
@@ -469,6 +486,193 @@ class TestCheckpointReader(TestCase):
 
         # Verify content
         self.assertEqual(loaded_state_dict["optimizer"]["param_groups"][0]["lr"], 0.01)
+
+    def test_resharded_read_prefers_source_metadata_layout(self):
+        checkpoint_path = os.path.join(self.temp_dir, "metadata_layout")
+        os.makedirs(checkpoint_path)
+        source_value = torch.arange(8, dtype=torch.float32)
+        configured_value = torch.full_like(source_value, -1)
+        source_layout = LayoutInfo(
+            file_path="source_from_metadata.pt",
+            serialization_format=TorchSerialization(),
+        )
+        configured_layout = LayoutInfo(
+            file_path="configured_target_path.pt",
+            serialization_format=TorchSerialization(),
+        )
+        torch.save(
+            {"weight": source_value},
+            os.path.join(checkpoint_path, source_layout.file_path),
+        )
+        torch.save(
+            {"weight": configured_value},
+            os.path.join(checkpoint_path, configured_layout.file_path),
+        )
+
+        resharder = DefaultResharder()
+        source_sharding = DTensorShardingMetadata(
+            global_shape=(8,),
+            dtype="torch.float32",
+            stride=(1,),
+            mesh_spec=DeviceMeshSpec(
+                device_type="cpu",
+                mesh_shape=(2,),
+                mesh_data=(0, 1),
+            ),
+            placements=(ReplicateSpec(),),
+        )
+        target_sharding = replace(
+            source_sharding,
+            mesh_spec=DeviceMeshSpec(
+                device_type="cpu",
+                mesh_shape=(1,),
+                mesh_data=(0,),
+            ),
+            placements=(ShardSpec(0),),
+        )
+        source_distributed_metadata = DistributedMetadata(
+            metadata={
+                "model": DistributedItemMetadata(
+                    nested_path_to_metadata={
+                        ("weight",): [
+                            GlobalObjectMetadata(
+                                sharding_metadata=source_sharding,
+                                ranks=(0, 1),
+                            )
+                        ]
+                    },
+                    rank_to_layout_info={
+                        0: source_layout,
+                        1: LayoutInfo(
+                            file_path="missing_unselected_replica.pt",
+                            serialization_format=TorchSerialization(),
+                        ),
+                    },
+                )
+            },
+            world_size=2,
+        )
+        target_distributed_metadata = DistributedMetadata(
+            metadata={
+                "model": DistributedItemMetadata(
+                    nested_path_to_metadata={
+                        ("weight",): [
+                            GlobalObjectMetadata(
+                                sharding_metadata=target_sharding,
+                                ranks=(0,),
+                            )
+                        ]
+                    },
+                    rank_to_layout_info={0: configured_layout},
+                )
+            },
+            world_size=1,
+        )
+        with open(os.path.join(checkpoint_path, METADATA_FILE_NAME), "wb") as stream:
+            pickle.dump(source_distributed_metadata.to_dict(), stream)
+
+        target = torch.empty_like(source_value)
+        checkpoint_info = CheckpointInfo(
+            checkpoint_items={
+                "model": CheckpointItem(
+                    value={"weight": target},
+                    layout=configured_layout,
+                    resharder=resharder,
+                )
+            }
+        ).for_reads(
+            CheckpointMetadata(
+                distributed_metadata=target_distributed_metadata,
+                local_metadata={"model": {("weight",): target_sharding}},
+            )
+        )
+
+        loaded, missing = self.reader.read(checkpoint_path, checkpoint_info)
+
+        torch.testing.assert_close(loaded["model"]["weight"], source_value)
+        self.assertEqual(missing, [])
+
+    def test_missing_default_resharder_source_fails_during_resharded_read(self):
+        checkpoint_path = os.path.join(self.temp_dir, "missing_reshard_source")
+        os.makedirs(checkpoint_path)
+        torch.save({"step": 9}, os.path.join(checkpoint_path, "epoch_0.pt"))
+
+        source_value = torch.arange(8, dtype=torch.float32)
+        resharder = DefaultResharder()
+        source_sharding = resharder.extract_sharding_metadata(
+            "model", {"weight": source_value}
+        )[("weight",)]
+        target_sharding = replace(source_sharding, placements=(ShardSpec(0),))
+        source_distributed_metadata = DistributedMetadata(
+            metadata={
+                "model": DistributedItemMetadata(
+                    nested_path_to_metadata={
+                        ("weight",): [
+                            GlobalObjectMetadata(
+                                sharding_metadata=source_sharding,
+                                ranks=(0,),
+                            )
+                        ]
+                    },
+                    rank_to_layout_info={
+                        0: LayoutInfo(
+                            "missing_model.pt",
+                            TorchSerialization(),
+                        )
+                    },
+                )
+            },
+            world_size=1,
+        )
+        target_distributed_metadata = DistributedMetadata(
+            metadata={
+                "model": DistributedItemMetadata(
+                    nested_path_to_metadata={
+                        ("weight",): [
+                            GlobalObjectMetadata(
+                                sharding_metadata=target_sharding,
+                                ranks=(0,),
+                            )
+                        ]
+                    },
+                    rank_to_layout_info={0: None},
+                )
+            },
+            world_size=1,
+        )
+        with open(os.path.join(checkpoint_path, METADATA_FILE_NAME), "wb") as stream:
+            pickle.dump(source_distributed_metadata.to_dict(), stream)
+
+        direct_target = {"step": 0}
+        model_target = {"weight": torch.zeros_like(source_value)}
+        checkpoint_info = CheckpointInfo(
+            checkpoint_items={
+                "epoch": CheckpointItem(value=direct_target),
+                "model": CheckpointItem(
+                    value=model_target,
+                    resharder=resharder,
+                ),
+            }
+        ).for_reads(
+            CheckpointMetadata(
+                distributed_metadata=target_distributed_metadata,
+                local_metadata={"model": {("weight",): target_sharding}},
+            )
+        )
+
+        with pytest.raises(
+            (FileNotFoundError, RuntimeError),
+            match="missing_model.pt",
+        ):
+            self.reader.read(checkpoint_path, checkpoint_info)
+
+        # Metadata-owned paths are not probed during source resolution, so the
+        # direct item can be loaded before the missing resharded source is read.
+        self.assertEqual(direct_target, {"step": 9})
+        torch.testing.assert_close(
+            model_target["weight"],
+            torch.zeros_like(source_value),
+        )
 
     def test_read_partial_with_layout(self):
         """Test partial reading checkpoint with layout."""

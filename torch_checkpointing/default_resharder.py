@@ -24,7 +24,7 @@ import logging
 import zipfile
 from enum import auto, Enum
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 import torch
 import torch.distributed as dist
@@ -39,6 +39,7 @@ from torch.distributed.tensor.placement_types import (
 )
 from typing_extensions import override
 
+from .checkpoint_layout import LayoutInfo
 from .distributed_metadata import (
     DistributedItemMetadata,
     ShardingMetadata,
@@ -463,12 +464,9 @@ class DefaultResharder(Resharder):
         resharding_info = self._generate_load_plans(target_metadata, source_metadata)
 
         if resharding_info.nested_path_to_load_plans:
-            # Create src_path_fn using DistributedItemMetadata
-            def src_path_fn(source_rank: int) -> Path:
-                return source_metadata.get_file_path(source_rank, source_path, item_key)
-
             self._execute_load_plans(
-                src_path_fn,
+                source_path,
+                source_metadata,
                 item_key,
                 resharding_info.nested_path_to_load_plans,
                 target,
@@ -617,7 +615,8 @@ class DefaultResharder(Resharder):
 
     def _execute_load_plans(
         self,
-        src_path_fn: Callable[[int], Path],
+        source_path: Path,
+        source_metadata: DistributedItemMetadata,
         item_key: str,
         nested_path_to_load_plans: dict[NestedPath, list[LoadPlan]],
         target: Any,
@@ -629,7 +628,8 @@ class DefaultResharder(Resharder):
         source data into target tensors.
 
         Args:
-            src_path_fn: Callable that returns the file path for a given source rank.
+            source_path: Base path to the source checkpoint directory.
+            source_metadata: Source checkpoint metadata for this item.
             item_key: The checkpoint item key being loaded.
             nested_path_to_load_plans: Mapping from NestedPath to LoadPlans.
             target: Target dict-like structure to load data into.
@@ -645,9 +645,14 @@ class DefaultResharder(Resharder):
                     plans_by_rank[lp.src_rank] = []
                 plans_by_rank[lp.src_rank].append((nested_path, lp))
 
+        source_layouts_by_rank = {
+            src_rank: source_metadata.get_layout_info(src_rank, item_key)
+            for src_rank in plans_by_rank
+        }
         self._execute_load_plans_with_read_strategy(
             self._read_strategy,
-            src_path_fn,
+            source_path,
+            source_layouts_by_rank,
             item_key,
             plans_by_rank,
             target_by_path,
@@ -657,7 +662,8 @@ class DefaultResharder(Resharder):
     def _execute_load_plans_with_read_strategy(
         self,
         read_strategy: ReshardingReadStrategy,
-        src_path_fn: Callable[[int], Path],
+        source_path: Path,
+        source_layouts_by_rank: dict[int, LayoutInfo],
         item_key: str,
         plans_by_rank: dict[int, list[tuple[NestedPath, LoadPlan]]],
         target_by_path: dict[NestedPath, Any],
@@ -665,7 +671,7 @@ class DefaultResharder(Resharder):
     ) -> None:
         current_strategy = read_strategy
         for src_rank, rank_plans in plans_by_rank.items():
-            file_path = src_path_fn(src_rank)
+            file_path = source_path / source_layouts_by_rank[src_rank].file_path
             if current_strategy in (
                 ReshardingReadStrategy.AUTO,
                 ReshardingReadStrategy.OFFSET,
