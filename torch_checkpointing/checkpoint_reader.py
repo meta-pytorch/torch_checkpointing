@@ -27,7 +27,6 @@ from .checkpoint_base import (
 from .checkpoint_layout import (
     default_layout_info,
     JsonSerialization,
-    LayoutInfo,
     RawSerialization,
     SafetensorsSerialization,
     TorchSerialization,
@@ -47,23 +46,6 @@ from .utils import from_dict
 from .walk_utils import walk_checkpoint_structure
 
 logger = logging.getLogger(__name__)
-
-
-def _build_src_to_layout_info_mappings(
-    distributed_metadata: "DistributedMetadata",
-) -> dict[int, dict[str, LayoutInfo | None]]:
-    """Build a mapping from source ranks to their per-item layout info.
-
-    Pivots the per-item rank_to_layout_info into a per-rank item_to_layout_info
-    structure needed by the checkpoint reader for file path resolution.
-    """
-    result: dict[int, dict[str, LayoutInfo | None]] = {}
-    for item_key, item_metadata in distributed_metadata.metadata.items():
-        for rank, layout_info in item_metadata.rank_to_layout_info.items():
-            if rank not in result:
-                result[rank] = {}
-            result[rank][item_key] = layout_info
-    return result
 
 
 class CheckpointReader:
@@ -204,15 +186,6 @@ class CheckpointReader:
             ),
         )
 
-        # If resharding is needed, use metadata to determine source ranks for loading.
-        # This mapping uses source ranks as keys because the world size or device mesh
-        # may differ between when the checkpoint was saved and when it is loaded.
-        src_to_layout_info_mappings = (
-            _build_src_to_layout_info_mappings(source_distributed_metadata)
-            if source_distributed_metadata
-            else None
-        )
-
         # Split items into two lists based on whether they need resharding
         items_needing_reshard: dict[str, CheckpointItem] = {}
         items_not_needing_reshard: dict[str, CheckpointItem] = {}
@@ -258,7 +231,6 @@ class CheckpointReader:
         if items_needing_reshard:
             assert checkpoint_metadata is not None
             assert source_distributed_metadata is not None
-            assert src_to_layout_info_mappings is not None
             checkpoint_info_reshard = CheckpointInfo(
                 checkpoint_items=items_needing_reshard
             )
@@ -266,7 +238,6 @@ class CheckpointReader:
                 path,
                 checkpoint_info_reshard,
                 checkpoint_metadata,
-                src_to_layout_info_mappings,
                 source_distributed_metadata,
                 map_location=map_location,
             )
@@ -405,7 +376,6 @@ class CheckpointReader:
         path: str,
         checkpoint_info: CheckpointInfo,
         checkpoint_metadata: CheckpointMetadata,
-        src_to_layout_info_mappings: dict[int, dict[str, LayoutInfo | None]],
         distributed_metadata: DistributedMetadata,
         *,
         map_location: Any = None,
@@ -426,8 +396,6 @@ class CheckpointReader:
                 All items must have non-None resharders.
             checkpoint_metadata: Metadata for the target checkpoint, containing
                 local metadata for generating load plans.
-            src_to_layout_info_mappings: Mapping from source ranks to their layout info,
-                used to locate checkpoint files from different source ranks.
             distributed_metadata: Source distributed metadata from the saved checkpoint,
                 used for resharding decisions.
             map_location: Device mapping for tensor relocation.
