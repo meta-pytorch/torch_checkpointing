@@ -376,7 +376,7 @@ was called, not whatever the trainer advanced to later.
 Both savers ultimately drive a `CheckpointWriter` (the sync saver directly, the
 async saver inside the subprocess). `write(path, checkpoint_info)` iterates
 `checkpoint_info.layout_info_mappings`, skipping keys absent from the state dict
-and filling in `default_layout_info(key, global_rank)` where no layout was
+and filling in `default_torch_layout_info(key, global_rank)` where no layout was
 specified. Files are written in parallel by a `ThreadPoolExecutor` sized by
 `file_write_max_threads`, and `_write_key` dispatches on the layout's
 serialization format:
@@ -425,7 +425,7 @@ delegates to each item's `Resharder.load`) and those that do not (routed through
 ### Dispatch on serialization format
 
 For non-resharded items, `_load_full_file` resolves the per-key
-`LayoutInfo` (falling back to `default_layout_info`) and dispatches on the
+`LayoutInfo` (falling back to `default_torch_layout_info`) and dispatches on the
 serialization format:
 
 - **`TorchSerialization`** — by default routes through

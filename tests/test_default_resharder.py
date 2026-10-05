@@ -33,7 +33,7 @@ from torch_checkpointing.checkpoint_base import (
     CheckpointItem,
     CheckpointReadInfo,
 )
-from torch_checkpointing.checkpoint_layout import default_layout_info
+from torch_checkpointing.checkpoint_layout import default_torch_layout_info
 from torch_checkpointing.checkpoint_reader import CheckpointReader
 from torch_checkpointing.default_resharder import (
     compute_local_shard_info,
@@ -219,7 +219,7 @@ class TestDefaultResharder(DTensorTestBase):
             if item.layout is not None:
                 file_path = os.path.join(checkpoint_dir, item.layout.file_path)
             else:
-                layout = default_layout_info(key, self.rank)
+                layout = default_torch_layout_info(key, self.rank)
                 file_path = os.path.join(checkpoint_dir, layout.file_path)
 
             torch.save(item.value, file_path)

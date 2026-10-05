@@ -320,16 +320,15 @@ class LayoutInfo:
         )
 
 
-def default_layout_info(key: str, rank: int) -> LayoutInfo:
-    """
-    Default layout info for a key and rank.
+def default_torch_layout_info(key: str, rank: int) -> LayoutInfo:
+    """Default per-rank Torch serialization layout for a checkpoint item.
 
     Args:
-        key (str): The key to use in the layout.
-        rank (int): The rank to use in the layout.
+        key: The checkpoint item key.
+        rank: The rank whose file is being named.
 
     Returns:
-        LayoutInfo: The layout info for the key and rank.
+        The ``<key>_<rank>.pt`` layout used by the native Torch writer.
     """
     return LayoutInfo(
         f"{key}_{rank}.pt",

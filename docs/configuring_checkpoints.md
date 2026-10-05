@@ -191,7 +191,7 @@ When `layout` is `None`, the writer falls back to a per-rank default. Internally
 this is:
 
 ```python
-def default_layout_info(key: str, rank: int) -> LayoutInfo:
+def default_torch_layout_info(key: str, rank: int) -> LayoutInfo:
     return LayoutInfo(
         f"{key}_{rank}.pt",
         TorchSerialization(),

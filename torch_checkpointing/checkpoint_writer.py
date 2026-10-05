@@ -25,7 +25,7 @@ import torch
 from .barriers import Barrier, BarrierConfig, DefaultStoreBarrierConfig
 from .checkpoint_base import CheckpointWriteInfo
 from .checkpoint_layout import (
-    default_layout_info,
+    default_torch_layout_info,
     JsonSerialization,
     LayoutInfo,
     RawSerialization,
@@ -205,7 +205,9 @@ class CheckpointWriter:
                 continue
 
             if layout_info is None:
-                layout_info = default_layout_info(key, self._args.rank_info.global_rank)
+                layout_info = default_torch_layout_info(
+                    key, self._args.rank_info.global_rank
+                )
             save_items.append((key, layout_info, tmp_dir_path / layout_info.file_path))
 
         self._write_keys(save_items, state_dict)

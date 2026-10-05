@@ -25,7 +25,7 @@ from .checkpoint_base import (
     CheckpointReadInfo,
 )
 from .checkpoint_layout import (
-    default_layout_info,
+    default_torch_layout_info,
     JsonSerialization,
     RawSerialization,
     SafetensorsSerialization,
@@ -328,7 +328,9 @@ class CheckpointReader:
 
             layout_info = checkpoint_info.layout_info_mappings[key]
             if layout_info is None:
-                layout_info = default_layout_info(key, self._rank_info.global_rank)
+                layout_info = default_torch_layout_info(
+                    key, self._rank_info.global_rank
+                )
 
             file_path = Path(path) / layout_info.file_path
             if not self._storage.exists(file_path):

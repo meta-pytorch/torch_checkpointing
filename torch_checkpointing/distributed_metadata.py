@@ -28,7 +28,7 @@ from functools import cached_property
 from pathlib import Path
 from typing import Any, ClassVar
 
-from .checkpoint_layout import default_layout_info, LayoutInfo
+from .checkpoint_layout import default_torch_layout_info, LayoutInfo
 from .logging_utils import EventLogger, EventType
 from .storage.base_storage import Storage
 from .types import CheckpointPath, NestedPath
@@ -209,7 +209,7 @@ class DistributedItemMetadata:
         """Layout for a given rank, defaulted when the checkpoint omits one."""
         layout = self.rank_to_layout_info.get(rank)
         if layout is None:
-            layout = default_layout_info(item_key, rank)
+            layout = default_torch_layout_info(item_key, rank)
         return layout
 
     def get_file_path(self, rank: int, checkpoint_path: Path, item_key: str) -> Path:
