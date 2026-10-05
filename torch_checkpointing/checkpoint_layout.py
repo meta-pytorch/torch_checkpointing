@@ -47,13 +47,24 @@ import abc
 import importlib
 import logging
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, final
 
 logger = logging.getLogger(__name__)
 
 
 class SerializationFormat(abc.ABC):
     """Base class for defining how data should be serialized to storage."""
+
+    @final
+    @staticmethod
+    def supported_types() -> tuple[type["SerializationFormat"], ...]:
+        """Return concrete payload formats built into this module."""
+        return (
+            TorchSerialization,
+            JsonSerialization,
+            RawSerialization,
+            SafetensorsSerialization,
+        )
 
     @abc.abstractmethod
     def to_dict(self) -> dict[str, Any]:
@@ -339,13 +350,14 @@ def default_torch_layout_info(key: str, rank: int) -> LayoutInfo:
 def serialization_format_from_dict(d: dict[str, Any]) -> SerializationFormat:
     """Factory function to deserialize a SerializationFormat from a dictionary."""
     type_name = d.get("type")
-    if type_name == "TorchSerialization":
-        return TorchSerialization.from_dict(d)
-    elif type_name == "JsonSerialization":
-        return JsonSerialization.from_dict(d)
-    elif type_name == "RawSerialization":
-        return RawSerialization.from_dict(d)
-    elif type_name == "SafetensorsSerialization":
-        return SafetensorsSerialization.from_dict(d)
-    else:
+    format_type = next(
+        (
+            format_type
+            for format_type in SerializationFormat.supported_types()
+            if format_type.__name__ == type_name
+        ),
+        None,
+    )
+    if format_type is None:
         raise ValueError(f"Unknown SerializationFormat type: {type_name}")
+    return format_type.from_dict(d)
