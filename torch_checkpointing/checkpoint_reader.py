@@ -13,7 +13,7 @@ determining checkpoint layout and configuring the reader.
 
 import json
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any, ClassVar
 
@@ -27,6 +27,7 @@ from .checkpoint_base import (
 from .checkpoint_layout import (
     default_torch_layout_info,
     JsonSerialization,
+    LayoutInfo,
     RawSerialization,
     SafetensorsSerialization,
     TorchSerialization,
@@ -34,13 +35,12 @@ from .checkpoint_layout import (
 from .distributed_metadata import (
     CheckpointMetadata,
     DistributedItemMetadata,
-    DistributedMetadata,
     ShardingMetadata,
 )
 from .logging_utils import EventLogger, EventType
 from .metadata_serialization import (
+    DistributedMetadataFormat,
     load_distributed_metadata,
-    RankAddressableDistributedMetadataFormat,
     TorchDistributedMetadataFormat,
 )
 from .storage.base_storage import Storage, StorageConfig
@@ -61,11 +61,11 @@ class CheckpointReader:
     all ranks in a distributed setting complete their checkpoint operations.
     """
 
-    # Reader-owned formats back loads without resharding, which find each
-    # rank's file by convention, so every one must be rank addressable.
-    _METADATA_FORMATS: ClassVar[
-        tuple[type[RankAddressableDistributedMetadataFormat], ...]
-    ] = (TorchDistributedMetadataFormat,)
+    # Formats tried, in order, to load a checkpoint's distributed metadata when
+    # an item may need resharding.
+    _METADATA_FORMATS: ClassVar[tuple[type[DistributedMetadataFormat], ...]] = (
+        TorchDistributedMetadataFormat,
+    )
 
     # Readers whose checkpoints always carry distributed metadata reject a
     # directory with none. Without this, a missing or renamed metadata artifact
@@ -178,10 +178,16 @@ class CheckpointReader:
                 logger.info(
                     "No resharders configured: skipping metadata loading and using direct file reads"
                 )
+            source_layouts = self._resolve_layouts_without_resharding(
+                checkpoint_info,
+                {},
+                requested_rank=self._rank_info.global_rank,
+            )
             # _read_without_resharding loads full files and filters to requested keys
             result, missing_paths = self._read_without_resharding(
                 path,
                 checkpoint_info,
+                source_layouts,
                 map_location=map_location,
             )
             missing_keys = [str(checkpoint_path) for checkpoint_path in missing_paths]
@@ -203,6 +209,11 @@ class CheckpointReader:
                 f"No distributed metadata found in {path}; tried "
                 f"{[fmt.__name__ for fmt in self._METADATA_FORMATS]}"
             )
+        source_metadata = (
+            source_distributed_metadata.metadata
+            if source_distributed_metadata is not None
+            else {}
+        )
         logger.info(
             "Finished reading checkpoint metadata",
             extra=event_logger(
@@ -217,11 +228,7 @@ class CheckpointReader:
 
         for key, item in checkpoint_info.checkpoint_items.items():
             # Get item-level metadata for should_reshard check
-            source_item_metadata: DistributedItemMetadata | None = (
-                source_distributed_metadata.metadata.get(key)
-                if source_distributed_metadata
-                else None
-            )
+            source_item_metadata = source_metadata.get(key)
 
             # Extract target metadata for this item from local_metadata
             target_metadata: dict[NestedPath, ShardingMetadata] | None = None
@@ -232,6 +239,9 @@ class CheckpointReader:
             if item.resharder is not None and item.resharder.should_reshard(
                 source_item_metadata, target_metadata
             ):
+                assert source_item_metadata is not None, (
+                    f"Missing source metadata for checkpoint item {key!r}"
+                )
                 items_needing_reshard[key] = item
             else:
                 items_not_needing_reshard[key] = item
@@ -244,9 +254,15 @@ class CheckpointReader:
             checkpoint_info_no_reshard = CheckpointInfo(
                 checkpoint_items=items_not_needing_reshard
             )
+            source_layouts = self._resolve_layouts_without_resharding(
+                checkpoint_info_no_reshard,
+                source_metadata,
+                requested_rank=self._rank_info.global_rank,
+            )
             non_reshard_result, non_reshard_missing = self._read_without_resharding(
                 path,
                 checkpoint_info_no_reshard,
+                source_layouts,
                 map_location=map_location,
             )
             result_dict.update(non_reshard_result)
@@ -255,7 +271,6 @@ class CheckpointReader:
         # Load items that need resharding
         if items_needing_reshard:
             assert checkpoint_metadata is not None
-            assert source_distributed_metadata is not None
             checkpoint_info_reshard = CheckpointInfo(
                 checkpoint_items=items_needing_reshard
             )
@@ -263,7 +278,7 @@ class CheckpointReader:
                 path,
                 checkpoint_info_reshard,
                 checkpoint_metadata,
-                source_distributed_metadata,
+                source_metadata,
                 map_location=map_location,
             )
             result_dict.update(reshard_result)
@@ -285,10 +300,47 @@ class CheckpointReader:
         )
         return result_dict, missing_keys
 
+    def _resolve_layouts_without_resharding(
+        self,
+        checkpoint_info: CheckpointInfo,
+        source_metadata: Mapping[str, DistributedItemMetadata],
+        *,
+        requested_rank: int,
+    ) -> dict[str, LayoutInfo]:
+        """Resolve the checkpoint-relative layout of each item read without resharding.
+
+        Sources for each item, highest priority first:
+
+        1. The layout recorded for this rank in source metadata, which is
+           loaded only when another item in the same read reshards.
+        2. The layout configured on the item.
+        3. The default ``<item_key>_<rank>.pt`` layout.
+
+        Nothing is probed: if a resolved file is absent, the read fails naming
+        the item instead of falling back to another file.
+        """
+        layouts: dict[str, LayoutInfo] = {}
+        for item_key, item in checkpoint_info.checkpoint_items.items():
+            source_item_metadata = source_metadata.get(item_key)
+            # Not get_layout_info: its default would shadow a configured layout.
+            recorded = (
+                source_item_metadata.rank_to_layout_info.get(requested_rank)
+                if source_item_metadata is not None
+                else None
+            )
+            if recorded is not None:
+                layouts[item_key] = recorded
+            elif item.layout is not None:
+                layouts[item_key] = item.layout
+            else:
+                layouts[item_key] = default_torch_layout_info(item_key, requested_rank)
+        return layouts
+
     def _read_without_resharding(
         self,
         path: str,
         checkpoint_info: CheckpointInfo,
+        source_layouts_by_item_key: Mapping[str, LayoutInfo],
         *,
         map_location: Any = None,
     ) -> tuple[STATE_DICT, list[CheckpointPath]]:
@@ -302,6 +354,8 @@ class CheckpointReader:
         Args:
             path: Path to the checkpoint directory.
             checkpoint_info: Encapsulates state_dict and layout_info_mappings.
+            source_layouts_by_item_key: Checkpoint-relative source layout for
+                each item.
             map_location: Device mapping for tensor relocation.
 
         Returns:
@@ -316,35 +370,12 @@ class CheckpointReader:
         missing_paths: list[CheckpointPath] = []
 
         for key in checkpoint_info.keys:
-            if key not in checkpoint_info.layout_info_mappings:
-                logger.warning(
-                    f"Item {key=} not found in layout_info_mappings. Skipping."
-                )
-
-                # Add all leaf keys to missing_keys
-                def collect_all_paths(
-                    checkpoint_path: CheckpointPath, src: Any, tgt: Any
-                ) -> Any:
-                    missing_paths.append(checkpoint_path)
-                    return src
-
-                walk_checkpoint_structure(
-                    item_key=key,
-                    source=checkpoint_info.checkpoint_items[key].value,
-                    target=None,
-                    leaf_fn=collect_all_paths,
-                )
-                continue
-
-            layout_info = checkpoint_info.layout_info_mappings[key]
-            if layout_info is None:
-                layout_info = default_torch_layout_info(
-                    key, self._rank_info.global_rank
-                )
-
+            layout_info = source_layouts_by_item_key[key]
             file_path = Path(path) / layout_info.file_path
             if not self._storage.exists(file_path):
-                raise RuntimeError(f"Missing file {file_path} for key {key}.")
+                raise FileNotFoundError(
+                    f"Missing file {file_path} for checkpoint item {key!r}."
+                )
 
             loaded_data = self._load_full_file(
                 file_path, layout_info, map_location=map_location
@@ -378,7 +409,7 @@ class CheckpointReader:
                 ),
             )
         logger.info(
-            f"Successfully read checkpoint file from {path} without resharding",
+            "Successfully read checkpoint without resharding",
             extra=event_logger(EventType.LOG_METRIC, end_to_end=True),
         )
         return result_dict, missing_paths
@@ -388,7 +419,7 @@ class CheckpointReader:
         path: str,
         checkpoint_info: CheckpointInfo,
         checkpoint_metadata: CheckpointMetadata,
-        distributed_metadata: DistributedMetadata,
+        source_metadata: Mapping[str, DistributedItemMetadata],
         *,
         map_location: Any = None,
     ) -> tuple[STATE_DICT, list[CheckpointPath]]:
@@ -408,8 +439,7 @@ class CheckpointReader:
                 All items must have non-None resharders.
             checkpoint_metadata: Metadata for the target checkpoint, containing
                 local metadata for generating load plans.
-            distributed_metadata: Source distributed metadata from the saved checkpoint,
-                used for resharding decisions.
+            source_metadata: Source distributed metadata and file layouts.
             map_location: Device mapping for tensor relocation.
 
         Returns:
@@ -438,7 +468,7 @@ class CheckpointReader:
             )
 
             # Get item-level source metadata (direct access by item_key)
-            source_item_metadata = distributed_metadata.metadata.get(key)
+            source_item_metadata = source_metadata.get(key)
 
             if not target_metadata or source_item_metadata is None:
                 logger.warning(f"Missing metadata for item {key}, skipping resharding")

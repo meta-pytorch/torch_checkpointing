@@ -9,6 +9,7 @@ import os
 import pickle
 import shutil
 import tempfile
+import unittest.mock as mock
 from dataclasses import replace
 from typing import Any
 
@@ -104,6 +105,27 @@ class NoOpResharder(Resharder):
 
     def should_reshard(self, source_metadata, target_metadata):
         return False  # Never actually reshard
+
+
+class LoadRecordingDefaultResharder(DefaultResharder):
+    """DefaultResharder subclass whose public load method must remain authoritative."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.load_called = False
+
+    def load(
+        self,
+        source_path,
+        item_key,
+        target_metadata,
+        source_metadata,
+        target,
+        storage,
+    ) -> list[NestedPath]:
+        self.load_called = True
+        target["weight"].fill_(17)
+        return []
 
 
 class SimpleCheckpoint(CheckpointBase):
@@ -592,6 +614,97 @@ class TestCheckpointReader(TestCase):
         torch.testing.assert_close(loaded["model"]["weight"], source_value)
         self.assertEqual(missing, [])
 
+    def test_default_resharder_subclass_uses_its_public_load_method(self):
+        checkpoint_path = os.path.join(self.temp_dir, "default_subclass")
+        os.makedirs(checkpoint_path)
+        source_value = torch.arange(8, dtype=torch.float32)
+        base_resharder = DefaultResharder()
+        source_sharding = base_resharder.extract_sharding_metadata(
+            "model", {"weight": source_value}
+        )[("weight",)]
+        target_sharding = replace(source_sharding, placements=(ShardSpec(0),))
+        source_distributed_metadata = DistributedMetadata(
+            metadata={
+                "model": DistributedItemMetadata(
+                    nested_path_to_metadata={
+                        ("weight",): [
+                            GlobalObjectMetadata(
+                                sharding_metadata=source_sharding,
+                                ranks=(0,),
+                            )
+                        ]
+                    },
+                    rank_to_layout_info={0: None},
+                )
+            },
+            world_size=1,
+        )
+        target_distributed_metadata = DistributedMetadata(
+            metadata={
+                "model": DistributedItemMetadata(
+                    nested_path_to_metadata={
+                        ("weight",): [
+                            GlobalObjectMetadata(
+                                sharding_metadata=target_sharding,
+                                ranks=(0,),
+                            )
+                        ]
+                    },
+                    rank_to_layout_info={0: None},
+                )
+            },
+            world_size=1,
+        )
+        with open(os.path.join(checkpoint_path, METADATA_FILE_NAME), "wb") as stream:
+            pickle.dump(source_distributed_metadata.to_dict(), stream)
+
+        target = torch.zeros_like(source_value)
+        resharder = LoadRecordingDefaultResharder()
+        checkpoint_info = CheckpointInfo(
+            checkpoint_items={
+                "model": CheckpointItem(
+                    value={"weight": target},
+                    resharder=resharder,
+                )
+            }
+        ).for_reads(
+            CheckpointMetadata(
+                distributed_metadata=target_distributed_metadata,
+                local_metadata={"model": {("weight",): target_sharding}},
+            )
+        )
+
+        loaded, missing = self.reader.read(checkpoint_path, checkpoint_info)
+
+        self.assertTrue(resharder.load_called)
+        torch.testing.assert_close(
+            loaded["model"]["weight"],
+            torch.full_like(source_value, 17),
+        )
+        self.assertEqual(missing, [])
+
+    def test_resharding_requires_source_metadata(self):
+        checkpoint_path = os.path.join(self.temp_dir, "missing_source_metadata")
+        os.makedirs(checkpoint_path)
+        resharder = NoOpResharder()
+        checkpoint_info = CheckpointInfo(
+            checkpoint_items={
+                "model": CheckpointItem(
+                    value={"weight": torch.zeros(1)},
+                    resharder=resharder,
+                )
+            }
+        ).for_reads()
+
+        with (
+            mock.patch.object(resharder, "should_reshard", return_value=True),
+            self.assertRaisesRegex(
+                AssertionError,
+                "Missing source metadata for checkpoint item 'model'",
+            ),
+        ):
+            self.reader.read(checkpoint_path, checkpoint_info)
+
     def test_missing_default_resharder_source_fails_during_resharded_read(self):
         checkpoint_path = os.path.join(self.temp_dir, "missing_reshard_source")
         os.makedirs(checkpoint_path)
@@ -672,6 +785,261 @@ class TestCheckpointReader(TestCase):
         torch.testing.assert_close(
             model_target["weight"],
             torch.zeros_like(source_value),
+        )
+
+    def test_direct_read_prefers_configured_layout_path(self):
+        checkpoint_path = os.path.join(self.temp_dir, "configured_layout")
+        os.makedirs(checkpoint_path)
+        configured_layout = LayoutInfo(
+            file_path="custom_model.pt",
+            serialization_format=TorchSerialization(),
+        )
+        configured_value = {"source": "configured"}
+        torch.save(configured_value, os.path.join(checkpoint_path, "custom_model.pt"))
+        torch.save(
+            {"source": "default"},
+            os.path.join(checkpoint_path, "model_0.pt"),
+        )
+
+        checkpoint_info = CheckpointInfo(
+            checkpoint_items={
+                "model": CheckpointItem(
+                    value=None,
+                    layout=configured_layout,
+                    resharder=None,
+                )
+            }
+        )
+
+        with (
+            mock.patch.object(
+                self.reader._storage,
+                "ls",
+                side_effect=AssertionError("direct reads must not call storage.ls()"),
+            ),
+            mock.patch.object(
+                self.reader._storage,
+                "glob",
+                side_effect=AssertionError("direct reads must not call storage.glob()"),
+            ),
+        ):
+            loaded, missing = self.reader.read(checkpoint_path, checkpoint_info)
+
+        self.assertEqual(loaded, {"model": configured_value})
+        self.assertEqual(missing, [])
+
+    def test_direct_read_uses_default_torch_path_for_loading_rank(self):
+        checkpoint_path = os.path.join(self.temp_dir, "default_layout")
+        os.makedirs(checkpoint_path)
+        loading_rank = 3
+        expected = {"source": "rank_3"}
+        torch.save(expected, os.path.join(checkpoint_path, "model_3.pt"))
+        torch.save(
+            {"source": "wrong_rank"},
+            os.path.join(checkpoint_path, "model_0.pt"),
+        )
+        reader = CheckpointReader(
+            rank_info=RankInfo(
+                global_rank=loading_rank,
+                global_world_size=4,
+                role_rank=loading_rank,
+                role_world_size=4,
+            ),
+            storage_config=LocalFileSystemStorageConfig(),
+        )
+        checkpoint_info = CheckpointInfo(
+            checkpoint_items={"model": CheckpointItem(resharder=None)}
+        )
+
+        with (
+            mock.patch.object(
+                reader._storage,
+                "ls",
+                side_effect=AssertionError("direct reads must not call storage.ls()"),
+            ),
+            mock.patch.object(
+                reader._storage,
+                "glob",
+                side_effect=AssertionError("direct reads must not call storage.glob()"),
+            ),
+        ):
+            loaded, missing = reader.read(checkpoint_path, checkpoint_info)
+
+        self.assertEqual(loaded, {"model": expected})
+        self.assertEqual(missing, [])
+
+    def test_recorded_layout_wins_over_a_configured_one(self):
+        configured = LayoutInfo("configured_model.pt", TorchSerialization())
+        recorded = LayoutInfo("recorded_model.pt", TorchSerialization())
+        source_metadata = {
+            "model": DistributedItemMetadata(
+                nested_path_to_metadata={},
+                rank_to_layout_info={0: recorded},
+            )
+        }
+
+        resolved = self.reader._resolve_layouts_without_resharding(
+            CheckpointInfo(
+                checkpoint_items={"model": CheckpointItem(layout=configured)}
+            ),
+            source_metadata,
+            requested_rank=0,
+        )
+
+        self.assertEqual(resolved, {"model": recorded})
+
+    def test_configured_layout_is_used_when_metadata_omits_the_rank(self):
+        configured = LayoutInfo("configured_model.pt", TorchSerialization())
+        source_metadata = {
+            "model": DistributedItemMetadata(
+                nested_path_to_metadata={},
+                rank_to_layout_info={1: LayoutInfo("model_1.pt", TorchSerialization())},
+            )
+        }
+
+        resolved = self.reader._resolve_layouts_without_resharding(
+            CheckpointInfo(
+                checkpoint_items={"model": CheckpointItem(layout=configured)}
+            ),
+            source_metadata,
+            requested_rank=0,
+        )
+
+        self.assertEqual(resolved, {"model": configured})
+
+    def test_metadata_source_layout_is_used_without_a_storage_probe(self):
+        source_layout = LayoutInfo("missing_model.pt", TorchSerialization())
+        source_metadata = {
+            "model": DistributedItemMetadata(
+                nested_path_to_metadata={},
+                rank_to_layout_info={0: source_layout},
+            )
+        }
+        checkpoint_info = CheckpointInfo(
+            checkpoint_items={"model": CheckpointItem(value=None)}
+        )
+
+        with (
+            mock.patch.object(
+                self.reader._storage,
+                "exists",
+                side_effect=AssertionError("metadata-owned paths must not be probed"),
+            ),
+            mock.patch.object(
+                self.reader._storage,
+                "getsize",
+                side_effect=AssertionError("metadata-owned paths must not be probed"),
+            ),
+        ):
+            resolved = self.reader._resolve_layouts_without_resharding(
+                checkpoint_info,
+                source_metadata,
+                requested_rank=0,
+            )
+
+        self.assertEqual(resolved, {"model": source_layout})
+
+    def test_direct_read_fails_on_a_missing_configured_path(self):
+        """A declared path that is absent fails naming itself.
+
+        Conventional files for the same item sit next to it here; falling back
+        to one of those would silently load something the caller did not ask
+        for.
+        """
+        checkpoint_path = os.path.join(self.temp_dir, "missing_configured_layout")
+        os.makedirs(checkpoint_path)
+        torch.save(
+            {"source": "default_torch"},
+            os.path.join(checkpoint_path, "model_0.pt"),
+        )
+        with open(os.path.join(checkpoint_path, "model_0.json"), "w") as stream:
+            json.dump({"source": "default_json"}, stream)
+        configured_layout = LayoutInfo(
+            file_path="missing_custom_model.pt",
+            serialization_format=TorchSerialization(),
+        )
+        checkpoint_info = CheckpointInfo(
+            checkpoint_items={
+                "model": CheckpointItem(
+                    value=None,
+                    layout=configured_layout,
+                    resharder=None,
+                )
+            }
+        )
+
+        with (
+            mock.patch.object(
+                self.reader._storage,
+                "ls",
+                side_effect=AssertionError("direct reads must not call storage.ls()"),
+            ),
+            mock.patch.object(
+                self.reader._storage,
+                "glob",
+                side_effect=AssertionError("direct reads must not call storage.glob()"),
+            ),
+        ):
+            with self.assertRaises(FileNotFoundError) as context:
+                self.reader.read(checkpoint_path, checkpoint_info)
+
+        self.assertIn("missing_custom_model.pt", str(context.exception))
+
+    def test_layout_without_resharding_defaults_to_torch_without_probing(self):
+        with mock.patch.object(
+            self.reader._storage,
+            "exists",
+            side_effect=AssertionError("layout resolution must not probe storage"),
+        ):
+            resolved = self.reader._resolve_layouts_without_resharding(
+                CheckpointInfo(checkpoint_items={"model": CheckpointItem()}),
+                {},
+                requested_rank=0,
+            )
+
+        self.assertEqual(
+            resolved["model"],
+            LayoutInfo("model_0.pt", TorchSerialization()),
+        )
+
+    def test_direct_read_does_not_guess_other_payload_formats(self):
+        """A file in another payload format needs a layout or metadata."""
+        checkpoint_path = os.path.join(self.temp_dir, "undeclared_json")
+        os.makedirs(checkpoint_path)
+        with open(os.path.join(checkpoint_path, "epoch_0.json"), "w") as stream:
+            json.dump({"epoch": 1}, stream)
+
+        with pytest.raises(FileNotFoundError, match="'epoch'"):
+            self.reader.read(
+                checkpoint_path,
+                CheckpointInfo(checkpoint_items={"epoch": CheckpointItem()}),
+            )
+
+    def test_direct_read_layouts_default_items_missing_from_metadata(self):
+        source_layout = LayoutInfo("model_from_metadata.pt", TorchSerialization())
+        source_metadata = {
+            "model": DistributedItemMetadata(
+                nested_path_to_metadata={},
+                rank_to_layout_info={0: source_layout},
+            )
+        }
+
+        resolved = self.reader._resolve_layouts_without_resharding(
+            CheckpointInfo(
+                checkpoint_items={
+                    "model": CheckpointItem(),
+                    "epoch": CheckpointItem(),
+                }
+            ),
+            source_metadata,
+            requested_rank=0,
+        )
+
+        self.assertEqual(resolved["model"].file_path, "model_from_metadata.pt")
+        self.assertEqual(resolved["epoch"].file_path, "epoch_0.pt")
+        self.assertIsInstance(
+            resolved["epoch"].serialization_format,
+            TorchSerialization,
         )
 
     def test_read_partial_with_layout(self):
@@ -796,6 +1164,11 @@ class TestCheckpointReader(TestCase):
 
     def test_read_without_resharders_skips_metadata(self):
         """Test that read without resharders configured skips metadata loading."""
+        with open(
+            os.path.join(self.checkpoint_path, METADATA_FILE_NAME), "wb"
+        ) as stream:
+            stream.write(b"not valid pickle data")
+
         # Create a template checkpoint with layout for all keys but NO resharders
         template_state_dict = dict.fromkeys(self.state_dict.keys(), None)
         template_checkpoint = SimpleCheckpoint(
@@ -893,6 +1266,11 @@ class TestCheckpointReader(TestCase):
 
     def test_resharder_skip_resharding_uses_fast_path(self):
         """Test that resharders with skip_resharding=True use the fast path."""
+        with open(
+            os.path.join(self.checkpoint_path, METADATA_FILE_NAME), "wb"
+        ) as stream:
+            stream.write(b"not valid pickle data")
+
         # Create a template checkpoint with resharders that have skip_resharding=True
         template_state_dict = dict.fromkeys(self.state_dict.keys(), None)
         template_checkpoint = SimpleCheckpoint(
@@ -957,9 +1335,9 @@ class TestCheckpointReader(TestCase):
         checkpoint_info = CheckpointInfo(checkpoint_items=checkpoint_items)
 
         # Read the checkpoint - should only load model
-        loaded_state_dict, missing_keys = self.reader._read_without_resharding(
+        loaded_state_dict, missing_keys = self.reader.read(
             path=single_item_path,
-            checkpoint_info=checkpoint_info,
+            checkpoint_info=checkpoint_info.for_reads(),
         )
 
         # Model should be loaded
@@ -984,11 +1362,11 @@ class TestCheckpointReader(TestCase):
             checkpoint_items=checkpoint_items_with_missing
         )
 
-        # Should raise RuntimeError for missing optimizer file
-        with self.assertRaises(RuntimeError) as context:
-            self.reader._read_without_resharding(
+        # Should raise FileNotFoundError for missing optimizer file
+        with self.assertRaises(FileNotFoundError) as context:
+            self.reader.read(
                 path=single_item_path,
-                checkpoint_info=checkpoint_info_with_missing,
+                checkpoint_info=checkpoint_info_with_missing.for_reads(),
             )
         self.assertIn("Missing file", str(context.exception))
         self.assertIn("optimizer", str(context.exception))

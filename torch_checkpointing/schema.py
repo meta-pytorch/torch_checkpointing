@@ -49,10 +49,13 @@ class ItemSpec:
         requires_copy (bool): Whether the value must be copied during async staging so
             the training loop can keep mutating it without a race. See
             `CheckpointItem`.
-        layout (LayoutInfo | None): Where/how to store the item. ``None`` delegates the
-            on-disk layout to the checkpoint engine's default per-rank policy. A
-            ``"{rank}"`` placeholder in ``file_path`` is materialized per rank at
-            save/load time.
+        layout (LayoutInfo | None): The exact path and serialization format to use
+            when saving the item. During direct loads, this is also the configured
+            source fallback. ``None`` uses the native default: ``TorchSerialization``
+            at ``<item_key>_<rank>.pt``, e.g. ``model_3.pt`` for item ``model`` on
+            rank 3. A ``"{rank}"`` placeholder in ``file_path`` is materialized per
+            rank at save/load time. Persisted source metadata is authoritative when
+            a metadata-aware load uses it.
         resharder (Resharder | None): Optional resharder for loading across a different sharding
             than was saved. When any item declares one, resharding is enabled
             transparently on both save and load. Resharding relies on metadata

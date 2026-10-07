@@ -50,9 +50,12 @@ class CheckpointItem:
         Whether the value requires a copy during async checkpointing, as otherwise
         it can get changed by the caller, causing a race condition.
     layout:
-        Provides instructions on where to save the item. All items without a layout
-        will be saved into a file with the same name as the key + rank id
-        using `torch.save()`.
+        The exact path and serialization format to use when saving the item.
+        During direct loads, this is also the configured source fallback. Items
+        without a layout use the native default: ``TorchSerialization`` at
+        ``<item_key>_<rank>.pt``, e.g. ``model_3.pt`` for item ``model`` on rank
+        3. Persisted source metadata is authoritative when a metadata-aware load
+        uses it.
     resharder:
         Optional resharder for redistributing checkpoint data across different
         parallelization strategies during loading. Used when the checkpoint was
