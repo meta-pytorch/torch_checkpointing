@@ -11,6 +11,7 @@ import shutil
 import tempfile
 import unittest.mock as mock
 from dataclasses import replace
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -105,6 +106,16 @@ class NoOpResharder(Resharder):
 
     def should_reshard(self, source_metadata, target_metadata):
         return False  # Never actually reshard
+
+
+class _SkippingResharder(NoOpResharder):
+    """Skips resharding, and fails the test if asked whether to reshard."""
+
+    def __init__(self) -> None:
+        super().__init__(skip_resharding=True)
+
+    def should_reshard(self, source_metadata, target_metadata):
+        raise AssertionError("should_reshard must not run when skip_resharding")
 
 
 class LoadRecordingDefaultResharder(DefaultResharder):
@@ -1370,6 +1381,34 @@ class TestCheckpointReader(TestCase):
             )
         self.assertIn("Missing file", str(context.exception))
         self.assertIn("optimizer", str(context.exception))
+
+
+def test_skipping_item_is_read_directly_when_another_item_reshards(
+    tmp_path: Path,
+) -> None:
+    """A skipping item keeps its promise when another item forces resharding."""
+    torch.save({"weight": torch.ones(2)}, tmp_path / "model_0.pt")
+    torch.save({"step": torch.tensor(3)}, tmp_path / "optimizer_0.pt")
+    reader = CheckpointReader(
+        rank_info=RankInfo(
+            global_rank=0, global_world_size=1, role_rank=0, role_world_size=1
+        ),
+        storage_config=LocalFileSystemStorageConfig(),
+    )
+    checkpoint_info = CheckpointInfo(
+        checkpoint_items={
+            "model": CheckpointItem(value=None, resharder=_SkippingResharder()),
+            "optimizer": CheckpointItem(value=None, resharder=NoOpResharder()),
+        }
+    )
+
+    result, missing_keys = reader.read(
+        path=str(tmp_path), checkpoint_info=checkpoint_info.for_reads()
+    )
+
+    assert missing_keys == []
+    torch.testing.assert_close(result["model"]["weight"], torch.ones(2))
+    torch.testing.assert_close(result["optimizer"]["step"], torch.tensor(3))
 
 
 if __name__ == "__main__":

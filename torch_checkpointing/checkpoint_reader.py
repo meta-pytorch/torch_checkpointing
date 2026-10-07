@@ -236,8 +236,12 @@ class CheckpointReader:
                 # Get metadata directly by item_key
                 target_metadata = checkpoint_metadata.local_metadata.get(key)
 
-            if item.resharder is not None and item.resharder.should_reshard(
-                source_item_metadata, target_metadata
+            # A skipping resharder has promised its layout is unchanged, so it is
+            # read directly even when another item forces this path.
+            if (
+                item.resharder is not None
+                and not item.resharder.skip_resharding
+                and item.resharder.should_reshard(source_item_metadata, target_metadata)
             ):
                 assert source_item_metadata is not None, (
                     f"Missing source metadata for checkpoint item {key!r}"
