@@ -76,7 +76,7 @@ class NoOpResharder(Resharder):
 
     When configured on checkpoint items, this resharder ensures that the
     CheckpointReader goes through the normal path (with metadata loading)
-    rather than the fast path (which skips metadata and uses full file reads).
+    rather than the direct full-file read path.
     """
 
     def __init__(self, skip_resharding: bool = False):
@@ -1173,8 +1173,8 @@ class TestCheckpointReader(TestCase):
             self.assertEqual(value.numel(), updated_state_dict[key].numel())
             self.assertEqual(value.shape, updated_state_dict[key].shape)
 
-    def test_read_without_resharders_skips_metadata(self):
-        """Test that read without resharders configured skips metadata loading."""
+    def test_read_without_resharders_skips_metadata_when_source_file_resolves(self):
+        """A resolvable direct source does not require distributed metadata."""
         with open(
             os.path.join(self.checkpoint_path, METADATA_FILE_NAME), "wb"
         ) as stream:
@@ -1219,15 +1219,8 @@ class TestCheckpointReader(TestCase):
             "model": {"weight": torch.randn(10, 5)},  # Only request weight
         }
 
-        layout_info = {
-            "checkpoint": LayoutInfo(
-                file_path=f"checkpoint_{self.rank_info.global_rank}.pt",
-                serialization_format=TorchSerialization(),
-            )
-        }
         partial_checkpoint = SimpleCheckpoint(
             {"checkpoint": partial_state_dict},
-            layout_info_mappings=layout_info,
             use_resharder=False,
         )
 
@@ -1240,10 +1233,15 @@ class TestCheckpointReader(TestCase):
             self.assertIsNone(item.resharder)
 
         # Call read - should use fast path with filtering
-        read_state_dict, _ = self.reader.read(
-            path=self.checkpoint_path,
-            checkpoint_info=checkpoint_info,
-        )
+        with mock.patch.object(
+            self.reader._storage,
+            "ls",
+            side_effect=AssertionError("direct load listed the checkpoint directory"),
+        ):
+            read_state_dict, _ = self.reader.read(
+                path=self.checkpoint_path,
+                checkpoint_info=checkpoint_info,
+            )
         read_state_dict = read_state_dict["checkpoint"]
 
         # Fast path loads full file, then filters to requested keys

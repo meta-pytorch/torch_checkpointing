@@ -28,6 +28,7 @@ fast path.
 
 from __future__ import annotations
 
+import os
 from collections.abc import Mapping
 from concurrent.futures import Future
 from contextlib import nullcontext
@@ -51,6 +52,7 @@ from .config import (
 )
 from .logging_utils import EventLogger
 from .metadata_manager import DefaultMetadataManager, MetadataManager
+from .metadata_serialization import DistributedMetadataFormat
 from .schema import _CheckpointSchema, ItemSpec
 from .storage.base_storage import StorageConfig
 from .storage.filesystem import LocalFileSystemStorageConfig
@@ -204,11 +206,12 @@ class CheckpointManager:
 
     def load(
         self,
-        checkpoint_id: str,
+        checkpoint_id: str | os.PathLike[str],
         into: Mapping[ItemKey, Any] | None = None,
         *,
         map_location: Any = None,
         strict: bool = False,
+        metadata_format: type[DistributedMetadataFormat] | None = None,
     ) -> Mapping[ItemKey, Any]:
         """Load a checkpoint and return the loaded mapping.
 
@@ -217,6 +220,9 @@ class CheckpointManager:
         back in the returned mapping. With ``into=None`` the schema's declared
         items are read as-is -- valid only for leaves, since resharding needs a
         live target.
+
+        ``metadata_format`` names the checkpoint's metadata format, e.g. to load
+        a Hugging Face export. When unset, the reader tries its own formats.
         """
         if self._closed:
             raise RuntimeError("Cannot load with a closed CheckpointManager")
@@ -246,6 +252,7 @@ class CheckpointManager:
             adapter,
             default_map_location=map_location,
             strict=strict,
+            metadata_format=metadata_format,
         )
         return adapter.result
 

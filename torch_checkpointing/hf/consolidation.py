@@ -59,6 +59,7 @@ from ..serialized_tensor_slice import ByteAddress, SerializedTensorSlice
 from ..storage.base_storage import ReadArgs, Storage, StorageConfig
 from ..storage.filesystem import LocalFileSystemStorageConfig
 from ..types import NestedPath
+from .metadata import HF_SAFETENSORS_INDEX_FILE_TEMPLATE
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -1265,7 +1266,7 @@ def _write_overall_hf_index_file(
         for fqn, index in fqn_to_index_mapping.items()
     }
 
-    metadata_file_name = f"{item_key}.safetensors.index.json"
+    metadata_file_name = HF_SAFETENSORS_INDEX_FILE_TEMPLATE.format(item_key=item_key)
     metadata_path = Path(output_dir) / metadata_file_name
     with _atomic_stream_write(storage, metadata_path) as metadata_file:
         metadata_file.write(

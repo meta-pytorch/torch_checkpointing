@@ -13,6 +13,7 @@ determining checkpoint layout and configuring the reader.
 
 import json
 import logging
+import os
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any, ClassVar
@@ -41,6 +42,7 @@ from .logging_utils import EventLogger, EventType
 from .metadata_serialization import (
     DistributedMetadataFormat,
     load_distributed_metadata,
+    RankAddressableDistributedMetadataFormat,
     TorchDistributedMetadataFormat,
 )
 from .storage.base_storage import Storage, StorageConfig
@@ -62,7 +64,7 @@ class CheckpointReader:
     """
 
     # Formats tried, in order, to load a checkpoint's distributed metadata when
-    # an item may need resharding.
+    # an item may need resharding and the caller names no metadata_format.
     _METADATA_FORMATS: ClassVar[tuple[type[DistributedMetadataFormat], ...]] = (
         TorchDistributedMetadataFormat,
     )
@@ -109,16 +111,21 @@ class CheckpointReader:
 
     def read(
         self,
-        path: str,
+        path: str | os.PathLike[str],
         checkpoint_info: CheckpointReadInfo,
         map_location: Any = None,
+        *,
+        metadata_format: type[DistributedMetadataFormat] | None = None,
     ) -> tuple[STATE_DICT, list[str]]:
         """
         Reads a state dictionary from storage.
 
         Only keys defined in checkpoint_info will be loaded. Each file is loaded in full.
 
-        File names are discovered by looking at the layout_info_mappings in checkpoint_info.
+        An item read without resharding uses its configured layout, else the
+        layout recorded in source metadata, else the default
+        ``<item_key>_<rank>.pt`` layout.
+        Source metadata is loaded only when an item may need resharding.
 
         In-place modification behavior:
             When checkpoint_info contains values (not None), loaded data is merged with
@@ -135,12 +142,17 @@ class CheckpointReader:
             loaded checkpoint data.
 
         Args:
-            path (str): The path from which to read the checkpoint.
+            path: The checkpoint directory to read.
             checkpoint_info (CheckpointReadInfo): Encapsulates state_dict, layout_info_mappings,
                 and optional checkpoint_metadata for resharding.
                 Each item in checkpoint_info.checkpoint_items may have a resharder for resharding.
                 checkpoint_metadata is used for resharding.
             map_location (Any): Device mapping function or device name for relocating tensors.
+            metadata_format: The only metadata format to load, which must be
+                present whenever the read needs metadata. A format that is not
+                rank addressable cannot be read one file per rank, so its items
+                require a resharder. When unset, this reader tries its own
+                formats.
 
         Returns:
             STATE_DICT: The loaded state dictionary.
@@ -151,41 +163,34 @@ class CheckpointReader:
             f"Reading checkpoint from {path} for rank {self._rank_info.global_rank}"
         )
 
-        if not self._storage.exists(Path(path)):
+        checkpoint_dir = Path(path)
+        if not self._storage.exists(checkpoint_dir):
             raise FileNotFoundError(f"Checkpoint path {path} does not exist.")
 
-        # Check if any items have resharders configured
-        has_any_resharder = any(
-            item.resharder is not None
+        no_item_reshards = all(
+            item.resharder is None or item.resharder.skip_resharding
             for item in checkpoint_info.checkpoint_items.values()
         )
 
-        # Check if all resharders have skip_resharding=True
-        all_resharders_skip = all(
-            item.resharder.skip_resharding
-            for item in checkpoint_info.checkpoint_items.values()
-            if item.resharder is not None
+        rank_addressable = metadata_format is None or issubclass(
+            metadata_format, RankAddressableDistributedMetadataFormat
         )
 
-        # Fast path: if no items have resharders OR all resharders have skip_resharding=True,
-        # skip metadata loading entirely and use direct file reads
-        if not has_any_resharder or all_resharders_skip:
-            if all_resharders_skip:
-                logger.info(
-                    "Resharder skip_resharding=True: skipping metadata loading and using direct file reads"
-                )
-            else:
-                logger.info(
-                    "No resharders configured: skipping metadata loading and using direct file reads"
-                )
+        # Fast path: if no items have resharders OR all resharders have
+        # skip_resharding=True, use direct full-file reads without loading
+        # metadata. Only a rank-addressable format guarantees that each rank's
+        # file holds whole items; any other format takes the normal path, which
+        # rejects direct reads of the items it describes.
+        if no_item_reshards and rank_addressable:
             source_layouts = self._resolve_layouts_without_resharding(
                 checkpoint_info,
                 {},
                 requested_rank=self._rank_info.global_rank,
             )
+            logger.info("No resharding required: using direct file reads")
             # _read_without_resharding loads full files and filters to requested keys
             result, missing_paths = self._read_without_resharding(
-                path,
+                str(checkpoint_dir),
                 checkpoint_info,
                 source_layouts,
                 map_location=map_location,
@@ -198,34 +203,11 @@ class CheckpointReader:
             return result, missing_keys
 
         # Normal path with resharding support
+        source_metadata = self._load_source_metadata(checkpoint_dir, metadata_format)
         checkpoint_metadata = checkpoint_info.checkpoint_metadata
-        source_distributed_metadata = load_distributed_metadata(
-            path,
-            self._storage,
-            formats=self._METADATA_FORMATS,
-        )
-        if source_distributed_metadata is None and self._REQUIRE_METADATA:
-            raise FileNotFoundError(
-                f"No distributed metadata found in {path}; tried "
-                f"{[fmt.__name__ for fmt in self._METADATA_FORMATS]}"
-            )
-        source_metadata = (
-            source_distributed_metadata.metadata
-            if source_distributed_metadata is not None
-            else {}
-        )
-        logger.info(
-            "Finished reading checkpoint metadata",
-            extra=event_logger(
-                EventType.LOG_METRIC,
-                metric_name="train.checkpoint_read.execute.filesystem.metadata.read.latency_ms",
-            ),
-        )
-
         # Split items into two lists based on whether they need resharding
         items_needing_reshard: dict[str, CheckpointItem] = {}
         items_not_needing_reshard: dict[str, CheckpointItem] = {}
-
         for key, item in checkpoint_info.checkpoint_items.items():
             # Get item-level metadata for should_reshard check
             source_item_metadata = source_metadata.get(key)
@@ -250,6 +232,18 @@ class CheckpointReader:
             else:
                 items_not_needing_reshard[key] = item
 
+        if not rank_addressable:
+            assert metadata_format is not None
+            unaddressable_keys = sorted(
+                items_not_needing_reshard.keys() & source_metadata.keys()
+            )
+            if unaddressable_keys:
+                raise ValueError(
+                    f"{metadata_format.__name__} is not rank addressable, so "
+                    f"reading one file per rank would load only part of "
+                    f"{unaddressable_keys}. Each of these items requires a resharder."
+                )
+
         result_dict: dict[str, Any] = {}
         missing_paths: list[CheckpointPath] = []
 
@@ -264,7 +258,7 @@ class CheckpointReader:
                 requested_rank=self._rank_info.global_rank,
             )
             non_reshard_result, non_reshard_missing = self._read_without_resharding(
-                path,
+                str(checkpoint_dir),
                 checkpoint_info_no_reshard,
                 source_layouts,
                 map_location=map_location,
@@ -279,7 +273,7 @@ class CheckpointReader:
                 checkpoint_items=items_needing_reshard
             )
             reshard_result, reshard_missing = self._read_with_resharding(
-                path,
+                str(checkpoint_dir),
                 checkpoint_info_reshard,
                 checkpoint_metadata,
                 source_metadata,
@@ -303,6 +297,42 @@ class CheckpointReader:
             extra=event_logger(EventType.LOG_METRIC),
         )
         return result_dict, missing_keys
+
+    def _load_source_metadata(
+        self,
+        checkpoint_dir: Path,
+        metadata_format: type[DistributedMetadataFormat] | None,
+    ) -> Mapping[str, DistributedItemMetadata]:
+        event_logger = EventLogger()
+        formats = (
+            (metadata_format,)
+            if metadata_format is not None
+            else self._METADATA_FORMATS
+        )
+        source_distributed_metadata = load_distributed_metadata(
+            checkpoint_dir,
+            self._storage,
+            formats=formats,
+        )
+        if source_distributed_metadata is None and (
+            metadata_format is not None or self._REQUIRE_METADATA
+        ):
+            raise FileNotFoundError(
+                f"No distributed metadata found in {checkpoint_dir}; tried "
+                f"{[fmt.__name__ for fmt in formats]}"
+            )
+        logger.info(
+            "Finished reading checkpoint metadata",
+            extra=event_logger(
+                EventType.LOG_METRIC,
+                metric_name="train.checkpoint_read.execute.filesystem.metadata.read.latency_ms",
+            ),
+        )
+        return (
+            source_distributed_metadata.metadata
+            if source_distributed_metadata is not None
+            else {}
+        )
 
     def _resolve_layouts_without_resharding(
         self,
@@ -380,13 +410,13 @@ class CheckpointReader:
                 raise FileNotFoundError(
                     f"Missing file {file_path} for checkpoint item {key!r}."
                 )
+            requested_value = checkpoint_info.checkpoint_items[key].value
 
             loaded_data = self._load_full_file(
                 file_path, layout_info, map_location=map_location
             )
             # Filter loaded data to only include keys present in the requested structure
             # Also track any missing keys within the nested structure
-            requested_value = checkpoint_info.checkpoint_items[key].value
             # safetensors only supports flat dict[str, Tensor], so the writer flattens
             # nested inputs with '.' separators. Re-nest here to match the target's shape
             # — otherwise walk_checkpoint_structure (which descends source + target in

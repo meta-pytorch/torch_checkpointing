@@ -14,6 +14,7 @@ the overhead of save infrastructure.
 """
 
 import logging
+import os
 from typing import Any, TypeVar
 
 from .checkpoint_base import CheckpointBase, CheckpointInfo, CheckpointReadInfo
@@ -21,6 +22,7 @@ from .checkpoint_reader import CheckpointReader
 from .distributed_metadata import CheckpointMetadata
 from .logging_utils import EventLogger, EventType
 from .metadata_manager import MetadataManager
+from .metadata_serialization import DistributedMetadataFormat
 
 logger = logging.getLogger(__name__)
 
@@ -99,10 +101,12 @@ class CheckpointLoader:
 
     def load(
         self,
-        path: str,
+        path: str | os.PathLike[str],
         checkpoint: CheckpointT,
         default_map_location: Any = None,
         strict: bool = False,
+        *,
+        metadata_format: type[DistributedMetadataFormat] | None = None,
     ) -> None:
         """
         Load a checkpoint from storage.
@@ -122,13 +126,15 @@ class CheckpointLoader:
             loaded checkpoint data.
 
         Args:
-            path: The path from which to load the checkpoint.
+            path: The checkpoint directory to load.
             checkpoint: CheckpointBase object to update with loaded values.
                 Only keys checkpoint.get_items() returns will be loaded.
             default_map_location: Device mapping function or device name for
                 relocating tensors.
             strict: If True, raises an error when there are missing keys in the
                 checkpoint.
+            metadata_format: The checkpoint's metadata format. When unset, the
+                reader tries its own formats.
 
         Raises:
             RuntimeError: If strict=True and there are missing keys in the checkpoint.
@@ -159,6 +165,7 @@ class CheckpointLoader:
             path=path,
             checkpoint_info=checkpoint_read_info,
             map_location=default_map_location,
+            metadata_format=metadata_format,
         )
         if strict and missing_keys is not None and missing_keys != []:
             raise RuntimeError(f"Checkpoint at {path} is missing keys: {missing_keys}")

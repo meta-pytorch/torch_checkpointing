@@ -103,10 +103,54 @@ class Resharder(abc.ABC):
 
     @property
     def skip_resharding(self) -> bool:
-        """If True, skip metadata loading and resharding checks during load.
+        """If True, load this item without checking whether it needs resharding.
 
-        Use for job retry scenarios where mesh config is identical between
-        save and load, to avoid expensive metadata loading overhead.
+        A resharding load is expensive: the reader loads the checkpoint's
+        distributed metadata, then calls ``should_reshard`` to compare each item's
+        saved sharding with the target's. On a job retry whose mesh matches the
+        one that saved the checkpoint, both are wasted work, so a resharder can
+        opt out with this property.
+
+        How the reader loads::
+
+            load(path) or load(path, metadata_format=...)
+                                            |
+                                            v
+            +-----------------------------------------------------------+
+            | Every item has no resharder, or a resharder that skips,   |-- no --+
+            | and metadata_format is unset or rank addressable?         |        |
+            +-----------------------------------------------------------+        |
+                    | yes                                                         v
+                    v                                        +-------------------------------------------+
+            +-------------------------------------------+   | Load metadata once, for every item. With  |
+            | Read each item's file for this rank, in   |   | metadata_format: only that format, and    |
+            | full, without loading metadata. Layout:   |   | raise if the checkpoint lacks it.         |
+            | 1. The item's configured layout, if set.  |   | Without: the reader's own formats.        |
+            | 2. The default <item_key>_<rank>.pt.      |   +-------------------------------------------+
+            | A missing file raises, naming the item.   |                         | for each item, including
+            +-------------------------------------------+                         | items with no resharder
+                                                                                  v
+                                                            +-------------------------------------------+
+                                                            | Resharder that does not skip, and         |-yes-> Reshard
+                                                            | should_reshard?                           |
+                                                            +-------------------------------------------+
+                                                                                  | no
+                                                                                  v
+                                                            +-------------------------------------------+
+                                                            | metadata_format not rank addressable and  |-yes-> Raise:
+                                                            | its metadata describes this item?         |       needs a
+                                                            +-------------------------------------------+       resharder
+                                                                                  | no
+                                                                                  v
+                                                            +-------------------------------------------+
+                                                            | Read the item's file for this rank, in    |
+                                                            | full. Layout:                             |
+                                                            | 1. The layout the metadata records for    |
+                                                            |    this rank, if any.                     |
+                                                            | 2. The item's configured layout, if set.  |
+                                                            | 3. The default <item_key>_<rank>.pt.      |
+                                                            | A missing file raises, naming the item.   |
+                                                            +-------------------------------------------+
 
         Subclasses can override this property to control skip behavior.
         Default is False (perform resharding as normal).

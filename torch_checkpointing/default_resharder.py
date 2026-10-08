@@ -440,6 +440,28 @@ class DefaultResharder(Resharder):
         return result
 
     @override
+    def should_reshard(
+        self,
+        source_metadata: DistributedItemMetadata | None,
+        target_metadata: dict[NestedPath, ShardingMetadata] | None,
+    ) -> bool:
+        """Reshard every safetensors source, even one whose sharding matches."""
+        # Safetensors stores bare tensors, so saving a DTensor drops its wrapper.
+        # A direct read cannot tell the resulting local shard from a whole tensor;
+        # only the resharder, which takes sharding from metadata, can place it.
+        if (
+            source_metadata is not None
+            and target_metadata is not None
+            and any(
+                layout is not None
+                and isinstance(layout.serialization_format, SafetensorsSerialization)
+                for layout in source_metadata.rank_to_layout_info.values()
+            )
+        ):
+            return True
+        return super().should_reshard(source_metadata, target_metadata)
+
+    @override
     def load(
         self,
         source_path: Path,

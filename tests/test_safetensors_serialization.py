@@ -100,14 +100,14 @@ def test_to_dict_from_dict_roundtrip_with_metadata() -> None:
     assert restored == fmt
 
 
-def test_factory_registration() -> None:
+def test_factory_deserialization() -> None:
     d = {"type": "SafetensorsSerialization"}
     fmt = serialization_format_from_dict(d)
     assert isinstance(fmt, SafetensorsSerialization)
     assert fmt.metadata is None
 
 
-def test_factory_registration_with_metadata() -> None:
+def test_factory_deserialization_with_metadata() -> None:
     d = {"type": "SafetensorsSerialization", "metadata": {"key": "value"}}
     fmt = serialization_format_from_dict(d)
     assert isinstance(fmt, SafetensorsSerialization)
@@ -619,6 +619,72 @@ def test_mixed_serialization_formats(
     assert missing == []
     assert torch.allclose(loaded["model"]["weight"], model_data["weight"])
     assert loaded["epoch"] == epoch_data
+
+
+def test_mixed_serialization_with_default_native_item_is_not_hf(
+    temp_dir: str,
+    writer: CheckpointWriter,
+    reader: CheckpointReader,
+) -> None:
+    model_data = {"weight": torch.randn(4, 3)}
+    checkpoint_path = os.path.join(temp_dir, "ckpt_mixed_default")
+    writer.write(
+        checkpoint_path,
+        CheckpointWriteInfo(
+            checkpoint_items={
+                "model": CheckpointItem(
+                    value=model_data,
+                    layout=LayoutInfo("model.safetensors", SafetensorsSerialization()),
+                ),
+                "epoch": CheckpointItem(value=42),
+            }
+        ),
+    )
+
+    loaded, missing = reader.read(
+        checkpoint_path,
+        CheckpointReadInfo(
+            checkpoint_items={
+                "model": CheckpointItem(
+                    value=None,
+                    layout=LayoutInfo("model.safetensors", SafetensorsSerialization()),
+                ),
+                "epoch": CheckpointItem(value=None),
+            }
+        ),
+    )
+
+    assert missing == []
+    assert torch.allclose(loaded["model"]["weight"], model_data["weight"])
+    assert loaded["epoch"] == 42
+
+
+def test_loading_only_default_item_from_mixed_checkpoint_is_not_hf(
+    temp_dir: str,
+    writer: CheckpointWriter,
+    reader: CheckpointReader,
+) -> None:
+    checkpoint_path = os.path.join(temp_dir, "ckpt_mixed_epoch_only")
+    writer.write(
+        checkpoint_path,
+        CheckpointWriteInfo(
+            checkpoint_items={
+                "model": CheckpointItem(
+                    value={"weight": torch.randn(4, 3)},
+                    layout=LayoutInfo("model.safetensors", SafetensorsSerialization()),
+                ),
+                "epoch": CheckpointItem(value=42),
+            }
+        ),
+    )
+
+    loaded, missing = reader.read(
+        checkpoint_path,
+        CheckpointReadInfo(checkpoint_items={"epoch": CheckpointItem(value=None)}),
+    )
+
+    assert missing == []
+    assert loaded["epoch"] == 42
 
 
 # ---------------------------------------------------------------------------
