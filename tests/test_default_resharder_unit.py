@@ -465,7 +465,7 @@ def test_auto_uses_offset_reads_for_safetensors() -> None:
 
     torch.testing.assert_close(target["first"], source)
     torch.testing.assert_close(target["second"], source)
-    assert storage.read_args == [ReadArgs(pre_read_full_file=False)]
+    assert storage.read_args == [ReadArgs(pre_read_full_file=False, direct_io=True)]
 
 
 def test_load_preserves_conjugate_view_in_offset_slice() -> None:

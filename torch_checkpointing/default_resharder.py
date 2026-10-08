@@ -757,9 +757,12 @@ class DefaultResharder(Resharder):
         storage: Storage,
     ) -> list[tuple[NestedPath, LoadPlan, torch.Tensor]]:
         """Read the source data every plan needs using file offset reads."""
+        # O_DIRECT bypasses the page cache. On FUSE mounts, page-cache reads
+        # share a small per-mount limit on in-flight requests, which caps how
+        # fast concurrent readers on one host can go.
         with storage.stream_read(
             file_path,
-            ReadArgs(pre_read_full_file=False),
+            ReadArgs(pre_read_full_file=False, direct_io=True),
         ) as stream:
             serialization_format = layout_info.serialization_format
             source_fqns = {load_plan.src_fqn for _, load_plan in rank_plans}

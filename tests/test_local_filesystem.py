@@ -6,6 +6,7 @@
 
 import array
 import errno
+import logging
 import os
 import random
 import shutil
@@ -17,6 +18,8 @@ import numpy as np
 import pytest
 import torch
 from torch.testing._internal.common_utils import TestCase
+from torch_checkpointing.storage import filesystem
+from torch_checkpointing.storage.base_storage import ReadArgs
 from torch_checkpointing.storage.filesystem import LocalFileSystemStorageConfig
 
 
@@ -333,3 +336,82 @@ class TestStorage(TestCase):
 
         self.assertFalse(src.exists())
         self.assertEqual(dst.read_bytes(), b"new")
+
+
+def test_direct_io_stream_falls_back_to_buffered_reads_on_einval(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "data.bin"
+    data = os.urandom(10_000)
+    path.write_bytes(data)
+    storage = LocalFileSystemStorageConfig().create_storage()
+
+    with storage.stream_read(
+        path, ReadArgs(pre_read_full_file=False, direct_io=True)
+    ) as stream:
+        stream.seek(13)
+        rejected = mock.Mock(
+            side_effect=OSError(errno.EINVAL, "unaligned O_DIRECT read")
+        )
+        with mock.patch.object(stream._file, "readinto", rejected):
+            buffer = bytearray(1000)
+            assert stream.readinto(buffer) == 1000
+        assert bytes(buffer) == data[13:1013]
+        # Later reads continue from the same position without O_DIRECT.
+        assert stream.read(7) == data[1013:1020]
+
+
+def test_direct_io_refusal_is_remembered_by_the_storage(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    paths = [tmp_path / f"data_{i}.bin" for i in range(3)]
+    for path in paths:
+        path.write_bytes(os.urandom(4096))
+    storage = LocalFileSystemStorageConfig().create_storage()
+    real_open = os.open
+    direct_opens = []
+
+    def reject_direct_open(path, flags, *args):
+        if flags & os.O_DIRECT:
+            direct_opens.append(path)
+            raise OSError(errno.EINVAL, "O_DIRECT not supported")
+        return real_open(path, flags, *args)
+
+    with (
+        mock.patch.object(filesystem.os, "open", reject_direct_open),
+        caplog.at_level(logging.WARNING),
+    ):
+        for path in paths:
+            with storage.stream_read(
+                path, ReadArgs(pre_read_full_file=False, direct_io=True)
+            ) as stream:
+                assert stream.read() == path.read_bytes()
+
+    # Only the first file tries O_DIRECT, and the refusal is logged once.
+    assert direct_opens == [paths[0]]
+    assert caplog.text.count("O_DIRECT open failed") == 1
+
+
+def test_direct_io_fallback_resumes_from_where_the_failed_read_started(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "data.bin"
+    data = os.urandom(10_000)
+    path.write_bytes(data)
+    storage = LocalFileSystemStorageConfig().create_storage()
+
+    with storage.stream_read(
+        path, ReadArgs(pre_read_full_file=False, direct_io=True)
+    ) as stream:
+        stream.seek(13)
+        direct_file = stream._file
+
+        def advance_then_reject(buffer):
+            # A failed read that still moves the file offset.
+            direct_file.seek(500, os.SEEK_CUR)
+            raise OSError(errno.EINVAL, "unaligned O_DIRECT read")
+
+        with mock.patch.object(direct_file, "readinto", advance_then_reject):
+            buffer = bytearray(1000)
+            assert stream.readinto(buffer) == 1000
+        assert bytes(buffer) == data[13:1013]
