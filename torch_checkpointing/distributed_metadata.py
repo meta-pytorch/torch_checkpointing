@@ -34,8 +34,6 @@ from .types import CheckpointPath, NestedPath
 logger = logging.getLogger(__name__)
 
 
-METADATA_FILE_NAME: str = "metadata.pkl"
-
 _CURRENT_VERSION: str = "2.0"
 _SUPPORTED_VERSIONS: set[str] = {"1.0", "2.0"}  # Support loading both formats
 

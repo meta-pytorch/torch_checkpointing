@@ -23,7 +23,6 @@ from torch_checkpointing.checkpoint_layout import (
 )
 from torch_checkpointing.checkpoint_manager import CheckpointManager
 from torch_checkpointing.default_resharder import DefaultResharder
-from torch_checkpointing.distributed_metadata import METADATA_FILE_NAME
 from torch_checkpointing.dtensor_metadata import (
     DeviceMeshSpec,
     DTensorShardingMetadata,
@@ -34,6 +33,7 @@ from torch_checkpointing.hf.metadata import (
 )
 from torch_checkpointing.metadata_serialization import (
     load_distributed_metadata,
+    METADATA_FILE_NAME,
     RankAddressableDistributedMetadataFormat,
     TorchDistributedMetadataFormat,
 )

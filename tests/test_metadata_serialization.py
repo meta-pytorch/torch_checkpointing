@@ -20,8 +20,8 @@ from torch_checkpointing.checkpoint_reader import CheckpointReader
 from torch_checkpointing.distributed_metadata import (
     DistributedItemMetadata,
     DistributedMetadata,
-    METADATA_FILE_NAME,
 )
+from torch_checkpointing.metadata_serialization import METADATA_FILE_NAME
 from torch_checkpointing.storage.base_storage import Storage
 from torch_checkpointing.storage.filesystem import LocalFileSystemStorageConfig
 

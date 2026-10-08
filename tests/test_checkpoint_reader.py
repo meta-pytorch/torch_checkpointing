@@ -36,7 +36,6 @@ from torch_checkpointing.distributed_metadata import (
     DistributedItemMetadata,
     DistributedMetadata,
     GlobalObjectMetadata,
-    METADATA_FILE_NAME,
     ShardingMetadata,
 )
 from torch_checkpointing.dtensor_metadata import (
@@ -45,6 +44,7 @@ from torch_checkpointing.dtensor_metadata import (
     ReplicateSpec,
     ShardSpec,
 )
+from torch_checkpointing.metadata_serialization import METADATA_FILE_NAME
 from torch_checkpointing.resharding import Resharder
 from torch_checkpointing.storage.filesystem import LocalFileSystemStorageConfig
 from torch_checkpointing.types import NestedPath, RankInfo, STATE_DICT

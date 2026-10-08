@@ -32,8 +32,8 @@ from .checkpoint_layout import (
     SafetensorsSerialization,
     TorchSerialization,
 )
-from .distributed_metadata import METADATA_FILE_NAME
 from .logging_utils import EventLogger, EventType, get_log_event_type_for_file_save
+from .metadata_serialization import METADATA_FILE_NAME
 from .storage.base_storage import StorageConfig
 from .types import RankInfo
 
