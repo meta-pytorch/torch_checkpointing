@@ -14,12 +14,50 @@ import pytest
 import torch
 from torch.testing._internal.common_utils import requires_cuda, run_tests, TestCase
 from torch_checkpointing import _pin_memory_utils as pin_memory_utils
-from torch_checkpointing._state_dict_stager import StorageManager
+from torch_checkpointing._state_dict_stager import StateDictStager, StorageManager
 from torch_checkpointing.staging import (
     CheckpointStagerConfig,
     DefaultStager,
 )
 from torch_checkpointing.utils import ensure_future
+
+
+@pytest.mark.parametrize("share_memory", [False, True])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.complex64])
+def test_staging_preserves_storage_for_aliased_views(
+    share_memory: bool, dtype: torch.dtype
+) -> None:
+    base = torch.arange(64).to(dtype).reshape(8, 8)
+    state = {
+        "strided": base[1::2, 1::2],
+        "bytes": base.view(torch.uint8),
+        "empty_view": base.as_strided((0, 3), (8, 1), 17),
+        "empty": torch.empty(0, dtype=dtype),
+    }
+    stager = StateDictStager(pin_memory=False, share_memory=share_memory)
+    try:
+        staged = stager.stage(state)
+        storage = staged["strided"].untyped_storage()
+        assert storage.nbytes() == base.untyped_storage().nbytes()
+        assert storage.data_ptr() != base.untyped_storage().data_ptr()
+        assert storage.is_shared() == share_memory
+        for name, source in state.items():
+            actual = staged[name]
+            torch.testing.assert_close(actual, source, rtol=0, atol=0)
+            assert actual.stride() == source.stride()
+            assert actual.storage_offset() == source.storage_offset()
+        assert staged["bytes"].untyped_storage() is storage
+        assert staged["empty_view"].untyped_storage() is storage
+
+        # A new stage updates the same pooled allocation, including bytes
+        # outside the strided view, rather than allocating another buffer.
+        base.add_(100)
+        refreshed = stager.stage(state)
+        assert refreshed["strided"].untyped_storage() is storage
+        torch.testing.assert_close(refreshed["bytes"], base.view(torch.uint8))
+        assert stager._storage_manager.total_num_bytes() == storage.nbytes()
+    finally:
+        stager.close()
 
 
 def test_default_stagers_can_share_a_caller_owned_executor() -> None:

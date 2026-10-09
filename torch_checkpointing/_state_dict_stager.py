@@ -253,11 +253,16 @@ class StateDictStager:
             The optimized storage
         """
         cpu_storage = self._storage_manager.get(storage.nbytes())
+        destination = torch.empty(0, dtype=torch.uint8, device=cpu_storage.device).set_(
+            cpu_storage
+        )
+        source = torch.empty(0, dtype=torch.uint8, device=storage.device).set_(storage)
         # PyTorch submits D2H copies on the source device's current stream.
         # A mixed-device payload can contain storage outside the stager's device;
         # its completion event cannot fence those copies, so finish them here.
-        cpu_storage.copy_(
-            storage,
+        # Tensor.copy_ releases the GIL; UntypedStorage.copy_ does not.
+        destination.copy_(
+            source,
             non_blocking=(
                 cpu_storage.is_pinned()
                 and self._use_non_blocking_copy
