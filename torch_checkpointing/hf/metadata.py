@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import os
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path, PurePosixPath
 
@@ -40,6 +41,20 @@ from ..types import NestedPath
 
 HF_SAFETENSORS_INDEX_FILE_TEMPLATE = "{item_key}.safetensors.index.json"
 _HF_SINGLE_FILE = "model.safetensors"
+
+
+@dataclass(frozen=True)
+class HuggingFaceSafetensorsItemMetadata(DistributedItemMetadata):
+    """Item metadata for a Hugging Face export, with each shard's parsed header.
+
+    Building this metadata reads every shard's header. Keeping the parsed
+    headers, keyed by the source rank that stands for each shard, lets offset
+    reads locate tensors without reading each header a second time.
+    """
+
+    shard_headers: dict[int, SafetensorsFileMetadata] = field(
+        default_factory=dict, compare=False, repr=False
+    )
 
 
 class HuggingFaceSafetensorsDistributedMetadataFormat(DistributedMetadataFormat):
@@ -90,12 +105,13 @@ class HuggingFaceSafetensorsDistributedMetadataFormat(DistributedMetadataFormat)
                 # TODO: Support loading into an item other than ``model``, e.g. by
                 # remapping the item key where CheckpointManager builds the
                 # CheckpointBase.
-                "model": DistributedItemMetadata(
+                "model": HuggingFaceSafetensorsItemMetadata(
                     nested_path_to_metadata=nested_path_to_metadata,
                     rank_to_layout_info={
                         rank: LayoutInfo(name, SafetensorsSerialization())
                         for rank, name in enumerate(shard_names)
                     },
+                    shard_headers=dict(enumerate(headers)),
                 )
             },
         )

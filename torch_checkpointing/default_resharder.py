@@ -59,6 +59,7 @@ from .dtensor_metadata import (
     ShardSpec,
     StridedShardSpec,
 )
+from .hf.metadata import HuggingFaceSafetensorsItemMetadata
 from .resharding import (
     LoadPlan,
     Resharder,
@@ -736,6 +737,12 @@ class DefaultResharder(Resharder):
             src_rank: source_metadata.get_layout_info(src_rank, item_key)
             for src_rank in plans_by_rank
         }
+        # A Hugging Face export's metadata already parsed every shard header.
+        shard_headers = (
+            source_metadata.shard_headers
+            if isinstance(source_metadata, HuggingFaceSafetensorsItemMetadata)
+            else {}
+        )
         self._execute_load_plans_with_read_strategy(
             self._read_strategy,
             source_path,
@@ -745,6 +752,7 @@ class DefaultResharder(Resharder):
             target_by_path,
             storage,
             file_read_workers,
+            shard_headers,
         )
 
     def _execute_load_plans_with_read_strategy(
@@ -757,6 +765,7 @@ class DefaultResharder(Resharder):
         target_by_path: dict[NestedPath, Any],
         storage: Storage,
         file_read_workers: int,
+        shard_headers: dict[int, SafetensorsFileMetadata],
     ) -> None:
         # Worker threads start on the default stream. Copy on the caller's
         # current stream so the writes are ordered after its pending work on the
@@ -793,6 +802,7 @@ class DefaultResharder(Resharder):
                         item_key,
                         plans_by_rank[src_rank],
                         storage,
+                        shard_headers.get(src_rank),
                     )
                 ) as staged:
                     copy(staged)
@@ -849,6 +859,7 @@ class DefaultResharder(Resharder):
         item_key: str,
         rank_plans: list[tuple[NestedPath, LoadPlan]],
         storage: Storage,
+        safetensors_header: SafetensorsFileMetadata | None = None,
     ) -> Generator[tuple[NestedPath, LoadPlan, torch.Tensor], None, None]:
         """Yield the source data each plan needs, one slice at a time.
 
@@ -878,11 +889,13 @@ class DefaultResharder(Resharder):
                     for source_fqn in source_fqns
                 }
             elif isinstance(serialization_format, SafetensorsSerialization):
-                source_tensors = SafetensorsFileMetadata.from_stream(
-                    stream,
-                    layout_info.file_path,
-                    source_rank,
-                ).as_fake_tensors(source_fqns)
+                if safetensors_header is None:
+                    safetensors_header = SafetensorsFileMetadata.from_stream(
+                        stream,
+                        layout_info.file_path,
+                        source_rank,
+                    )
+                source_tensors = safetensors_header.as_fake_tensors(source_fqns)
             else:
                 raise ValueError(
                     "Unsupported serialization format "

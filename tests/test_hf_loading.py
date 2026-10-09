@@ -37,6 +37,7 @@ from torch_checkpointing.metadata_serialization import (
     RankAddressableDistributedMetadataFormat,
     TorchDistributedMetadataFormat,
 )
+from torch_checkpointing.safetensors_metadata import SafetensorsFileMetadata
 from torch_checkpointing.schema import ItemSpec
 from torch_checkpointing.storage.filesystem import LocalFileSystemStorageConfig
 
@@ -542,6 +543,58 @@ def test_hf_resharder_reads_only_target_shard_range(tmp_path: Path) -> None:
     # One span read covering rows 0..2 of the two requested columns: far less
     # than the file, which also holds a 4 MB tensor we never touch.
     assert [len(call.args[2]) for call in read_exact.call_args_list] == [40]
+
+
+def test_hf_resharder_reuses_shard_headers_read_for_metadata(tmp_path: Path) -> None:
+    expected = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+    save_file({"weight": expected}, tmp_path / "model.safetensors")
+    target_metadata = {
+        ("weight",): DTensorShardingMetadata(
+            global_shape=(3, 4),
+            dtype=str(expected.dtype),
+            stride=(4, 1),
+            mesh_spec=DeviceMeshSpec(
+                device_type="cpu",
+                mesh_shape=(2,),
+                mesh_data=(0, 1),
+            ),
+            placements=(ShardSpec(1),),
+        )
+    }
+    storage = LocalFileSystemStorageConfig(use_direct_io=False).create_storage()
+    # Building the metadata reads each shard header once.
+    source_metadata = (lambda m: None if m is None else m.metadata["model"])(
+        HuggingFaceSafetensorsDistributedMetadataFormat.maybe_load(tmp_path, storage)
+    )
+    assert source_metadata is not None
+    target_tensor = torch.zeros((3, 2), dtype=torch.float32)
+
+    with (
+        patch(
+            "torch_checkpointing.default_resharder.dist.is_initialized",
+            return_value=True,
+        ),
+        patch(
+            "torch_checkpointing.default_resharder.dist.get_rank",
+            return_value=1,
+        ),
+        patch.object(
+            SafetensorsFileMetadata,
+            "from_stream",
+            side_effect=AssertionError("shard header read a second time"),
+        ),
+    ):
+        missing = DefaultResharder().load(
+            source_path=tmp_path,
+            item_key="model",
+            target_metadata=target_metadata,
+            source_metadata=source_metadata,
+            target={"weight": target_tensor},
+            storage=storage,
+        )
+
+    assert missing == []
+    torch.testing.assert_close(target_tensor, expected[:, 2:])
 
 
 def test_hf_resharder_falls_through_for_native_checkpoint_without_metadata(
