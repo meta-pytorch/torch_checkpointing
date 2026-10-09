@@ -21,7 +21,11 @@ The core algorithm:
 
 import io
 import logging
+import os
 import zipfile
+from collections.abc import Generator, Iterable
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 from enum import auto, Enum
 from pathlib import Path
 from typing import Any
@@ -62,6 +66,7 @@ from .resharding import (
 )
 from .resharding_utils import (
     convert_nested_path_dict_to_fqn,
+    dedupe_aliased_targets,
     deduplicate_source_chunks,
     get_fqn_from_nested_path,
 )
@@ -73,7 +78,27 @@ from .walk_utils import walk_checkpoint_structure
 
 logger: logging.Logger = logging.getLogger(__name__)
 
+# Source files read concurrently per host when the resharder does not set
+# ``file_read_workers``. Ranks on a host share its storage client and network
+# link, so each local rank reads an equal share. Too few reads in flight leave
+# the link idle while each waits on latency: filling it takes about host read
+# bandwidth / one read's throughput. Clients that read ahead into a fixed cache
+# start evicting each other past cache size / read-ahead window.
+DEFAULT_READS_IN_FLIGHT_PER_HOST: int = 24
+# Source files each rank reads concurrently when ``LOCAL_WORLD_SIZE`` is unset or
+# not a positive integer, so the number of ranks sharing the host is unknown.
+DEFAULT_FILE_READ_WORKERS: int = 8
+
 __all__ = ["DefaultResharder", "ReshardingReadStrategy"]
+
+
+def _default_file_read_workers() -> int:
+    # Assumes the host runs only this job and every local rank is a trainer that
+    # loads at the same time; set ``file_read_workers`` on the resharder otherwise.
+    local_world_size = os.environ.get("LOCAL_WORLD_SIZE", "")
+    if not local_world_size.isdigit() or int(local_world_size) < 1:
+        return DEFAULT_FILE_READ_WORKERS
+    return max(1, DEFAULT_READS_IN_FLIGHT_PER_HOST // int(local_world_size))
 
 
 class ReshardingReadStrategy(Enum):
@@ -359,15 +384,15 @@ def _read_source_tensor_slice(
         span = 1 + sum(
             (size - 1) * stride for size, stride in zip(load_plan.src_sizes, strides)
         )
-        packed = bytearray(span * element_size)
+        # Uninitialized, unlike a bytearray, which would zero-fill memory that
+        # the read overwrites anyway.
+        packed = torch.empty(span * element_size, dtype=torch.uint8)
         _read_exact(
             stream,
             checkpoint_offset + first_element * element_size,
-            memoryview(packed),
+            memoryview(packed.numpy()),
         )
-        result = torch.frombuffer(packed, dtype=source.dtype).as_strided(
-            load_plan.src_sizes, strides
-        )
+        result = packed.view(source.dtype).as_strided(load_plan.src_sizes, strides)
 
     if source.is_conj():
         result = result.conj()
@@ -387,14 +412,28 @@ class DefaultResharder(Resharder):
     Args:
         read_strategy: Whether to use offset reads, full-file reads, or try
             offset reads and fall back to full-file reads when unsupported.
+        file_read_workers: Number of source files read concurrently. None
+            splits a per-host default across ``LOCAL_WORLD_SIZE`` ranks, or uses
+            ``DEFAULT_FILE_READ_WORKERS`` if it is unset or invalid. Set 1 to read one file
+            at a time.
     """
 
     def __init__(
         self,
         *,
         read_strategy: ReshardingReadStrategy = ReshardingReadStrategy.AUTO,
+        file_read_workers: int | None = None,
     ) -> None:
+        if file_read_workers is not None and file_read_workers < 1:
+            raise ValueError(
+                f"file_read_workers must be at least 1, got {file_read_workers}"
+            )
         self._read_strategy = read_strategy
+        self._file_read_workers = (
+            _default_file_read_workers()
+            if file_read_workers is None
+            else file_read_workers
+        )
 
     @override
     def extract_sharding_metadata(
@@ -663,6 +702,27 @@ class DefaultResharder(Resharder):
             storage: Storage backend for reading checkpoint files.
         """
         target_by_path = _collect_leaf_values(item_key, target)
+        _, nested_path_to_load_plans, aliased_paths = dedupe_aliased_targets(
+            {
+                path: _unwrap_dtensor(target_by_path[path])
+                for path in nested_path_to_load_plans
+            },
+            nested_path_to_load_plans,
+        )
+        # Aliased targets share memory, so concurrent reads could race on it.
+        # Read one file at a time whenever any are found.
+        file_read_workers = 1 if aliased_paths else self._file_read_workers
+        if aliased_paths:
+            logger.warning(
+                "Loading %d aliased target(s) once, from the last path that "
+                "shares each tensor, reading one file at a time: %s",
+                len(aliased_paths),
+                ", ".join(
+                    f"{get_fqn_from_nested_path(dropped)} -> "
+                    f"{get_fqn_from_nested_path(kept)}"
+                    for dropped, kept in aliased_paths
+                ),
+            )
 
         # Group load plans by source rank
         plans_by_rank: dict[int, list[tuple[NestedPath, LoadPlan]]] = {}
@@ -684,6 +744,7 @@ class DefaultResharder(Resharder):
             plans_by_rank,
             target_by_path,
             storage,
+            file_read_workers,
         )
 
     def _execute_load_plans_with_read_strategy(
@@ -695,57 +756,90 @@ class DefaultResharder(Resharder):
         plans_by_rank: dict[int, list[tuple[NestedPath, LoadPlan]]],
         target_by_path: dict[NestedPath, Any],
         storage: Storage,
+        file_read_workers: int,
     ) -> None:
-        current_strategy = read_strategy
-        for src_rank, rank_plans in plans_by_rank.items():
+        # Worker threads start on the default stream. Copy on the caller's
+        # current stream so the writes are ordered after its pending work on the
+        # targets. Assumes accelerator targets are on the current device.
+        on_accelerator = any(
+            _unwrap_dtensor(target_by_path[path]).device.type != "cpu"
+            for rank_plans in plans_by_rank.values()
+            for path, _ in rank_plans
+        )
+        caller_stream = torch.accelerator.current_stream() if on_accelerator else None
+
+        def copy(staged: Iterable[tuple[NestedPath, LoadPlan, torch.Tensor]]) -> None:
+            if caller_stream is not None:
+                torch.accelerator.set_stream(caller_stream)
+            for nested_path, load_plan, src_data in staged:
+                target_tensor = _unwrap_dtensor(target_by_path[nested_path])
+                tgt_slice = tuple(
+                    slice(o, o + s) for o, s in zip(load_plan.offsets, load_plan.sizes)
+                )
+                target_tensor[tgt_slice].copy_(src_data)
+
+        def read_with_offsets(src_rank: int) -> bool:
+            """Return False if the file must be read in full instead."""
             layout_info = source_layouts_by_rank[src_rank]
             file_path = source_path / layout_info.file_path
-            if current_strategy in (
-                ReshardingReadStrategy.AUTO,
-                ReshardingReadStrategy.OFFSET,
-            ):
-                try:
-                    staged = self._read_source_slices_with_offset_reads(
+            try:
+                # Close the generator even if copy() raises, so its stream is
+                # closed then rather than whenever the generator is collected.
+                with closing(
+                    self._read_source_slices_with_offset_reads(
                         file_path,
                         layout_info,
                         src_rank,
                         item_key,
-                        rank_plans,
+                        plans_by_rank[src_rank],
                         storage,
                     )
-                except NotImplementedError as error:
-                    if current_strategy is ReshardingReadStrategy.OFFSET:
-                        raise
-                    current_strategy = ReshardingReadStrategy.FULL_FILE
-                    logger.warning(
-                        "Offset reads unavailable for %s; reading it and "
-                        "remaining source files in full: %s",
-                        file_path,
-                        error,
-                    )
-                    staged = self._read_source_slices_with_full_file_read(
-                        file_path,
-                        layout_info,
-                        item_key,
-                        rank_plans,
-                        storage,
-                    )
-            elif current_strategy is ReshardingReadStrategy.FULL_FILE:
-                staged = self._read_source_slices_with_full_file_read(
+                ) as staged:
+                    copy(staged)
+                return True
+            except NotImplementedError as error:
+                if read_strategy is ReshardingReadStrategy.OFFSET:
+                    raise
+                logger.warning(
+                    "Offset reads unavailable for %s; reading it in full: %s",
                     file_path,
+                    error,
+                )
+                return False
+            except Exception:
+                # Only the first failure is raised to the caller; log every one.
+                logger.exception("Reading %s failed", file_path)
+                raise
+
+        full_file_ranks = list(plans_by_rank)
+        if read_strategy is not ReshardingReadStrategy.FULL_FILE:
+            with ThreadPoolExecutor(
+                max_workers=file_read_workers,
+                thread_name_prefix="ckpt-read",
+            ) as pool:
+                try:
+                    read = list(pool.map(read_with_offsets, plans_by_rank))
+                except BaseException:
+                    # The load has failed, so skip the files not yet started.
+                    pool.shutdown(cancel_futures=True)
+                    raise
+            full_file_ranks = [
+                src_rank for src_rank, done in zip(plans_by_rank, read) if not done
+            ]
+
+        # A full-file read holds the whole file in memory, so read these one at a
+        # time to bound memory regardless of file_read_workers.
+        for src_rank in full_file_ranks:
+            layout_info = source_layouts_by_rank[src_rank]
+            copy(
+                self._read_source_slices_with_full_file_read(
+                    source_path / layout_info.file_path,
                     layout_info,
                     item_key,
-                    rank_plans,
+                    plans_by_rank[src_rank],
                     storage,
                 )
-            else:
-                raise ValueError(
-                    f"Cannot directly execute read strategy {current_strategy}"
-                )
-            for nested_path, lp, src_data in staged:
-                target_tensor = _unwrap_dtensor(target_by_path[nested_path])
-                tgt_slice = tuple(slice(o, o + s) for o, s in zip(lp.offsets, lp.sizes))
-                target_tensor[tgt_slice].copy_(src_data)
+            )
 
     def _read_source_slices_with_offset_reads(
         self,
@@ -755,8 +849,12 @@ class DefaultResharder(Resharder):
         item_key: str,
         rank_plans: list[tuple[NestedPath, LoadPlan]],
         storage: Storage,
-    ) -> list[tuple[NestedPath, LoadPlan, torch.Tensor]]:
-        """Read the source data every plan needs using file offset reads."""
+    ) -> Generator[tuple[NestedPath, LoadPlan, torch.Tensor], None, None]:
+        """Yield the source data each plan needs, one slice at a time.
+
+        Each slice's buffer is released after the caller copies it, rather
+        than every slice in the file being held until the last one is read.
+        """
         # O_DIRECT bypasses the page cache. On FUSE mounts, page-cache reads
         # share a small per-mount limit on in-flight requests, which caps how
         # fast concurrent readers on one host can go.
@@ -790,8 +888,8 @@ class DefaultResharder(Resharder):
                     "Unsupported serialization format "
                     f"{type(serialization_format).__name__}"
                 )
-            return [
-                (
+            for path, plan in rank_plans:
+                yield (
                     path,
                     plan,
                     _read_source_tensor_slice(
@@ -800,8 +898,6 @@ class DefaultResharder(Resharder):
                         plan,
                     ),
                 )
-                for path, plan in rank_plans
-            ]
 
     def _read_source_slices_with_full_file_read(
         self,

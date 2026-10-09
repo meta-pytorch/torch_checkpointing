@@ -8,6 +8,8 @@ import io
 import logging
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch, PropertyMock
@@ -22,6 +24,7 @@ from torch_checkpointing.checkpoint_layout import (
     TorchSerialization,
 )
 from torch_checkpointing.default_resharder import (
+    _default_file_read_workers,
     _slice_source_tensor,
     _validate_source_slice_bounds,
     DefaultResharder,
@@ -428,7 +431,19 @@ def test_full_file_strategy_loads_dotted_safetensors() -> None:
     assert storage.bytes_read == len(checkpoint_data)
 
 
-def test_auto_uses_offset_reads_for_safetensors() -> None:
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda",
+            marks=pytest.mark.skipif(
+                not torch.cuda.is_available(), reason="requires CUDA"
+            ),
+        ),
+    ],
+)
+def test_auto_uses_offset_reads_for_safetensors(device: str) -> None:
     source = torch.arange(1024, dtype=torch.float32)
     path = Path("model.safetensors")
     checkpoint_data = serialize_safetensors({"weight": source})
@@ -442,8 +457,8 @@ def test_auto_uses_offset_reads_for_safetensors() -> None:
         src_sizes=tuple(source.shape),
     )
     target = {
-        "first": torch.empty_like(source),
-        "second": torch.empty_like(source),
+        "first": torch.empty_like(source, device=device),
+        "second": torch.empty_like(source, device=device),
     }
     span_bytes = source.numel() * source.element_size()
     assert span_bytes < len(checkpoint_data) <= 2 * span_bytes
@@ -463,8 +478,8 @@ def test_auto_uses_offset_reads_for_safetensors() -> None:
         storage=storage,  # type: ignore[arg-type]
     )
 
-    torch.testing.assert_close(target["first"], source)
-    torch.testing.assert_close(target["second"], source)
+    torch.testing.assert_close(target["first"].cpu(), source)
+    torch.testing.assert_close(target["second"].cpu(), source)
     assert storage.read_args == [ReadArgs(pre_read_full_file=False, direct_io=True)]
 
 
@@ -638,7 +653,7 @@ def test_load_falls_back_for_quantized_source_tensor() -> None:
     assert storage.getsize_calls == [path]
 
 
-def test_auto_stops_trying_offset_reads_after_first_unsupported_file(
+def test_auto_falls_back_to_full_file_reads_per_unsupported_file(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     paths = [Path(f"rank_{rank}.pt") for rank in range(3)]
@@ -675,10 +690,15 @@ def test_auto_stops_trying_offset_reads_after_first_unsupported_file(
         caplog.at_level(logging.WARNING),
         patch(
             "torch_checkpointing.default_resharder._validate_offset_read_archive",
-            side_effect=(None, NotImplementedError("unsupported offset read")),
+            side_effect=(
+                None,
+                NotImplementedError("unsupported offset read"),
+                NotImplementedError("unsupported offset read"),
+            ),
         ) as validate_archive,
     ):
-        DefaultResharder()._execute_load_plans(
+        # One worker, so files are read in order.
+        DefaultResharder(file_read_workers=1)._execute_load_plans(
             source_path=Path("."),
             source_metadata=source_metadata,
             item_key="model",
@@ -688,15 +708,411 @@ def test_auto_stops_trying_offset_reads_after_first_unsupported_file(
         )
 
     torch.testing.assert_close(target_tensor, torch.arange(12, dtype=torch.float32))
-    assert validate_archive.call_count == 2
+    assert validate_archive.call_count == 3
+    # Every file tries offset reads first; the unsupported ones are then read in
+    # full, one at a time.
     assert [path for path, _ in storage.reads] == [
         paths[0],
         paths[1],
+        paths[2],
         paths[1],
         paths[2],
     ]
     assert storage.getsize_calls == paths[1:]
-    assert caplog.text.count("Offset reads unavailable") == 1
+    assert caplog.text.count("Offset reads unavailable") == 2
+
+
+def test_full_file_reads_run_one_at_a_time_on_the_calling_thread() -> None:
+    """A full-file read holds the whole file in memory, so they never overlap."""
+    paths = [Path(f"rank_{rank}.pt") for rank in range(3)]
+    files = {}
+    for rank, path in enumerate(paths):
+        checkpoint = io.BytesIO()
+        torch.save({"selected": torch.full((4,), float(rank))}, checkpoint)
+        files[path] = checkpoint.getvalue()
+    read_threads = []
+
+    class _ThreadRecordingStorage(_MultiFileTrackingStorage):
+        def stream_read(
+            self,
+            path: Path,
+            read_args: ReadArgs | None = None,
+        ) -> io.BytesIO:
+            read_threads.append(threading.current_thread())
+            return super().stream_read(path, read_args)
+
+    storage = _ThreadRecordingStorage(files)
+    target_tensor = torch.zeros(12, dtype=torch.float32)
+    load_plans = [
+        LoadPlan(
+            offsets=(rank * 4,),
+            sizes=(4,),
+            src_rank=rank,
+            src_fqn="selected",
+            src_offsets=(0,),
+            src_sizes=(4,),
+        )
+        for rank in range(len(paths))
+    ]
+
+    DefaultResharder(
+        read_strategy=ReshardingReadStrategy.FULL_FILE, file_read_workers=len(paths)
+    )._execute_load_plans(
+        source_path=Path("."),
+        source_metadata=DistributedItemMetadata(
+            nested_path_to_metadata={},
+            rank_to_layout_info={
+                rank: LayoutInfo(str(path), TorchSerialization())
+                for rank, path in enumerate(paths)
+            },
+        ),
+        item_key="model",
+        nested_path_to_load_plans={("selected",): load_plans},
+        target={"selected": target_tensor},
+        storage=storage,  # type: ignore[arg-type]
+    )
+
+    torch.testing.assert_close(
+        target_tensor, torch.arange(3, dtype=torch.float32).repeat_interleave(4)
+    )
+    assert read_threads == [threading.current_thread()] * len(paths)
+
+
+@pytest.mark.parametrize(
+    ("local_world_size", "workers"),
+    [
+        ("8", 3),
+        ("4", 6),
+        ("2", 12),
+        ("32", 1),
+        (None, 8),
+        ("", 8),
+        ("0", 8),
+        ("-2", 8),
+        ("eight", 8),
+    ],
+)
+def test_default_file_read_workers_split_host_reads_across_local_ranks(
+    monkeypatch: pytest.MonkeyPatch, local_world_size: str | None, workers: int
+) -> None:
+    if local_world_size is None:
+        monkeypatch.delenv("LOCAL_WORLD_SIZE", raising=False)
+    else:
+        monkeypatch.setenv("LOCAL_WORLD_SIZE", local_world_size)
+    assert _default_file_read_workers() == workers
+
+
+def test_file_read_workers_must_be_positive() -> None:
+    with pytest.raises(ValueError, match="file_read_workers must be at least 1"):
+        DefaultResharder(file_read_workers=0)
+
+
+def test_reads_source_files_concurrently() -> None:
+    num_files = 4
+    paths = [Path(f"model_{rank}.safetensors") for rank in range(num_files)]
+    files = {
+        path: serialize_safetensors(
+            {"weight": torch.arange(rank * 4, rank * 4 + 4, dtype=torch.float32)}
+        )
+        for rank, path in enumerate(paths)
+    }
+    # Every file must be open at once to get past the barrier.
+    all_open = threading.Barrier(num_files, timeout=30)
+
+    class _BarrierStorage(_MultiFileTrackingStorage):
+        def stream_read(
+            self,
+            path: Path,
+            read_args: ReadArgs | None = None,
+        ) -> io.BytesIO:
+            all_open.wait()
+            return super().stream_read(path, read_args)
+
+    target_tensor = torch.zeros(num_files * 4, dtype=torch.float32)
+    load_plans = [
+        LoadPlan(
+            offsets=(rank * 4,),
+            sizes=(4,),
+            src_rank=rank,
+            src_fqn="weight",
+            src_offsets=(0,),
+            src_sizes=(4,),
+        )
+        for rank in range(num_files)
+    ]
+
+    storage = _BarrierStorage(files)
+    DefaultResharder(file_read_workers=num_files)._execute_load_plans(
+        source_path=Path("."),
+        source_metadata=DistributedItemMetadata(
+            nested_path_to_metadata={},
+            rank_to_layout_info={
+                rank: LayoutInfo(str(path), SafetensorsSerialization())
+                for rank, path in enumerate(paths)
+            },
+        ),
+        item_key="model",
+        nested_path_to_load_plans={("weight",): load_plans},
+        target={"weight": target_tensor},
+        storage=storage,  # type: ignore[arg-type]
+    )
+
+    torch.testing.assert_close(
+        target_tensor, torch.arange(num_files * 4, dtype=torch.float32)
+    )
+
+
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda",
+            marks=pytest.mark.skipif(
+                not torch.cuda.is_available(), reason="requires CUDA"
+            ),
+        ),
+    ],
+)
+def test_concurrent_reads_of_many_tensors_fill_shared_targets(
+    tmp_path: Path, device: str
+) -> None:
+    """Every file writes into every target at once, including interleaved columns."""
+    num_files, rows, cols = 4, 1024, 4096
+    generator = torch.Generator().manual_seed(0)
+    shards = [
+        {
+            "rows": torch.randn(rows, cols, generator=generator),
+            "columns": torch.randn(rows, cols, generator=generator),
+            "half": torch.randn(rows, cols, generator=generator).to(torch.bfloat16),
+        }
+        for _ in range(num_files)
+    ]
+    names = [f"model_{rank}.safetensors" for rank in range(num_files)]
+    for name, shard in zip(names, shards):
+        save_file(shard, tmp_path / name)
+    storage = LocalFileSystemStorageConfig().create_storage()
+    # Every file must be open at once to get past the barrier.
+    all_open = threading.Barrier(num_files, timeout=30)
+    open_stream = storage.stream_read
+
+    def stream_read_once_all_are_open(
+        path: Path, read_args: ReadArgs | None = None
+    ) -> io.RawIOBase:
+        all_open.wait()
+        return open_stream(path, read_args)
+
+    target = {
+        "rows": torch.zeros(num_files * rows, cols, device=device),
+        "columns": torch.zeros(rows, num_files * cols, device=device),
+        "half": torch.zeros(
+            num_files * rows, cols, dtype=torch.bfloat16, device=device
+        ),
+    }
+    # Row blocks are contiguous in the target; column blocks interleave.
+    target_offsets = {
+        "rows": lambda rank: (rank * rows, 0),
+        "columns": lambda rank: (0, rank * cols),
+        "half": lambda rank: (rank * rows, 0),
+    }
+    load_plans = {
+        (name,): [
+            LoadPlan(
+                offsets=target_offsets[name](rank),
+                sizes=(rows, cols),
+                src_rank=rank,
+                src_fqn=name,
+                src_offsets=(0, 0),
+                src_sizes=(rows, cols),
+            )
+            for rank in range(num_files)
+        ]
+        for name in target
+    }
+
+    with patch.object(storage, "stream_read", stream_read_once_all_are_open):
+        DefaultResharder(file_read_workers=num_files)._execute_load_plans(
+            source_path=tmp_path,
+            source_metadata=DistributedItemMetadata(
+                nested_path_to_metadata={},
+                rank_to_layout_info={
+                    rank: LayoutInfo(name, SafetensorsSerialization())
+                    for rank, name in enumerate(names)
+                },
+            ),
+            item_key="model",
+            nested_path_to_load_plans=load_plans,
+            target=target,
+            storage=storage,
+        )
+
+    torch.testing.assert_close(
+        target["rows"].cpu(), torch.cat([shard["rows"] for shard in shards])
+    )
+    torch.testing.assert_close(
+        target["columns"].cpu(),
+        torch.cat([shard["columns"] for shard in shards], dim=1),
+    )
+    torch.testing.assert_close(
+        target["half"].cpu(), torch.cat([shard["half"] for shard in shards])
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_copies_follow_pending_work_on_the_callers_stream() -> None:
+    source = torch.arange(1024, dtype=torch.float32)
+    path = Path("model.safetensors")
+    storage = _TrackingStorage(path, serialize_safetensors({"weight": source}))
+    plan = LoadPlan(
+        offsets=(0,),
+        sizes=tuple(source.shape),
+        src_rank=0,
+        src_fqn="weight",
+        src_offsets=(0,),
+        src_sizes=tuple(source.shape),
+    )
+    target = torch.empty_like(source, device="cuda")
+
+    def load() -> None:
+        DefaultResharder()._execute_load_plans(
+            source_path=Path("."),
+            source_metadata=DistributedItemMetadata(
+                nested_path_to_metadata={},
+                rank_to_layout_info={
+                    0: LayoutInfo(str(path), SafetensorsSerialization())
+                },
+            ),
+            item_key="model",
+            nested_path_to_load_plans={("weight",): [plan]},
+            target={"weight": target},
+            storage=storage,  # type: ignore[arg-type]
+        )
+
+    # First kernel launches and first-time host allocations can synchronize the
+    # whole device, which would order the copy by accident. Do them once up front.
+    torch.cuda._sleep(1)
+    target.fill_(-1)
+    load()
+    torch.cuda.synchronize()
+
+    with torch.cuda.stream(torch.cuda.Stream()):
+        # Delay the caller's pending write, so a copy not ordered after it
+        # finishes first and is overwritten.
+        torch.cuda._sleep(100_000_000)
+        target.fill_(-1)
+        load()
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(target.cpu(), source)
+
+
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda",
+            marks=pytest.mark.skipif(
+                not torch.cuda.is_available(), reason="requires CUDA"
+            ),
+        ),
+    ],
+)
+def test_aliased_targets_load_once_from_the_last_path(device: str) -> None:
+    """Two files fill paths that share one tensor; the last path wins, as serially."""
+    paths = [Path(f"model_{rank}.safetensors") for rank in range(2)]
+    files = {
+        path: serialize_safetensors({"weight": torch.full((4,), float(rank + 1))})
+        for rank, path in enumerate(paths)
+    }
+    tied = torch.zeros(4, device=device)
+    storage = _MultiFileTrackingStorage(files)
+    DefaultResharder(file_read_workers=2)._execute_load_plans(
+        source_path=Path("."),
+        source_metadata=DistributedItemMetadata(
+            nested_path_to_metadata={},
+            rank_to_layout_info={
+                rank: LayoutInfo(str(path), SafetensorsSerialization())
+                for rank, path in enumerate(paths)
+            },
+        ),
+        item_key="model",
+        nested_path_to_load_plans={
+            (name,): [
+                LoadPlan(
+                    offsets=(0,),
+                    sizes=(4,),
+                    src_rank=rank,
+                    src_fqn="weight",
+                    src_offsets=(0,),
+                    src_sizes=(4,),
+                )
+            ]
+            for rank, name in [(1, "first"), (0, "second")]
+        },
+        target={"first": tied, "second": tied},
+        storage=storage,  # type: ignore[arg-type]
+    )
+
+    torch.testing.assert_close(tied.cpu(), torch.full((4,), 1.0))
+    # The dropped path's file is never read, so no concurrent write can race.
+    assert {path for path, _ in storage.reads} == {paths[0]}
+
+
+def test_aliased_targets_disable_concurrent_reads() -> None:
+    """With any aliased targets, every file is read by the same single worker."""
+    paths = [Path(f"model_{rank}.safetensors") for rank in range(3)]
+    files = {
+        path: serialize_safetensors({"weight": torch.full((4,), float(rank + 1))})
+        for rank, path in enumerate(paths)
+    }
+    read_threads = []
+
+    class _SlowThreadRecordingStorage(_MultiFileTrackingStorage):
+        def stream_read(
+            self,
+            path: Path,
+            read_args: ReadArgs | None = None,
+        ) -> io.BytesIO:
+            read_threads.append(threading.current_thread())
+            # Keep each read busy so concurrent workers would overlap.
+            time.sleep(0.1)
+            return super().stream_read(path, read_args)
+
+    tied = torch.zeros(4)
+    other = torch.zeros(4)
+    storage = _SlowThreadRecordingStorage(files)
+    DefaultResharder(file_read_workers=3)._execute_load_plans(
+        source_path=Path("."),
+        source_metadata=DistributedItemMetadata(
+            nested_path_to_metadata={},
+            rank_to_layout_info={
+                rank: LayoutInfo(str(path), SafetensorsSerialization())
+                for rank, path in enumerate(paths)
+            },
+        ),
+        item_key="model",
+        nested_path_to_load_plans={
+            (name,): [
+                LoadPlan(
+                    offsets=(0,),
+                    sizes=(4,),
+                    src_rank=rank,
+                    src_fqn="weight",
+                    src_offsets=(0,),
+                    src_sizes=(4,),
+                )
+            ]
+            for rank, name in [(1, "first"), (0, "second"), (2, "other")]
+        },
+        target={"first": tied, "second": tied, "other": other},
+        storage=storage,  # type: ignore[arg-type]
+    )
+
+    torch.testing.assert_close(tied, torch.full((4,), 1.0))
+    torch.testing.assert_close(other, torch.full((4,), 3.0))
+    assert len(read_threads) == 2
+    assert len(set(read_threads)) == 1
 
 
 def test_load_reshards_safetensors_shards_described_by_native_metadata(
