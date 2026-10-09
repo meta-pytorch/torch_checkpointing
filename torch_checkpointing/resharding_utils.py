@@ -11,13 +11,16 @@ Utility helpers shared by resharding implementations.
 from __future__ import annotations
 
 import logging
-from typing import TypeVar
+from typing import Any, TypeVar
+
+import torch
 
 from .resharding import LoadPlan
 from .types import NestedPath
 
 logger: logging.Logger = logging.getLogger(__name__)
 
+_K = TypeVar("_K")
 _V = TypeVar("_V")
 
 
@@ -113,3 +116,47 @@ def deduplicate_source_chunks(
 
     logger.info(f"Load plan generated with {len(selected_ranks)} ranks")
     return optimized_result, selected_ranks
+
+
+def dedupe_aliased_targets(
+    targets: dict[_K, Any],
+    load_plans: dict[_K, _V],
+) -> tuple[dict[_K, Any], dict[_K, _V], list[tuple[_K, _K]]]:
+    """Drop keys whose target tensor aliases another key's target tensor.
+
+    When two keys reference the same tensor (tied weights, or a parameter also
+    registered under a second name), both appear in ``targets`` with the same
+    ``data_ptr``. A loader that writes targets concurrently would race the two
+    writes. Serial ``load_state_dict`` iterates keys in order, so the LAST key
+    wins. Match that by keeping the last-seen key per ``data_ptr`` and dropping
+    the earlier ones from both ``targets`` and ``load_plans``.
+
+    Returns:
+        The deduped ``(targets, load_plans, aliased_pairs)``, where
+        ``aliased_pairs`` lists ``(dropped_key, kept_key)``.
+    """
+    key_for_data_ptr: dict[int, _K] = {}
+    key_to_data_ptr: dict[_K, int] = {}
+    for key, tensor in targets.items():
+        if not isinstance(tensor, torch.Tensor) or tensor.numel() == 0:
+            continue
+        ptr = tensor.data_ptr()
+        key_to_data_ptr[key] = ptr
+        # Last-write-wins: later keys override earlier ones for the same ptr.
+        key_for_data_ptr[ptr] = key
+    aliased_pairs = [
+        (key, key_for_data_ptr[ptr])
+        for key, ptr in key_to_data_ptr.items()
+        if key_for_data_ptr[ptr] != key
+    ]
+    if not aliased_pairs:
+        return targets, load_plans, aliased_pairs
+
+    aliased_keys = {key for key, _ in aliased_pairs}
+    deduped_targets = {
+        key: tensor for key, tensor in targets.items() if key not in aliased_keys
+    }
+    deduped_plans = {
+        key: plans for key, plans in load_plans.items() if key not in aliased_keys
+    }
+    return deduped_targets, deduped_plans, aliased_pairs
