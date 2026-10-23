@@ -157,17 +157,13 @@ class _DirectIOReader(io.RawIOBase):
         self._path = path
         self._on_unsupported = on_unsupported
         self._direct_io = False
-        if _O_DIRECT is None:
-            on_unsupported(path, "open")
-            self._file: io.RawIOBase = open(path, "rb", buffering=0)
-            return
         try:
-            fd = os.open(path, _O_DIRECT | os.O_RDONLY)
+            fd = os.open(path, os.O_DIRECT | os.O_RDONLY)
         except OSError as e:
             if e.errno != errno.EINVAL:
                 raise
             on_unsupported(path, "open")
-            self._file = open(path, "rb", buffering=0)
+            self._file: io.RawIOBase = open(path, "rb", buffering=0)
         else:
             self._file = os.fdopen(fd, "rb", buffering=0)
             self._direct_io = True

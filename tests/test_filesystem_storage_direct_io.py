@@ -4,14 +4,15 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import io
 import tempfile
 from pathlib import Path
 from unittest import mock
 
 import torch_checkpointing.storage.filesystem as filesystem_module
 from torch.testing._internal.common_utils import run_tests, TestCase
+from torch_checkpointing.storage.base_storage import ReadArgs
 from torch_checkpointing.storage.filesystem import (
-    _DirectIOReader,
     LocalFileSystemStorageConfig,
     WriteStream,
 )
@@ -35,19 +36,15 @@ class TestDirectIOWithoutOSSupport(TestCase):
             self.assertFalse(stream.using_direct_io)
         self.assertEqual(self.path.read_bytes(), b"x" * 16)
 
-    def test_direct_io_reader_reports_unsupported_open(self) -> None:
-        self.path.write_bytes(b"y" * 8)
-        reported: list[tuple[Path, str]] = []
-        with _DirectIOReader(self.path, lambda p, op: reported.append((p, op))) as f:
-            self.assertEqual(f.read(), b"y" * 8)
-        self.assertEqual(reported, [(self.path, "open")])
-
     def test_storage_round_trip_never_tries_direct_io(self) -> None:
         storage = LocalFileSystemStorageConfig().create_storage()
         self.assertFalse(storage._try_direct_io_reads)
         storage.write(self.path, b"z" * 32)
         self.assertEqual(storage.read(self.path), b"z" * 32)
-        with storage.stream_read(self.path) as f:
+        # Asking for direct I/O still opens a plain buffered file.
+        read_args = ReadArgs(pre_read_full_file=False, direct_io=True)
+        with storage.stream_read(self.path, read_args) as f:
+            self.assertIsInstance(f, io.FileIO)
             self.assertEqual(f.read(), b"z" * 32)
 
 
