@@ -13,6 +13,7 @@ functionality for distributed tensor checkpointing across various configurations
 
 import os
 import tempfile
+from unittest import mock
 
 import pytest
 import torch
@@ -710,3 +711,88 @@ class TestMetadataManager(DTensorTestBase):
         custom_groups = custom_item.nested_path_to_metadata[()]
         # Custom objects (without equivalent_ranks) should have ranks from aggregation
         self.assertEqual(custom_groups[0].ranks, tuple(range(world_size)))
+
+
+@pytest.mark.gpus_needed_1
+@pytest.mark.skipif(
+    not torch.accelerator.is_available(), reason="requires a visible accelerator"
+)
+def test_cpu_only_group_gathers_with_accelerator_visible() -> None:
+    dist.init_process_group(
+        backend="cpu:gloo", store=dist.HashStore(), rank=0, world_size=1
+    )
+    try:
+        manager = DefaultMetadataManager(
+            RankInfo(global_rank=0, global_world_size=1, role_rank=0, role_world_size=1)
+        )
+        assert manager._all_gather_pickled_data({"a": 1}) == {0: {"a": 1}}
+    finally:
+        dist.destroy_process_group()
+
+
+class TestMetadataManagerGloo(DTensorTestBase):
+    """Multi-rank metadata aggregation over Gloo on ranks that see no GPU."""
+
+    @property
+    def world_size(self) -> int:
+        return 2
+
+    @property
+    def device_type(self) -> str:
+        return "cpu"
+
+    @property
+    def backend(self) -> str:
+        return "gloo"
+
+    def setUp(self) -> None:
+        # Hide GPUs from the spawned ranks, as on a CPU-only host.
+        with mock.patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": ""}):
+            super().setUp()
+
+    @with_comms
+    def test_compute_metadata(self) -> None:
+        def layout(rank: int) -> LayoutInfo:
+            return LayoutInfo(
+                file_path=f"model_{rank}.pt", serialization_format=TorchSerialization()
+            )
+
+        def custom(rank: int) -> CustomObject:
+            return CustomObject(f"rank{rank}")
+
+        rank = dist.get_rank()
+        mesh = DeviceMesh("cpu", list(range(self.world_size)))
+        dtensor = DTensor.from_local(torch.randn(4, 8), mesh, [DTensorShard(0)])
+        checkpoint_info = make_checkpoint_info_from_dict(
+            {"model": {"weight": dtensor}, "custom": custom(rank)},
+            {"model": layout(rank)},
+        )
+        manager = DefaultMetadataManager(
+            RankInfo(
+                global_rank=rank,
+                global_world_size=self.world_size,
+                role_rank=rank,
+                role_world_size=self.world_size,
+            )
+        )
+
+        metadata = manager.compute_metadata(checkpoint_info)
+
+        assert metadata is not None
+        items = metadata.distributed_metadata.metadata
+        (weight_group,) = items["model"].nested_path_to_metadata[("weight",)]
+        self.assertEqual(weight_group.ranks, (0, 1))
+        self.assertEqual(
+            items["model"].rank_to_layout_info, {0: layout(0), 1: layout(1)}
+        )
+        # Each rank's custom object differs, so both ranks' payloads must arrive.
+        self.assertEqual(
+            {
+                group.ranks: group.sharding_metadata
+                for group in items["custom"].nested_path_to_metadata[()]
+            },
+            {
+                (0,): custom(0).__pt_sharding_metadata__(),
+                (1,): custom(1).__pt_sharding_metadata__(),
+            },
+        )

@@ -19,6 +19,7 @@ from typing import Any
 import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
+from torch.distributed.distributed_c10d import _get_object_coll_device
 
 from .checkpoint_base import CheckpointInfo
 from .checkpoint_layout import LayoutInfo
@@ -34,6 +35,18 @@ from .logging_utils import EventLogger, EventType
 from .types import NestedPath, RankInfo
 
 logger = logging.getLogger(__name__)
+
+
+def _collective_device(process_group: ProcessGroup | None) -> torch.device:
+    """
+    Device for the tensors of a collective on ``process_group``.
+
+    Uses the rule of torch's object collectives, via the private
+    ``torch.distributed.distributed_c10d._get_object_coll_device``: CPU if the
+    group has a CPU backend (e.g. Gloo, alone or next to NCCL), otherwise its
+    accelerator.
+    """
+    return torch.device(_get_object_coll_device(process_group))
 
 
 class MetadataManager(ABC):
@@ -402,6 +415,7 @@ class DefaultMetadataManager(MetadataManager):
             Dict mapping rank to deserialized data from that rank
         """
         world_size = dist.get_world_size(process_group)
+        device = _collective_device(process_group)
 
         # Step 1: Serialize local data using pickle
         data_bytes = pickle.dumps(data)
@@ -413,13 +427,13 @@ class DefaultMetadataManager(MetadataManager):
 
         # Use all_reduce with max operation to find the maximum total size across all ranks
         total_size = len(prefixed_data)
-        max_size_tensor = torch.tensor([total_size], dtype=torch.int64, device="cuda")
+        max_size_tensor = torch.tensor([total_size], dtype=torch.int64, device=device)
         dist.all_reduce(max_size_tensor, op=dist.ReduceOp.MAX, group=process_group)
         max_size = int(max_size_tensor.item())
 
         # Pad prefixed data and convert to tensor
         padded_bytes = prefixed_data + b"\0" * (max_size - len(prefixed_data))
-        data_tensor = torch.frombuffer(padded_bytes, dtype=torch.uint8).cuda()
+        data_tensor = torch.frombuffer(padded_bytes, dtype=torch.uint8).to(device)
 
         # All-gather data tensors
         all_data_tensors = [torch.zeros_like(data_tensor) for _ in range(world_size)]
