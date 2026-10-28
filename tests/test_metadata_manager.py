@@ -40,7 +40,11 @@ from torch_checkpointing.distributed_metadata import (
     DistributedMetadata,
     ShardingMetadata,
 )
-from torch_checkpointing.dtensor_metadata import DTensorShardingMetadata
+from torch_checkpointing.dtensor_metadata import (
+    DeviceMeshSpec,
+    DTensorShardingMetadata,
+    ReplicateSpec,
+)
 from torch_checkpointing.metadata_manager import DefaultMetadataManager
 from torch_checkpointing.types import RankInfo
 
@@ -51,6 +55,51 @@ from .resharding_test_utils import (
     make_checkpoint_info_from_dict,
     make_checkpoint_item,
 )
+
+
+@pytest.mark.parametrize("use_equivalent_ranks", [False, True])
+def test_merge_reuses_rank_tuples(use_equivalent_ranks: bool) -> None:
+    ranks = (2, 0, 1)
+
+    def metadata(name: str, owners: tuple[int, ...]) -> ShardingMetadata:
+        if use_equivalent_ranks:
+            return DTensorShardingMetadata(
+                global_shape=(len(name),),
+                dtype="torch.float32",
+                stride=(1,),
+                mesh_spec=DeviceMeshSpec("cpu", (len(owners),), owners),
+                placements=(ReplicateSpec(),),
+            )
+        return CustomObject(name).__pt_sharding_metadata__()
+
+    all_ranks_metadata = {
+        rank: {
+            "model": {
+                ("weight",): metadata("weight", ranks),
+                ("bias",): metadata("bias", (0, 2, 1)),
+            },
+            "optimizer": {("moment",): metadata("moment", ranks)},
+        }
+        for rank in ranks
+    }
+    all_ranks_metadata[2]["model"][("partial",)] = metadata("partial", (2,))
+    manager = DefaultMetadataManager(RankInfo(0, 3, 0, 3))
+    try:
+        merged = manager._merge_object_metadata_from_ranks(all_ranks_metadata)
+        weight = merged["model"][("weight",)][0]
+        bias = merged["model"][("bias",)][0]
+        moment = merged["optimizer"][("moment",)][0]
+        partial = merged["model"][("partial",)][0]
+
+        assert weight.ranks == ((0, 1, 2) if use_equivalent_ranks else ranks)
+        assert weight.ranks is bias.ranks is moment.ranks
+        assert partial.ranks == (2,)
+        serialized = [group.to_dict() for group in (weight, bias, moment, partial)]
+        restored = pickle.loads(pickle.dumps(serialized))
+        assert restored == serialized
+        assert restored[0]["ranks"] is restored[1]["ranks"] is restored[2]["ranks"]
+    finally:
+        manager.close()
 
 
 class TestMetadataManager(DTensorTestBase):

@@ -605,6 +605,12 @@ class DefaultMetadataManager(MetadataManager):
 
         # For each item and nested path, group ranks by their ShardingMetadata
         result: dict[str, dict[NestedPath, list[GlobalObjectMetadata]]] = {}
+        # Share equal rank tuples so pickle memoizes them across tensors instead
+        # of serializing the same rank list for every tensor.
+        rank_tuples: dict[tuple[int, ...], tuple[int, ...]] = {}
+
+        def intern_ranks(ranks: tuple[int, ...]) -> tuple[int, ...]:
+            return rank_tuples.setdefault(ranks, ranks)
 
         for item_key, nested_paths in all_items.items():
             result[item_key] = {}
@@ -646,6 +652,7 @@ class DefaultMetadataManager(MetadataManager):
                         if equiv_ranks is not None
                         else tuple(ranks_list)
                     )
+                    final_ranks = intern_ranks(final_ranks)
 
                     result[item_key][nested_path].append(
                         GlobalObjectMetadata(
