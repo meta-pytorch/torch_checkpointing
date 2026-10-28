@@ -95,8 +95,9 @@ class SyncCheckpointSaver(CheckpointSaver):
 `save` does three things:
 
 1. `_prepare_checkpoint_write_info(checkpoint)` — calls `checkpoint.get_items()`,
-   and if a `MetadataManager` is present, computes the distributed metadata once
-   and pickles `metadata.distributed_metadata.to_dict()` into bytes. It returns a
+   and if a `MetadataManager` is present, has it compute the distributed metadata
+   when none is cached, raises if this rank's items no longer match the cached
+   metadata, and takes its serialized bytes. It returns a
    `CheckpointWriteInfo` via `CheckpointInfo(...).for_writes(serialized_metadata)`.
 2. `self._writer.write(path, write_info)` — writes files to storage on the
    current thread.
@@ -133,9 +134,13 @@ class AsyncCheckpointSaver(CheckpointSaver):
 `save` proceeds roughly as follows:
 
 1. **Prepare write info.** `_prepare_checkpoint_write_info(checkpoint,
-   validate=validate_state_dict)` computes metadata once (kicking off async
-   serialization) and returns a `CheckpointWriteInfo`. From it, `save` reads
-   `state_dict` and `layout_info_mappings`.
+   validate=validate_state_dict)` fetches the serialized metadata, computing it
+   when none is cached, but checks it against the items only when validating. It
+   runs on the calling thread, so an invalidation after `save` returns cannot
+   change what this checkpoint records. It returns a `CheckpointWriteInfo`
+   that carries the metadata only if the write subprocess does not already hold
+   it. From it, `save` reads `state_dict`, `layout_info_mappings` and the
+   metadata.
 2. **Wait for the previous write.** If a prior `self._write_future` is
    outstanding, `save` blocks on `self._write_future.result()`. Only one
    asynchronous checkpoint is in flight at a time; a new `save` waits for the
@@ -150,8 +155,8 @@ class AsyncCheckpointSaver(CheckpointSaver):
    transforms are chained onto it with `fut_then`.
 5. **Build write info from staged tensors.** A continuation rebuilds a
    `dict[str, CheckpointItem]` from the staged values, attaching the recorded
-   `layout` per key, attaches serialized metadata on the first write only, and
-   returns a `CheckpointWriteInfo`.
+   `layout` per key, attaches the metadata from step 1, and returns a
+   `CheckpointWriteInfo`.
 6. **Hand off to the subprocess.** `self._checkpoint_process.write(
    checkpoint_write_info_fut, path)` submits the write and returns a `Future`,
    stored as `self._write_future`.
@@ -168,8 +173,8 @@ with `torch.save`. After staging, `_throw_if_not_equal_to_sync_save` reloads tha
 reference with `torch.load(..., mmap=True, weights_only=False)` and calls
 `compare_state_dicts` against the staged copy. Any difference raises a
 `ValueError` — this catches cases where the training loop mutated model state
-during the forward/backward pass while staging was in flight. It also forces
-metadata re-computation for consistency checking.
+during the forward/backward pass while staging was in flight. It also raises if
+the items no longer match the cached distributed metadata.
 
 This is **extremely expensive** (it doubles the serialization work and reads the
 whole checkpoint back) and is intended only for testing and debugging, not
@@ -359,9 +364,9 @@ class RequestType(Enum):
   `CheckpointWriteInfo` or a `Future[CheckpointWriteInfo]`, submits the work on
   the comm executor, and returns a `Future[None]`. The comm thread resolves the
   future (waiting on staging if needed), sends a `WRITE_CHECKPOINT` request, and
-  waits for the response. The child caches `serialized_distributed_metadata` from
-  the first write that carries it and reuses it for subsequent writes, so
-  metadata is serialized and sent only once.
+  waits for the response. The child keeps the latest
+  `serialized_distributed_metadata` it received and reuses it for writes that
+  carry none, so the saver sends the metadata only when it changes.
 - **Shutdown** — `close()` shuts down the executor, sends `TERMINATE_PROCESS`,
   and joins the child up to `subprocess_shutdown_timeout_secs`, killing it if it
   does not exit gracefully.

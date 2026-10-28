@@ -170,9 +170,8 @@ def test_to_and_from_dict():
             global_rank=0, global_world_size=1, role_rank=0, role_world_size=1
         ),
     )
-    md_result = manager.compute_metadata(checkpoint_info)
-    assert md_result is not None, "Expected fresh metadata computation"
-    md = md_result.distributed_metadata
+    manager.compute_distributed_metadata(checkpoint_info)
+    md = manager.get_computed_metadata().distributed_metadata
 
     # Convert to dictionary
     metadata_dict = md.to_dict()

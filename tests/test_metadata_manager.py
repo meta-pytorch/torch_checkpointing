@@ -12,6 +12,7 @@ functionality for distributed tensor checkpointing across various configurations
 """
 
 import os
+import pickle
 import tempfile
 from unittest import mock
 
@@ -29,7 +30,7 @@ from torch.testing._internal.distributed._tensor.common_dtensor import (
     DTensorTestBase,
     with_comms,
 )
-from torch_checkpointing.checkpoint_base import CheckpointInfo
+from torch_checkpointing.checkpoint_base import CheckpointInfo, CheckpointItem
 from torch_checkpointing.checkpoint_layout import (
     JsonSerialization,
     LayoutInfo,
@@ -48,6 +49,7 @@ from .resharding_test_utils import (
     CustomShardingMetadata,
     CustomTensorObject,
     make_checkpoint_info_from_dict,
+    make_checkpoint_item,
 )
 
 
@@ -324,7 +326,8 @@ class TestMetadataManager(DTensorTestBase):
 
         manager = DefaultMetadataManager(rank_info)
 
-        metadata = manager.compute_metadata(checkpoint_info)
+        manager.compute_distributed_metadata(checkpoint_info)
+        metadata = manager.get_computed_metadata()
 
         # Verify metadata structure
         self.assertIsNotNone(metadata)
@@ -394,7 +397,8 @@ class TestMetadataManager(DTensorTestBase):
 
         manager = DefaultMetadataManager(rank_info)
 
-        metadata = manager.compute_metadata(checkpoint_info)
+        manager.compute_distributed_metadata(checkpoint_info)
+        metadata = manager.get_computed_metadata()
 
         # Verify metadata is aggregated correctly
         self.assertIsNotNone(metadata)
@@ -429,7 +433,8 @@ class TestMetadataManager(DTensorTestBase):
 
         manager = DefaultMetadataManager(rank_info)
 
-        metadata = manager.compute_metadata(checkpoint_info)
+        manager.compute_distributed_metadata(checkpoint_info)
+        metadata = manager.get_computed_metadata()
 
         self.assertIsNotNone(metadata)
         self.assertIsInstance(metadata.distributed_metadata, DistributedMetadata)
@@ -458,7 +463,8 @@ class TestMetadataManager(DTensorTestBase):
 
         manager = DefaultMetadataManager(rank_info)
 
-        metadata = manager.compute_metadata(checkpoint_info)
+        manager.compute_distributed_metadata(checkpoint_info)
+        metadata = manager.get_computed_metadata()
 
         # With no sharding metadata to extract, the metadata dict should be empty
         self.assertIsNotNone(metadata)
@@ -531,43 +537,43 @@ class TestMetadataManager(DTensorTestBase):
                 self.assertIsInstance(nested_path, tuple)
                 self.assertIsInstance(sharding_meta, ShardingMetadata)
 
-    def test_local_metadata_cache_invalidated(self):
-        """Test that local metadata cache is invalidated when state dict changes."""
-        state_dict = {
-            "custom": CustomObject("test_data"),
-            "custom_tensor": CustomTensorObject(torch.ones(2, 2)),
-            "regular_tensor": torch.ones(3, 3),
-            "scalar": 42,
-            "string": "test",
+    @with_comms
+    @requires_nccl()
+    @skip_if_lt_x_gpu(2)
+    @pytest.mark.gpus_needed_2
+    def test_compute_recomputes_on_every_rank_when_one_rank_changes(self):
+        """A change on one rank makes every rank recompute; no change keeps the
+        cache everywhere."""
+        rank = dist.get_rank()
+        manager = DefaultMetadataManager(self._create_rank_info())
+
+        def checkpoint_info(rank1_value: str) -> CheckpointInfo:
+            value = rank1_value if rank == 1 else "same"
+            return make_checkpoint_info_from_dict({"custom": CustomObject(value)})
+
+        with mock.patch.object(
+            manager, "_aggregate_metadata", wraps=manager._aggregate_metadata
+        ) as aggregate:
+            manager.compute_distributed_metadata(checkpoint_info("same"))
+            first = manager.get_computed_metadata()
+
+            manager.compute_distributed_metadata(checkpoint_info("same"))
+            self.assertIs(manager.get_computed_metadata(), first)
+            self.assertEqual(aggregate.call_count, 1)
+
+            manager.compute_distributed_metadata(checkpoint_info("changed"))
+            self.assertEqual(aggregate.call_count, 2)
+
+        groups = (
+            manager.get_computed_metadata()
+            .distributed_metadata.metadata["custom"]
+            .nested_path_to_metadata[()]
+        )
+        values_to_ranks = {
+            dict(group.sharding_metadata.custom_info)["value"]: group.ranks
+            for group in groups
         }
-
-        manager = DefaultMetadataManager(
-            self._create_rank_info(),
-        )
-
-        # Create CheckpointInfo from state_dict with appropriate resharders
-        checkpoint_info = make_checkpoint_info_from_dict(state_dict)
-
-        # First call should populate cache
-        manager.compute_metadata(checkpoint_info)
-        self.assertTrue(manager._cached_local_metadata is not None)
-
-        # Subsequent call without metadata changes should not raise error
-        manager.compute_metadata(checkpoint_info)
-        state_dict["scalar"] = 1
-        checkpoint_info = make_checkpoint_info_from_dict(state_dict)
-        manager.compute_metadata(checkpoint_info)
-
-        # Change state dict's metadata by changing tensor shape
-        state_dict["custom_tensor"] = CustomTensorObject(torch.ones(4, 2))
-        checkpoint_info = make_checkpoint_info_from_dict(state_dict)
-
-        with self.assertRaises(RuntimeError) as context:
-            manager.compute_metadata(checkpoint_info)
-        self.assertIn(
-            "State dictionary has changed since last checkpoint.",
-            str(context.exception),
-        )
+        self.assertEqual(values_to_ranks, {"same": (0,), "changed": (1,)})
 
     @with_comms
     @requires_nccl()
@@ -652,7 +658,8 @@ class TestMetadataManager(DTensorTestBase):
         rank_info = self._create_rank_info()
         manager = DefaultMetadataManager(rank_info)
 
-        metadata = manager.compute_metadata(checkpoint_info)
+        manager.compute_distributed_metadata(checkpoint_info)
+        metadata = manager.get_computed_metadata()
 
         # Verify DTensor metadata has ranks from equivalent_ranks (mesh_data)
         # Grouped format: metadata is dict[str, DistributedItemMetadata]
@@ -690,7 +697,8 @@ class TestMetadataManager(DTensorTestBase):
         rank_info = self._create_rank_info()
         manager = DefaultMetadataManager(rank_info)
 
-        metadata = manager.compute_metadata(checkpoint_info)
+        manager.compute_distributed_metadata(checkpoint_info)
+        metadata = manager.get_computed_metadata()
 
         # Verify all items are present in aggregated metadata
         self.assertIsNotNone(metadata)
@@ -776,9 +784,9 @@ class TestMetadataManagerGloo(DTensorTestBase):
             )
         )
 
-        metadata = manager.compute_metadata(checkpoint_info)
+        manager.compute_distributed_metadata(checkpoint_info)
+        metadata = manager.get_computed_metadata()
 
-        assert metadata is not None
         items = metadata.distributed_metadata.metadata
         (weight_group,) = items["model"].nested_path_to_metadata[("weight",)]
         self.assertEqual(weight_group.ranks, (0, 1))
@@ -796,3 +804,106 @@ class TestMetadataManagerGloo(DTensorTestBase):
                 (1,): custom(1).__pt_sharding_metadata__(),
             },
         )
+
+        # Unchanged on every rank: the agreement round keeps the cache.
+        manager.compute_distributed_metadata(checkpoint_info)
+        self.assertIs(manager.get_computed_metadata(), metadata)
+
+
+def _single_rank_manager() -> DefaultMetadataManager:
+    return DefaultMetadataManager(
+        RankInfo(global_rank=0, global_world_size=1, role_rank=0, role_world_size=1)
+    )
+
+
+def test_getters_raise_until_computed_and_after_invalidation():
+    manager = _single_rank_manager()
+    checkpoint_info = make_checkpoint_info_from_dict({"custom": CustomObject("a")})
+
+    assert not manager.has_computed_metadata()
+    with pytest.raises(RuntimeError, match="compute_distributed_metadata"):
+        manager.get_computed_metadata()
+    with pytest.raises(RuntimeError, match="compute_distributed_metadata"):
+        manager.get_serialized_computed_metadata()
+
+    manager.compute_distributed_metadata(checkpoint_info)
+    assert manager.has_computed_metadata()
+    metadata = manager.get_computed_metadata()
+    assert set(metadata.distributed_metadata.metadata) == {"custom"}
+    assert metadata.local_metadata == manager.extract_object_metadata(checkpoint_info)
+    serialized = manager.get_serialized_computed_metadata()
+    assert pickle.loads(serialized) == metadata.distributed_metadata.to_dict()
+    assert manager.get_serialized_computed_metadata() is serialized
+
+    manager.invalidate_computed_metadata()
+    assert not manager.has_computed_metadata()
+    with pytest.raises(RuntimeError, match="compute_distributed_metadata"):
+        manager.get_computed_metadata()
+    with pytest.raises(RuntimeError, match="compute_distributed_metadata"):
+        manager.get_serialized_computed_metadata()
+
+
+@pytest.mark.parametrize(
+    "rows, fill, file_path, extra_item, recomputes",
+    [
+        (2, 0.0, "a.pt", False, False),  # values only
+        (2, 1.0, "a.pt", True, False),  # an item without a resharder added
+        (4, 1.0, "a.pt", False, True),  # sharding metadata
+        (2, 1.0, "b.pt", False, True),  # layout of a resharded item
+    ],
+)
+def test_compute_keeps_cache_only_when_metadata_and_layout_match(
+    rows: int, fill: float, file_path: str, extra_item: bool, recomputes: bool
+):
+    def checkpoint_info(
+        rows: int, fill: float, file_path: str, extra_item: bool
+    ) -> CheckpointInfo:
+        items = {
+            "tensor": make_checkpoint_item(
+                CustomTensorObject(torch.full((rows, 2), fill)),
+                LayoutInfo(file_path, TorchSerialization()),
+            )
+        }
+        if extra_item:
+            items["step"] = CheckpointItem(value=5)
+        return CheckpointInfo(items)
+
+    manager = _single_rank_manager()
+    manager.compute_distributed_metadata(checkpoint_info(2, 1.0, "a.pt", False))
+    first = manager.get_computed_metadata()
+    first_serialized = manager.get_serialized_computed_metadata()
+
+    second_info = checkpoint_info(rows, fill, file_path, extra_item)
+    assert manager.computed_metadata_matches(second_info) is not recomputes
+    manager.compute_distributed_metadata(second_info)
+    second = manager.get_computed_metadata()
+    second_serialized = manager.get_serialized_computed_metadata()
+
+    if not recomputes:
+        assert second is first
+        assert second_serialized is first_serialized
+        return
+    item = second.distributed_metadata.metadata["tensor"]
+    assert item.nested_path_to_metadata[()][0].sharding_metadata.global_shape == (
+        rows,
+        2,
+    )
+    assert item.rank_to_layout_info[0].file_path == file_path
+    assert pickle.loads(second_serialized) == second.distributed_metadata.to_dict()
+
+
+def test_failed_recompute_drops_the_old_metadata():
+    manager = _single_rank_manager()
+    manager.compute_distributed_metadata(
+        make_checkpoint_info_from_dict({"custom": CustomObject("a")})
+    )
+
+    with mock.patch.object(
+        manager, "_aggregate_metadata", side_effect=RuntimeError("aggregation failed")
+    ):
+        with pytest.raises(RuntimeError, match="aggregation failed"):
+            manager.compute_distributed_metadata(
+                make_checkpoint_info_from_dict({"custom": CustomObject("b")})
+            )
+
+    assert not manager.has_computed_metadata()

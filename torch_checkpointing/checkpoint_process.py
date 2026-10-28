@@ -234,7 +234,7 @@ class CheckpointProcess:
         # request itself must not outlive the iteration that serves it.
         request_type = RequestType.PING
 
-        # Cache for serialized metadata - once received, reuse for subsequent writes
+        # The latest serialized metadata received, reused by writes that carry none
         metadata_cache: list[bytes | None] = [None]
 
         try:
@@ -352,11 +352,9 @@ class CheckpointProcess:
             PAYLOAD_KEY_CHECKPOINT_INFO
         ]
 
-        # Cache serialized metadata on first write that has it
-        if (
-            metadata_cache[0] is None
-            and checkpoint_info.serialized_distributed_metadata is not None
-        ):
+        # The saver sends metadata only when it changes; writes without it reuse
+        # the latest metadata received.
+        if checkpoint_info.serialized_distributed_metadata is not None:
             metadata_cache[0] = checkpoint_info.serialized_distributed_metadata
             logger.debug("Cached serialized_distributed_metadata for subsequent writes")
         checkpoint_info = checkpoint_info.for_writes(metadata_cache[0])

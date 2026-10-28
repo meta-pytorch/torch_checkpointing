@@ -142,17 +142,11 @@ optimizer.zero_grad()
 
 **Fix.** Call `manager.close()` before exit — it blocks until the last background write is durable and then releases resources. (Equivalently, block on the write `Future` returned by the final `save()`.) A sync manager has already written by the time `save()` returns, so it has nothing outstanding at exit.
 
-## `RuntimeError: State dictionary has changed since last checkpoint`
+## `RuntimeError: Checkpoint structure, sharding or layout has changed since its distributed metadata was computed`
 
-**Cause.** The metadata pipeline caches sharding metadata across saves by default. It raises this when the payload's structure or sharding differs from the previous checkpoint, because the cached global view is no longer valid. You only hit this on the resharding path (an item with a `resharder`), where sharding metadata is computed.
+**Cause.** Savers compute the sharding metadata of resharded items (items with a `resharder`) on the first save and reuse it for later saves. A synchronous saver, or `AsyncCheckpointSaver.save(..., validate_state_dict=True)`, checks this rank's items against it on every save and raises this when the payload's structure, sharding or layout no longer matches. (An asynchronous save without that check silently writes metadata for the old structure.)
 
-**Fix.** Keep the structure and sharding of resharded items stable across checkpoints. If they genuinely change between saves and you need metadata caching off, drive the [lower-level metadata manager](./distributed_and_resharding.md) with caching disabled:
-
-```python
-from torch_checkpointing.metadata_manager import DefaultMetadataManager
-
-manager = DefaultMetadataManager(rank_info=rank_info, should_cache_metadata=False)
-```
+**Fix.** If the structure or layout genuinely changes between saves, call `invalidate_computed_metadata()` on the [metadata manager](./distributed_and_resharding.md#when-the-structure-changes) on every rank after the change; the next save recomputes the metadata. `CheckpointManager` does not expose its metadata manager, so with it, construct a new `CheckpointManager` after the change.
 
 ## Warning about `O_DIRECT` / direct I/O
 

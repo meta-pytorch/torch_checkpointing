@@ -13,7 +13,6 @@ for distributed tensor checkpointing.
 import logging
 import pickle
 from abc import ABC, abstractmethod
-from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any
 
 import torch
@@ -49,36 +48,33 @@ def _collective_device(process_group: ProcessGroup | None) -> torch.device:
     return torch.device(_get_object_coll_device(process_group))
 
 
+def _resharded_item_layouts(
+    checkpoint_info: CheckpointInfo,
+) -> dict[str, LayoutInfo | None]:
+    """This rank's layouts of the items that the distributed metadata describes."""
+    return {
+        key: item.layout
+        for key, item in checkpoint_info.checkpoint_items.items()
+        if item.resharder is not None
+    }
+
+
 class MetadataManager(ABC):
     """
     Abstract base class for metadata managers in distributed checkpointing.
 
-    A metadata manager is responsible for:
-    1. Extracting metadata from state dictionaries
-    2. Providing utilities for metadata aggregation, validation and consumption.
+    A metadata manager extracts sharding metadata from checkpoint items and
+    aggregates it across ranks into the global view that a checkpoint records.
+
+    Only ``compute_distributed_metadata`` issues collectives, and every rank must
+    call it. It caches its result, which the ``get_*`` methods return on any
+    single rank without communicating or checking it against later state: after
+    changing the structure or sharding of a resharded item, call
+    ``invalidate_computed_metadata`` on every rank.
 
     This ABC enables composable metadata management that can be plugged
     into different checkpointer implementations.
     """
-
-    @abstractmethod
-    def compute_metadata(
-        self,
-        checkpoint_info: CheckpointInfo,
-    ) -> CheckpointMetadata | None:
-        """
-        Compute complete distributed metadata from checkpoint info.
-
-        This is the main method that orchestrates metadata extraction,
-        distributed coordination, and metadata construction.
-
-        Args:
-            checkpoint_info: CheckpointInfo containing state_dict and layout_info_mappings
-
-        Returns:
-            Complete DistributedMetadata structure if distributed metadata isn't computed yet.
-            None if distributed metadata is already computed and local metadata cached.
-        """
 
     @abstractmethod
     def extract_object_metadata(
@@ -103,6 +99,68 @@ class MetadataManager(ABC):
         """
 
     @abstractmethod
+    def compute_distributed_metadata(
+        self,
+        checkpoint_info: CheckpointInfo,
+    ) -> None:
+        """
+        Compute the global metadata for ``checkpoint_info`` and cache it.
+
+        Issues collectives, so every rank must call it, each with its own items.
+        It does not assume the structure is unchanged since the previous call: it
+        keeps the cache only if every rank's metadata and layouts still match it,
+        and otherwise recomputes and replaces it.
+
+        Args:
+            checkpoint_info: CheckpointInfo containing checkpoint items
+        """
+
+    @abstractmethod
+    def has_computed_metadata(self) -> bool:
+        """Whether computed metadata is cached. No collectives."""
+
+    @abstractmethod
+    def computed_metadata_matches(self, checkpoint_info: CheckpointInfo) -> bool:
+        """
+        Whether this rank's part of ``checkpoint_info`` still matches the cached
+        metadata. False if nothing is cached.
+
+        No collectives, so it says nothing about other ranks.
+        """
+
+    @abstractmethod
+    def get_computed_metadata(self) -> CheckpointMetadata:
+        """
+        Return the metadata cached by ``compute_distributed_metadata``.
+
+        No collectives. The metadata is not checked against the current state.
+
+        Raises:
+            RuntimeError: If nothing has been computed since construction or the
+                last ``invalidate_computed_metadata``.
+        """
+
+    @abstractmethod
+    def get_serialized_computed_metadata(self) -> bytes:
+        """
+        Return the global part of ``get_computed_metadata()`` serialized as the
+        checkpoint's metadata file. No collectives.
+
+        Raises:
+            RuntimeError: If ``get_computed_metadata`` would raise.
+        """
+
+    @abstractmethod
+    def invalidate_computed_metadata(self) -> None:
+        """
+        Drop the cached metadata, if any.
+
+        Issues no collectives, but call it on every rank: savers call
+        ``compute_distributed_metadata`` when ``has_computed_metadata()`` is
+        False, and a rank that skips that collective hangs the others.
+        """
+
+    @abstractmethod
     def close(self) -> None:
         """Release resources used by the metadata manager."""
 
@@ -111,14 +169,14 @@ class DefaultMetadataManager(MetadataManager):
     """
     Provides a basic implementation suitable for most use cases that aggregates
     metadata from all ranks and validates consistency with distributed coordination using standard PyTorch distributed primitives.
+
+    Not thread-safe: call it from one thread.
     """
 
     def __init__(
         self,
         rank_info: RankInfo,
         process_group: ProcessGroup | None = None,
-        should_cache_metadata: bool = True,
-        enable_serialization: bool = True,
     ):
         """
         Initialize the default metadata manager.
@@ -126,80 +184,22 @@ class DefaultMetadataManager(MetadataManager):
         Args:
             rank_info: Information about current rank and world size
             process_group: The process group to use for distributed coordination. If None, uses the default process group.
-            should_cache_metadata: Whether to cache computed metadata for reuse across checkpoints.
-                Note: Caching metadata assumes that the state_dict does not change between
-                intermediate checkpoints. If the state_dict is modified, cached metadata may become invalid
-            enable_serialization: Whether to kick off async serialization of metadata after
-                first compute. Only async savers consume the serialized bytes.
         """
         self._rank_info = rank_info
         self._process_group = process_group
-        self._should_cache_metadata = should_cache_metadata
-        self._enable_serialization = enable_serialization
-        self._cached_local_metadata: (
-            dict[str, dict[NestedPath, ShardingMetadata]] | None
-        ) = None
-
-        # Async metadata serialization state
-        self._metadata_executor = ThreadPoolExecutor(max_workers=1)
-        self._serialization_future: Future[bytes] | None = None
-        self._cached_serialized_metadata: bytes | None = None
-
-    def _async_serialize_distributed_metadata(
-        self,
-        distributed_metadata: DistributedMetadata,
-    ) -> None:
-        """
-        Trigger async serialization of distributed metadata.
-
-        Only serializes once. Starts in background thread to overlap with other work.
-        This is called automatically after the first compute_metadata() call.
-        """
-        if (
-            not self._enable_serialization
-            or self._serialization_future is not None
-            or self._cached_serialized_metadata is not None
-        ):
-            return  # Serialization disabled, already serializing, or already serialized
-
-        def serialize() -> bytes:
-            event_logger = EventLogger()
-            serialized_dist_metadata = pickle.dumps(distributed_metadata.to_dict())
-            logger.info(
-                "Serialized distributed metadata",
-                extra=event_logger(
-                    EventType.LOG_METRIC,
-                    metric_name="train.checkpoint_metadata.serialize.latency_ms",
-                ),
-            )
-            return serialized_dist_metadata
-
-        self._serialization_future = self._metadata_executor.submit(serialize)
-
-    def get_serialized_metadata(self) -> bytes | None:
-        """
-        Get serialized metadata bytes, waiting for serialization to complete if needed.
-
-        Returns:
-            Serialized metadata bytes if available, None if no metadata has been computed.
-        """
-        # Wait for serialization to complete if in progress
-        if self._serialization_future is not None:
-            self._cached_serialized_metadata = self._serialization_future.result()
-            self._serialization_future = None
-
-        return self._cached_serialized_metadata
+        self._computed_metadata: CheckpointMetadata | None = None
+        # This rank's layouts of the resharded items the computed metadata was
+        # built from; with the local metadata, they decide whether it still holds.
+        self._computed_layout_info: dict[str, LayoutInfo | None] | None = None
+        self._serialized_metadata: bytes | None = None
 
     def close(self) -> None:
         """Release resources used by the metadata manager."""
-        self._metadata_executor.shutdown(wait=False, cancel_futures=False)
 
-    def compute_metadata(
+    def compute_distributed_metadata(
         self,
         checkpoint_info: CheckpointInfo,
-    ) -> CheckpointMetadata | None:
-        """Compute complete distributed metadata from checkpoint info. Return None if cache is valid."""
-
+    ) -> None:
         event_logger = EventLogger()
 
         local_metadata = self.extract_object_metadata(checkpoint_info)
@@ -212,21 +212,21 @@ class DefaultMetadataManager(MetadataManager):
             ),
         )
 
-        # Return None if cache is valid
-        if self._should_cache_metadata and self._cached_local_metadata is not None:
-            if local_metadata != self._cached_local_metadata:
-                raise RuntimeError(
-                    "State dictionary has changed since last checkpoint. Cached metadata is no longer valid.",
-                )
-            return None
+        layout_info = _resharded_item_layouts(checkpoint_info)
+        if self._all_ranks_agree(self._cache_matches(local_metadata, layout_info)):
+            logger.info("MetadataManager: computed metadata is unchanged; keeping it")
+            return
 
-        # Compute fresh metadata
+        # A failed aggregation must not leave the old metadata in place.
+        self.invalidate_computed_metadata()
         distributed_metadata = self._aggregate_metadata(
             local_metadata, checkpoint_info.layout_info_mappings
         )
-
-        if self._should_cache_metadata:
-            self._cached_local_metadata = local_metadata
+        self._computed_metadata = CheckpointMetadata(
+            distributed_metadata=distributed_metadata,
+            local_metadata=local_metadata,
+        )
+        self._computed_layout_info = layout_info
 
         logger.info(
             f"MetadataManager: computed metadata for {len(distributed_metadata.metadata)} paths",
@@ -237,15 +237,53 @@ class DefaultMetadataManager(MetadataManager):
             ),
         )
 
-        result = CheckpointMetadata(
-            distributed_metadata=distributed_metadata,
-            local_metadata=local_metadata,
+    def has_computed_metadata(self) -> bool:
+        return self._computed_metadata is not None
+
+    def computed_metadata_matches(self, checkpoint_info: CheckpointInfo) -> bool:
+        return self._cache_matches(
+            self.extract_object_metadata(checkpoint_info),
+            _resharded_item_layouts(checkpoint_info),
         )
 
-        # Kick off async serialization immediately after first compute
-        self._async_serialize_distributed_metadata(distributed_metadata)
+    def _cache_matches(
+        self,
+        local_metadata: LocalMetadata,
+        layout_info: dict[str, LayoutInfo | None],
+    ) -> bool:
+        return (
+            self._computed_metadata is not None
+            and self._computed_metadata.local_metadata == local_metadata
+            and self._computed_layout_info == layout_info
+        )
 
-        return result
+    def get_computed_metadata(self) -> CheckpointMetadata:
+        if self._computed_metadata is None:
+            raise RuntimeError(
+                "No computed metadata: call compute_distributed_metadata() on "
+                "every rank first."
+            )
+        return self._computed_metadata
+
+    def get_serialized_computed_metadata(self) -> bytes:
+        if self._serialized_metadata is None:
+            event_logger = EventLogger()
+            self._serialized_metadata = pickle.dumps(
+                self.get_computed_metadata().distributed_metadata.to_dict()
+            )
+            logger.info(
+                "Serialized distributed metadata",
+                extra=event_logger(
+                    EventType.LOG_METRIC,
+                    metric_name="train.checkpoint_metadata.serialize.latency_ms",
+                ),
+            )
+        return self._serialized_metadata
+
+    def invalidate_computed_metadata(self) -> None:
+        self._computed_metadata = None
+        self._computed_layout_info = None
+        self._serialized_metadata = None
 
     def extract_object_metadata(
         self,
@@ -323,6 +361,21 @@ class DefaultMetadataManager(MetadataManager):
 
         return compacted
 
+    def _is_distributed(self) -> bool:
+        return self._rank_info.global_world_size > 1 and dist.is_initialized()
+
+    def _all_ranks_agree(self, value: bool) -> bool:
+        """Return True on every rank iff ``value`` is True on every rank."""
+        if not self._is_distributed():
+            return value
+        flag = torch.tensor(
+            [int(value)],
+            dtype=torch.int32,
+            device=_collective_device(self._process_group),
+        )
+        dist.all_reduce(flag, op=dist.ReduceOp.MIN, group=self._process_group)
+        return bool(flag.item())
+
     def _aggregate_metadata(
         self,
         item_to_metadata: dict[str, dict[NestedPath, ShardingMetadata]],
@@ -339,7 +392,7 @@ class DefaultMetadataManager(MetadataManager):
             Final DistributedMetadata after aggregation across all ranks
         """
         rank_info = self._rank_info
-        if rank_info.global_world_size == 1 or not dist.is_initialized():
+        if not self._is_distributed():
             # For single rank, create metadata directly
             metadata: dict[str, DistributedItemMetadata] = {}
             for item_key, nested_path_to_metadata in item_to_metadata.items():

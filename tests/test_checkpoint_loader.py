@@ -169,7 +169,7 @@ def test_every_load_extracts_local_target_metadata_without_aggregating(
         with (
             mock.patch.object(
                 metadata_manager,
-                "compute_metadata",
+                "compute_distributed_metadata",
                 side_effect=AssertionError("load must not aggregate metadata"),
             ),
             mock.patch.object(
@@ -201,7 +201,7 @@ def test_every_load_extracts_local_target_metadata_without_aggregating(
                 target._state_dict["model"]["weight"],
                 sample_state_dict["model"]["weight"],
             )
-        assert metadata_manager.get_serialized_metadata() is None
+        assert not metadata_manager.has_computed_metadata()
 
         loader.close()
         metadata_manager.close()

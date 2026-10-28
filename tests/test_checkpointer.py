@@ -10,13 +10,18 @@ import shutil
 import tempfile
 from collections.abc import Generator, Iterator
 from concurrent.futures import Future
-from typing import Any, Mapping
-from unittest.mock import Mock
+from typing import Any, Callable, Mapping
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
 import torch.nn as nn
-from torch_checkpointing.checkpoint_base import CheckpointBase, CheckpointItem
+from torch_checkpointing.checkpoint_base import (
+    CheckpointBase,
+    CheckpointInfo,
+    CheckpointItem,
+    CheckpointWriteInfo,
+)
 from torch_checkpointing.checkpoint_layout import LayoutInfo, TorchSerialization
 from torch_checkpointing.checkpoint_loader import CheckpointLoader
 from torch_checkpointing.checkpoint_process import (
@@ -38,7 +43,7 @@ from torch_checkpointing.metadata_manager import DefaultMetadataManager
 from torch_checkpointing.staging import CheckpointStagerConfig, DefaultStager
 from torch_checkpointing.storage.filesystem import LocalFileSystemStorageConfig
 from torch_checkpointing.types import RankInfo
-from torch_checkpointing.utils import ensure_future
+from torch_checkpointing.utils import ensure_future, fut_then
 
 from .resharding_test_utils import SimpleResharder
 
@@ -320,7 +325,6 @@ def save_sync(
     checkpointer: CheckpointSaver,
     checkpoint_path: str,
     checkpoint: SimpleCheckpoint,
-    clear_cache: bool = False,
 ) -> None:
     """Save the checkpoint synchronously.
 
@@ -328,23 +332,12 @@ def save_sync(
         checkpointer: The checkpointer to use for saving
         checkpoint_path: Path where checkpoint should be saved
         checkpoint: The checkpoint to save
-        clear_cache: If True, clears metadata cache after save. Use this when the same
-                     checkpointer will be used for a subsequent load with a different
-                     state dict structure (e.g., partial loads in tests).
     """
     save_result = checkpointer.save(checkpoint_path, checkpoint)
     if save_result is not None:
         stage_future, write_future = save_result
         stage_future.result()
         write_future.result()
-
-    # Clear metadata cache if requested (useful for tests with save+load of different structures)
-    if clear_cache:
-        if isinstance(checkpointer, (SyncCheckpointSaver, AsyncCheckpointSaver)):
-            metadata_mgr = checkpointer._metadata_manager
-            if isinstance(metadata_mgr, DefaultMetadataManager):
-                # Access private variables to clear cache
-                metadata_mgr._cached_local_metadata = None
 
 
 @pytest.mark.parametrize("use_map_location", [False, True])
@@ -390,7 +383,6 @@ def test_partial_load(
         checkpointer=checkpointer,
         checkpoint_path=checkpoint_path,
         checkpoint=original_checkpoint,
-        clear_cache=True,  # Clear cache since load has different state dict structure
     )
 
     # Load only the keys in partial_state_dict
@@ -576,7 +568,6 @@ def test_load_full_model_from_partial_checkpoint(
         checkpointer,
         checkpoint_path,
         _create_checkpoint(model_partial, epoch=0, step=3),
-        clear_cache=True,  # Clear cache since load has different state dict structure
     )
 
     loaded_checkpoint = _create_checkpoint(model_full, epoch=1, step=2)
@@ -626,7 +617,6 @@ def test_nested_dict_partial_load(
         checkpointer,
         checkpoint_path,
         _create_checkpoint(model_full, epoch=0, step=3),
-        clear_cache=True,  # Clear cache since load has different state dict structure
     )
 
     partial_checkpoint = _create_checkpoint(model_partial, epoch=1, step=2)
@@ -782,102 +772,124 @@ def test_save_selectively_stages_only_copy_required_items() -> None:
         stager.close()
 
 
-def test_metadata_caching_and_serialization(
+def _metadata_item_keys(checkpoint_path: str) -> set[str]:
+    with open(os.path.join(checkpoint_path, "metadata.pkl"), "rb") as f:
+        return set(pickle.load(f)["metadata"])
+
+
+def test_async_saver_sends_metadata_to_subprocess_only_when_it_changes(
+    temp_dir: str,
     async_checkpointer: AsyncCheckpointSaver,
+    metadata_manager: DefaultMetadataManager,
 ) -> None:
-    """Test metadata caching and async serialization behavior.
-
-    This test validates the complete lifecycle:
-    1. First compute_metadata returns CheckpointMetadata and kicks off serialization
-    2. Cached metadata exists in the manager after first call
-    3. Second compute_metadata returns None (cache is valid)
-    4. Serialization future is created on first call and reused (not recreated)
-    5. Serialized metadata can be retrieved and is cached
-    6. After _metadata_sent=True, no more metadata is returned
-    """
+    """The write subprocess gets the metadata once per computation, and reuses
+    it for every write until it is recomputed."""
     checkpoint = create_full_checkpoint()
+    process = async_checkpointer._checkpoint_process
+    sent: list[bytes | None] = []
 
-    # Get metadata manager and verify type
-    metadata_manager = async_checkpointer._metadata_manager
-    assert metadata_manager is not None
-    assert isinstance(metadata_manager, DefaultMetadataManager), (
-        "Expected DefaultMetadataManager"
+    def capture_write(checkpoint_info_fut: Future, path: str) -> Future:
+        write_info = ensure_future(checkpoint_info_fut).result()
+        sent.append(write_info.serialized_distributed_metadata)
+        return CheckpointProcess.write(process, checkpoint_info_fut, path)
+
+    with patch.object(process, "write", side_effect=capture_write):
+        for i in range(2):
+            save_sync(
+                async_checkpointer, os.path.join(temp_dir, f"ckpt_{i}"), checkpoint
+            )
+        metadata_manager.invalidate_computed_metadata()
+        save_sync(
+            async_checkpointer,
+            os.path.join(temp_dir, "ckpt_2"),
+            create_partial_checkpoint(),
+        )
+
+    assert sent[0] is not None
+    assert sent[1] is None
+    assert sent[2] is not None and sent[2] != sent[0]
+    for i, expected in enumerate([sent[0], sent[0], sent[2]]):
+        with open(os.path.join(temp_dir, f"ckpt_{i}", "metadata.pkl"), "rb") as f:
+            assert f.read() == expected
+
+
+def test_inflight_save_keeps_metadata_fetched_at_save_time(
+    rank_info: RankInfo,
+) -> None:
+    """Invalidating and recomputing while a save is still staging must not change
+    the metadata that save writes."""
+    metadata_manager = DefaultMetadataManager(rank_info=rank_info)
+    staging_future: Future = Future()
+    stager = Mock()
+    stager.stage.return_value = staging_future
+    written: list[CheckpointWriteInfo] = []
+    process = Mock()
+    process.write.side_effect = lambda info_fut, _path: fut_then(
+        info_fut, written.append
     )
-
-    # Phase 1: First compute_metadata call
-    result1 = async_checkpointer._compute_metadata_once(checkpoint)
-    assert result1 is not None, "First compute should return CheckpointMetadata"
-    assert result1.distributed_metadata is not None
-
-    # Verify serialization future was created in the metadata_manager
-    assert metadata_manager._serialization_future is not None
-
-    # Verify cached metadata exists in manager
-    assert metadata_manager._cached_local_metadata is not None
-
-    # Phase 2: Second compute_metadata call (cache hit)
-    old_future = metadata_manager._serialization_future
-    result2 = async_checkpointer._compute_metadata_once(checkpoint)
-    assert result2 is None, "Second compute should return None (cache valid)"
-    assert metadata_manager._serialization_future is old_future, (
-        "Should not recreate serialization future"
+    saver = AsyncCheckpointSaver(
+        checkpoint_stager=stager,
+        checkpoint_process=process,
+        metadata_manager=metadata_manager,
     )
+    try:
+        checkpoint = create_full_checkpoint()
+        saver.save("/tmp/unused", checkpoint)
+        expected = metadata_manager.get_serialized_computed_metadata()
 
-    # Phase 3: Get serialized metadata (waits for background serialization)
-    serialized1 = async_checkpointer._get_serialized_metadata_if_needed()
-    assert serialized1 is not None
-    assert isinstance(serialized1, bytes)
-    assert len(serialized1) > 0
+        metadata_manager.invalidate_computed_metadata()
+        metadata_manager.compute_distributed_metadata(
+            CheckpointInfo(create_partial_checkpoint().get_items())
+        )
+        assert metadata_manager.get_serialized_computed_metadata() != expected
 
-    # Verify serialization future was consumed and result cached in metadata_manager
-    assert metadata_manager._serialization_future is None
-    assert metadata_manager._cached_serialized_metadata is not None
-
-    # Phase 4: After metadata is marked as sent, no more metadata returned
-    async_checkpointer._metadata_sent = True
-    serialized2 = async_checkpointer._get_serialized_metadata_if_needed()
-    assert serialized2 is None, "Should not return metadata after _metadata_sent=True"
+        staging_future.set_result(
+            {key: item.value for key, item in checkpoint.get_items().items()}
+        )
+        assert written[0].serialized_distributed_metadata is expected
+    finally:
+        saver.close()
 
 
-def test_metadata_sent_once_to_subprocess(
+def test_failed_save_launch_resends_metadata(rank_info: RankInfo) -> None:
+    """If a save fails before its write is submitted, the next save sends the
+    metadata again: the write subprocess may never have received it."""
+    metadata_manager = DefaultMetadataManager(rank_info=rank_info)
+    checkpoint = create_full_checkpoint()
+    stager = Mock()
+    stager.stage.side_effect = [
+        RuntimeError("staging failed"),
+        {key: item.value for key, item in checkpoint.get_items().items()},
+    ]
+    written: list[CheckpointWriteInfo] = []
+    process = Mock()
+    process.write.side_effect = lambda info_fut, _path: fut_then(
+        info_fut, written.append
+    )
+    saver = AsyncCheckpointSaver(
+        checkpoint_stager=stager,
+        checkpoint_process=process,
+        metadata_manager=metadata_manager,
+    )
+    try:
+        with pytest.raises(RuntimeError, match="staging failed"):
+            saver.save("/tmp/unused", checkpoint)
+        saver.save("/tmp/unused", checkpoint)
+
+        assert (
+            written[0].serialized_distributed_metadata
+            == metadata_manager.get_serialized_computed_metadata()
+        )
+    finally:
+        saver.close()
+
+
+def test_load_then_save_with_shared_metadata_manager(
     temp_dir: str,
     async_checkpointer: AsyncCheckpointSaver,
 ) -> None:
-    """Test that metadata is only sent to subprocess once across multiple saves."""
-    checkpoint_path1 = os.path.join(temp_dir, "checkpoint1")
-    checkpoint_path2 = os.path.join(temp_dir, "checkpoint2")
-
-    checkpoint = create_full_checkpoint()
-
-    # First save - metadata should be sent
-    assert async_checkpointer._metadata_sent is False
-    save_sync(async_checkpointer, checkpoint_path1, checkpoint)
-    assert async_checkpointer._metadata_sent is True
-
-    # Second save - metadata should NOT be sent again
-    save_sync(async_checkpointer, checkpoint_path2, checkpoint)
-
-    # Verify both checkpoints have metadata.pkl (written by subprocess)
-    assert os.path.exists(os.path.join(checkpoint_path1, "metadata.pkl"))
-    assert os.path.exists(os.path.join(checkpoint_path2, "metadata.pkl"))
-
-    # Verify metadata content is the same (since same state dict structure)
-    with open(os.path.join(checkpoint_path1, "metadata.pkl"), "rb") as f:
-        metadata1 = pickle.load(f)
-    with open(os.path.join(checkpoint_path2, "metadata.pkl"), "rb") as f:
-        metadata2 = pickle.load(f)
-
-    # Both should have same structure (world_size, version, metadata keys)
-    assert metadata1["world_size"] == metadata2["world_size"]
-    assert metadata1["version"] == metadata2["version"]
-    assert set(metadata1["metadata"].keys()) == set(metadata2["metadata"].keys())
-
-
-def test_load_before_save_prepares_metadata(
-    temp_dir: str,
-    async_checkpointer: AsyncCheckpointSaver,
-) -> None:
-    """Test that loading before saving prepares metadata for subsequent saves."""
+    """A save after a load through a shared manager computes and writes the
+    metadata; the load itself computes nothing."""
     checkpoint_path_save = os.path.join(temp_dir, "checkpoint_save")
     checkpoint_path_load = os.path.join(temp_dir, "checkpoint_load")
 
@@ -913,22 +925,18 @@ def test_load_before_save_prepares_metadata(
     )
 
     try:
-        # Load checkpoint - this triggers metadata computation in the shared metadata_manager
         loaded_checkpoint = create_full_checkpoint(bias=0.0, epoch=0, step=0)
         loader.load(checkpoint_path_load, loaded_checkpoint)
+        assert not metadata_manager.has_computed_metadata()
 
-        # Now save - metadata is reused via the shared metadata_manager
         save_sync(
             new_checkpointer,
             checkpoint_path_save,
             loaded_checkpoint,
         )
 
-        # Verify metadata was sent (only once)
-        assert new_checkpointer._metadata_sent is True
-
-        # Verify metadata file exists in saved checkpoint
-        assert os.path.exists(os.path.join(checkpoint_path_save, "metadata.pkl"))
+        assert metadata_manager.has_computed_metadata()
+        assert _metadata_item_keys(checkpoint_path_save) == {"model", "optimizer"}
 
     finally:
         loader.close()
@@ -936,85 +944,93 @@ def test_load_before_save_prepares_metadata(
         metadata_manager.close()
 
 
-def test_multiple_saves_reuse_cached_metadata(
+def test_every_save_writes_metadata_computed_once(
     temp_dir: str,
-    async_checkpointer: AsyncCheckpointSaver,
+    checkpointer: CheckpointSaver,
+    metadata_manager: DefaultMetadataManager,
 ) -> None:
-    """Test that multiple saves achieve 0-overhead by skipping metadata computation after first save."""
+    """Every save writes metadata.pkl, while only the first one computes it."""
     checkpoint = create_full_checkpoint(bias=0.0, epoch=0, step=0)
 
-    metadata_manager = async_checkpointer._metadata_manager
-    assert metadata_manager is not None
-
-    # Track how many times compute_metadata is called
-    original_compute = metadata_manager.compute_metadata
-    compute_count = {"count": 0}
-
-    def tracked_compute(*args, **kwargs):
-        compute_count["count"] += 1
-        return original_compute(*args, **kwargs)
-
-    metadata_manager.compute_metadata = tracked_compute
-
-    # Perform 5 saves with the same checkpoint structure
     N = 5
+    with patch.object(
+        metadata_manager,
+        "compute_distributed_metadata",
+        wraps=metadata_manager.compute_distributed_metadata,
+    ) as compute:
+        for i in range(N):
+            checkpoint_path = os.path.join(temp_dir, f"checkpoint_{i}")
+            save_sync(checkpointer, checkpoint_path, checkpoint)
+
+            # Modify checkpoint values (but not structure)
+            assert checkpoint.step is not None
+            assert checkpoint.epoch is not None
+            checkpoint.step = checkpoint.step + 1
+            checkpoint.epoch = checkpoint.epoch + 1
+
+    assert compute.call_count == 1
+
+    expected = metadata_manager.get_serialized_computed_metadata()
     for i in range(N):
-        checkpoint_path = os.path.join(temp_dir, f"checkpoint_{i}")
-        save_sync(async_checkpointer, checkpoint_path, checkpoint)
-
-        # Modify checkpoint values (but not structure)
-        assert checkpoint.step is not None
-        assert checkpoint.epoch is not None
-        checkpoint.step = checkpoint.step + 1
-        checkpoint.epoch = checkpoint.epoch + 1
-
-    # compute_metadata should only be called once (first save)
-    # subsequent saves skip metadata computation when validate_state_dict=False
-    assert compute_count["count"] == 1, (
-        f"Expected 1 compute_metadata call, got {compute_count['count']}"
-    )
-
-    # Verify all checkpoints were created
-    for i in range(N):
-        checkpoint_path = os.path.join(temp_dir, f"checkpoint_{i}")
-        assert os.path.exists(os.path.join(checkpoint_path, "metadata.pkl"))
+        with open(os.path.join(temp_dir, f"checkpoint_{i}", "metadata.pkl"), "rb") as f:
+            assert f.read() == expected
 
 
-def test_metadata_cache_invalidation_on_structure_change(
+def test_save_after_invalidation_writes_the_new_structure(
     temp_dir: str,
-    async_checkpointer: AsyncCheckpointSaver,
+    checkpointer: CheckpointSaver,
+    metadata_manager: DefaultMetadataManager,
 ) -> None:
-    """Test that changing checkpoint structure with validate_state_dict=True raises error.
+    """State that appears after the first save (here, the optimizer's momentum
+    buffers) is in the metadata once the cached metadata is invalidated."""
+    model = NestedModel()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01, momentum=0.9)
+    checkpoint = SimpleCheckpoint(model=model, optimizer=optimizer)
 
-    To detect structure changes, validate_state_dict=True
-    must be used.
-    """
-    checkpoint1 = create_full_checkpoint(bias=0.0, epoch=0, step=0)
+    save_sync(checkpointer, os.path.join(temp_dir, "before_step"), checkpoint)
+    model(torch.randn(2, 16)).sum().backward()
+    optimizer.step()
+    metadata_manager.invalidate_computed_metadata()
+    save_sync(checkpointer, os.path.join(temp_dir, "after_step"), checkpoint)
 
-    # First save with full checkpoint
-    checkpoint_path1 = os.path.join(temp_dir, "checkpoint1")
-    save_sync(async_checkpointer, checkpoint_path1, checkpoint1)
+    assert _metadata_item_keys(os.path.join(temp_dir, "before_step")) == {"model"}
+    assert _metadata_item_keys(os.path.join(temp_dir, "after_step")) == {
+        "model",
+        "optimizer",
+    }
 
-    # Verify metadata was cached (cast to access private attributes)
-    metadata_manager = async_checkpointer._metadata_manager
-    assert metadata_manager is not None
-    assert isinstance(metadata_manager, DefaultMetadataManager), (
-        "Expected DefaultMetadataManager"
+
+def _without_layouts(checkpoint: SimpleCheckpoint) -> SimpleCheckpoint:
+    return SimpleCheckpoint(
+        model=checkpoint.model,
+        optimizer=checkpoint.optimizer,
+        epoch=checkpoint.epoch,
+        step=checkpoint.step,
+        use_layout=False,
     )
 
-    # Try to save with a different checkpoint structure (partial checkpoint)
-    # With validate_state_dict=True, metadata validation runs and should detect the change
-    checkpoint2 = create_partial_checkpoint(bias=1.0, epoch=5)
-    checkpoint_path2 = os.path.join(temp_dir, "checkpoint2")
 
-    # This should raise an error because the state dict structure changed
-    # Use a helper to wrap all the operations that may raise
-    def save_and_wait():
-        stage_future, write_future = async_checkpointer.save(
-            checkpoint_path2, checkpoint2, validate_state_dict=True
-        )
-        stage_future.result()
-        write_future.result()
+@pytest.mark.parametrize(
+    "change",
+    [
+        lambda _: create_partial_checkpoint(bias=1.0, epoch=5),
+        _without_layouts,
+    ],
+    ids=["structure", "layout"],
+)
+def test_save_raises_on_change_without_invalidation(
+    temp_dir: str,
+    checkpointer: CheckpointSaver,
+    change: Callable[[SimpleCheckpoint], SimpleCheckpoint],
+) -> None:
+    """The sync saver always, and the async saver with validate_state_dict=True,
+    raise instead of writing stale metadata for changed items or layouts."""
+    checkpoint = create_full_checkpoint(bias=0.0, epoch=0, step=0)
+    save_sync(checkpointer, os.path.join(temp_dir, "checkpoint1"), checkpoint)
 
-    with pytest.raises(RuntimeError, match="State dictionary has changed"):
-        save_and_wait()
+    path = os.path.join(temp_dir, "checkpoint2")
+    with pytest.raises(RuntimeError, match="invalidate_computed_metadata"):
+        if isinstance(checkpointer, AsyncCheckpointSaver):
+            checkpointer.save(path, change(checkpoint), validate_state_dict=True)
+        else:
+            checkpointer.save(path, change(checkpoint))

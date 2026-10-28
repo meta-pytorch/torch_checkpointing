@@ -201,9 +201,8 @@ class TestDefaultResharder(DTensorTestBase):
             rank_info=self.rank_info,
             process_group=dist.distributed_c10d._get_default_group(),
         )
-        result = metadata_manager.compute_metadata(checkpoint_info)
-        assert result is not None, "Expected fresh metadata computation"
-        return result
+        metadata_manager.compute_distributed_metadata(checkpoint_info)
+        return metadata_manager.get_computed_metadata()
 
     def _save_checkpoint_info(
         self,

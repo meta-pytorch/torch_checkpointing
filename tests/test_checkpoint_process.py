@@ -390,16 +390,14 @@ class TestCheckpointProcess(TestCase):
             )
         )
 
-    def test_write_reuses_serialized_metadata_on_subsequent_requests(self) -> None:
-        """Serialized metadata from the first write is reused for later writes."""
-        first_info = self._build_checkpoint_info(self.test_state_dict)
-        first_info.serialized_distributed_metadata = b"cached-metadata"
-
-        second_info = self._build_checkpoint_info(self.test_state_dict)
-        self.assertIsNone(second_info.serialized_distributed_metadata)
-
-        third_info = self._build_checkpoint_info(self.test_state_dict)
-        third_info.serialized_distributed_metadata = b"other-metadata"
+    def test_write_reuses_latest_serialized_metadata(self) -> None:
+        """A write without serialized metadata reuses the latest metadata sent."""
+        sent_metadata = [b"cached-metadata", None, b"other-metadata", None]
+        infos = []
+        for metadata in sent_metadata:
+            info = self._build_checkpoint_info(self.test_state_dict)
+            info.serialized_distributed_metadata = metadata
+            infos.append(info)
 
         requests = [
             WorkerRequest(
@@ -409,7 +407,7 @@ class TestCheckpointProcess(TestCase):
                     "checkpoint_info": info,
                 },
             )
-            for i, info in enumerate([first_info, second_info, third_info], start=1)
+            for i, info in enumerate(infos, start=1)
         ]
         requests.append(
             WorkerRequest(
@@ -435,15 +433,23 @@ class TestCheckpointProcess(TestCase):
             "test.checkpoint_write",
         )
 
-        self.assertEqual(writer.write.call_count, 3)
-        for call in writer.write.call_args_list:
-            written_info = call.kwargs["checkpoint_info"]
-            self.assertEqual(
-                written_info.serialized_distributed_metadata, b"cached-metadata"
-            )
+        written_metadata = [
+            call.kwargs["checkpoint_info"].serialized_distributed_metadata
+            for call in writer.write.call_args_list
+        ]
+        self.assertEqual(
+            written_metadata,
+            [
+                b"cached-metadata",
+                b"cached-metadata",
+                b"other-metadata",
+                b"other-metadata",
+            ],
+        )
         # Originals are unchanged; reuse happens via the subprocess cache.
-        self.assertIsNone(second_info.serialized_distributed_metadata)
-        self.assertEqual(third_info.serialized_distributed_metadata, b"other-metadata")
+        self.assertEqual(
+            [info.serialized_distributed_metadata for info in infos], sent_metadata
+        )
 
     def test_checkpoint_process_keeps_the_barrier_scope_until_close(self) -> None:
         with mock.patch.object(

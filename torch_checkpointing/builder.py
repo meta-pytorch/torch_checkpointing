@@ -182,8 +182,7 @@ def make_async_checkpoint_saver(
                                     checkpoint metadata. Handles extraction, aggregation, and
                                     validation of sharding metadata across ranks for proper
                                     distributed checkpointing. If None, no metadata management
-                                    steps are performed. When shared with a CheckpointLoader,
-                                    metadata computed during load will be reused by save.
+                                    steps are performed.
 
     Returns:
         AsyncCheckpointSaver: A configured asynchronous checkpoint saver instance.
@@ -210,17 +209,17 @@ def make_async_checkpoint_saver(
             subprocess_init_args=("my", "args"),
         )
 
-        # Create with shared metadata manager for load-then-save workflows
-        metadata_manager = CachingMetadataManager(...)
+        # Create with a metadata manager shared with a loader
+        metadata_manager = DefaultMetadataManager(rank_info=rank_info)
         reader = CheckpointReader(rank_info=rank_info, storage_config=storage_config)
         loader = CheckpointLoader(reader=reader, metadata_manager=metadata_manager)
-        loader.load(path, checkpoint)
+        loader.load(path, checkpoint)  # extracts local target metadata only
         loader.close()
 
         saver = make_async_checkpoint_saver(
-            checkpoint_metadata_manager=metadata_manager,  # Shared with loader
+            checkpoint_metadata_manager=metadata_manager,
         )
-        saver.save(new_path, checkpoint)  # Reuses serialized metadata from load
+        saver.save(new_path, checkpoint)  # computes, caches and writes the metadata
     """
     if config is None:
         config = AsyncCheckpointSaverConfig()

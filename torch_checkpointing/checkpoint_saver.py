@@ -6,7 +6,6 @@
 
 import abc
 import logging
-import pickle
 import tempfile
 from concurrent.futures import Future
 from typing import Any, TypeVar
@@ -21,7 +20,6 @@ from .checkpoint_base import (
 )
 from .checkpoint_process import CheckpointProcess
 from .checkpoint_writer import CheckpointWriter
-from .distributed_metadata import CheckpointMetadata
 from .lock import RWLock
 from .logging_utils import EventLogger, EventType
 from .metadata_manager import MetadataManager
@@ -58,6 +56,29 @@ def _throw_if_not_equal_to_sync_save(
         f"Staged state_dict is equal to sync copy, everything is good. Checkpoint path: {path}"
     )
     return staged_sd  # To make it chainable
+
+
+def _get_serialized_metadata(
+    metadata_manager: MetadataManager,
+    checkpoint_info: CheckpointInfo,
+    validate: bool = False,
+) -> bytes:
+    """
+    Return the serialized distributed metadata for a save, computing it (with
+    collectives) only when the manager has none cached.
+
+    With ``validate``, raise if this rank's items no longer match the cached
+    metadata instead of silently writing stale metadata.
+    """
+    if not metadata_manager.has_computed_metadata():
+        metadata_manager.compute_distributed_metadata(checkpoint_info)
+    elif validate and not metadata_manager.computed_metadata_matches(checkpoint_info):
+        raise RuntimeError(
+            "Checkpoint structure, sharding or layout has changed since its "
+            "distributed metadata was computed. Call "
+            "invalidate_computed_metadata() on every rank after changing it."
+        )
+    return metadata_manager.get_serialized_computed_metadata()
 
 
 class CheckpointSaver(abc.ABC):
@@ -146,6 +167,8 @@ class SyncCheckpointSaver(CheckpointSaver):
         Args:
             writer: CheckpointWriter for writing checkpoints to storage.
             metadata_manager: Optional MetadataManager for distributed metadata.
+                Every save raises if its items no longer match the cached
+                metadata; invalidate it on every rank after changing them.
         """
         self._writer = writer
         self._metadata_manager = metadata_manager
@@ -155,22 +178,15 @@ class SyncCheckpointSaver(CheckpointSaver):
         checkpoint: CheckpointBase,
     ) -> CheckpointWriteInfo:
         """
-        Prepare CheckpointWriteInfo for CheckpointProcess.write().
+        Prepare CheckpointWriteInfo for CheckpointWriter.write().
         """
-
+        checkpoint_info = CheckpointInfo(checkpoint_items=checkpoint.get_items())
         serialized_metadata: bytes | None = None
-        # Compute metadata once (also kicks off serialization if first call)
-        if self._metadata_manager:
-            metadata = self._metadata_manager.compute_metadata(
-                CheckpointInfo(checkpoint.get_items())
+        if self._metadata_manager is not None:
+            # The local check costs little next to a blocking write.
+            serialized_metadata = _get_serialized_metadata(
+                self._metadata_manager, checkpoint_info, validate=True
             )
-            if metadata is not None:
-                serialized_metadata = pickle.dumps(
-                    metadata.distributed_metadata.to_dict()
-                )
-
-        items = checkpoint.get_items()
-        checkpoint_info = CheckpointInfo(checkpoint_items=items)
         return checkpoint_info.for_writes(serialized_metadata)
 
     def save(
@@ -262,8 +278,6 @@ class AsyncCheckpointSaver(CheckpointSaver):
             checkpoint_stager: Stager for async operations.
             checkpoint_process: Process for async operations.
             metadata_manager: Optional MetadataManager for distributed metadata.
-                When shared with a CheckpointLoader, metadata computed during load
-                will be reused by save, avoiding redundant computation.
             lock_acquire_timeout: Seconds to wait when acquiring the staging-buffer
                 lock before raising (a timeout here almost always means a deadlock).
         """
@@ -271,7 +285,9 @@ class AsyncCheckpointSaver(CheckpointSaver):
         self._checkpoint_process = checkpoint_process
         self._write_future: Future[Any] | None = None
         self._metadata_manager = metadata_manager
-        self._metadata_sent: bool = False
+        # The write subprocess reuses the last metadata it was sent, so only send
+        # metadata that differs from this.
+        self._sent_serialized_metadata: bytes | None = None
         self._staging_lock = RWLock(acquire_timeout=lock_acquire_timeout)
 
     @property
@@ -283,45 +299,6 @@ class AsyncCheckpointSaver(CheckpointSaver):
         """The lock guarding the staging buffer (see class docstring)."""
         return self._staging_lock
 
-    def _compute_metadata_once(
-        self,
-        checkpoint: CheckpointBase,
-    ) -> CheckpointMetadata | None:
-        """
-        Compute CheckpointMetadata. Only computes once per metadata_manager.
-
-        Uses compute_metadata() result as the guard - it returns None when cache is valid.
-        The metadata_manager automatically kicks off async serialization after first compute.
-
-        Returns:
-            CheckpointMetadata if newly computed, None if already computed or no metadata_manager.
-        """
-        if self._metadata_manager is None:
-            return None
-
-        items = checkpoint.get_items()
-        checkpoint_info = CheckpointInfo(checkpoint_items=items)
-
-        # compute_metadata returns None if cache is valid (already computed)
-        # It also kicks off async serialization automatically after first compute
-        return self._metadata_manager.compute_metadata(checkpoint_info)
-
-    def _get_serialized_metadata_if_needed(self) -> bytes | None:
-        """
-        Get serialized metadata if not yet sent to subprocess.
-
-        Returns:
-            Serialized metadata on first send, None on subsequent sends.
-        """
-        if self._metadata_sent:
-            return None
-
-        if self._metadata_manager is None:
-            return None
-
-        # Get serialized metadata from the metadata_manager
-        return self._metadata_manager.get_serialized_metadata()
-
     def _prepare_checkpoint_write_info(
         self,
         checkpoint: CheckpointBase,
@@ -330,17 +307,26 @@ class AsyncCheckpointSaver(CheckpointSaver):
         """
         Prepare CheckpointWriteInfo for CheckpointProcess.write().
 
+        Fetches the metadata on the calling thread, so a later invalidation
+        cannot change what this save writes. The write info carries it only if
+        the write subprocess doesn't already hold it.
+
         Args:
             checkpoint: The checkpoint object
-            validate: If True, validate metadata consistency with state_dict.
-                      If False and metadata already sent, skip for 0-overhead.
+            validate: If True, raise if the items no longer match the cached
+                metadata.
         """
-        if not self._metadata_sent or validate:
-            self._compute_metadata_once(checkpoint)
+        checkpoint_info = CheckpointInfo(checkpoint_items=checkpoint.get_items())
+        if self._metadata_manager is None:
+            return checkpoint_info.for_writes(None)
 
-        items = checkpoint.get_items()
-        checkpoint_info = CheckpointInfo(checkpoint_items=items)
-        return checkpoint_info.for_writes(None)
+        serialized_metadata = _get_serialized_metadata(
+            self._metadata_manager, checkpoint_info, validate=validate
+        )
+        if serialized_metadata is self._sent_serialized_metadata:
+            return checkpoint_info.for_writes(None)
+        self._sent_serialized_metadata = serialized_metadata
+        return checkpoint_info.for_writes(serialized_metadata)
 
     def _stage(
         self,
@@ -411,7 +397,6 @@ class AsyncCheckpointSaver(CheckpointSaver):
             logger.info(
                 "Preparing checkpoint write info",
             )
-            # Prepare CheckpointWriteInfo (triggers async metadata serialization)
             checkpoint_write_info = self._prepare_checkpoint_write_info(
                 checkpoint, validate=validate_state_dict
             )
@@ -425,6 +410,7 @@ class AsyncCheckpointSaver(CheckpointSaver):
 
             state_dict = checkpoint_write_info.state_dict
             layout_info_mappings = checkpoint_write_info.layout_info_mappings
+            serialized_metadata = checkpoint_write_info.serialized_distributed_metadata
 
             if validate_state_dict:
                 # Create a sync copy of the state_dict to compare against later. Write it
@@ -461,11 +447,6 @@ class AsyncCheckpointSaver(CheckpointSaver):
                     for key in staged_sd.keys()
                 }
 
-                # Get serialized metadata if not yet sent
-                serialized_metadata = self._get_serialized_metadata_if_needed()
-                if serialized_metadata is not None:
-                    self._metadata_sent = True
-
                 write_info = CheckpointWriteInfo(checkpoint_items=rebuilt_items)
                 return write_info.for_writes(serialized_metadata)
 
@@ -481,6 +462,8 @@ class AsyncCheckpointSaver(CheckpointSaver):
         except BaseException:
             # Futures failed to launch; release the lock
             self._staging_lock.write.release()
+            # The write subprocess may not have received the metadata.
+            self._sent_serialized_metadata = None
             raise
 
         # Futures have launched; release the lock in callbacks. On staging

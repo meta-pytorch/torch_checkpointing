@@ -352,21 +352,19 @@ if driving the low-level savers and loaders directly).
 
 ```python
 class MetadataManager(ABC):
-    @abstractmethod
-    def compute_metadata(
-        self,
-        checkpoint_info: CheckpointInfo,
-    ) -> CheckpointMetadata | None: ...
-
-    @abstractmethod
-    def extract_object_metadata(
-        self,
-        checkpoint_info: CheckpointInfo,
-    ) -> dict[str, dict[NestedPath, ShardingMetadata]]: ...
-
-    @abstractmethod
+    def extract_object_metadata(self, checkpoint_info: CheckpointInfo) -> LocalMetadata: ...
+    def compute_distributed_metadata(self, checkpoint_info: CheckpointInfo) -> None: ...
+    def has_computed_metadata(self) -> bool: ...
+    def computed_metadata_matches(self, checkpoint_info: CheckpointInfo) -> bool: ...
+    def get_computed_metadata(self) -> CheckpointMetadata: ...
+    def get_serialized_computed_metadata(self) -> bytes: ...
+    def invalidate_computed_metadata(self) -> None: ...
     def close(self) -> None: ...
 ```
+
+(All methods are abstract; `LocalMetadata` is
+`dict[str, dict[NestedPath, ShardingMetadata]]`.) Only
+`compute_distributed_metadata` communicates; every other method is local.
 
 - `extract_object_metadata` walks the checkpoint items and, for each item that
   has a resharder attached, calls that resharder's `extract_sharding_metadata`
@@ -374,12 +372,22 @@ class MetadataManager(ABC):
   entirely. It is purely local — no collectives, no caching — and it is all a
   load needs: the loader calls it on every load to get this rank's *target*
   metadata.
-- `compute_metadata` orchestrates the full save-side pipeline: local
+- `compute_distributed_metadata` runs the save-side pipeline — local
   extraction, cross-rank aggregation, and construction of the global view that
-  is written as the checkpoint's metadata file. Only savers call it. It returns
-  `None` when the result is unchanged from a cached previous computation (see
-  caching below).
-- `close` releases resources (a background serialization thread pool).
+  is written as the checkpoint's metadata file — and caches the result. It
+  issues collectives, so every rank must call it. It does not assume the
+  structure is unchanged since its previous call: it keeps the cache only if
+  every rank's metadata and layouts still match it, and otherwise recomputes.
+- `has_computed_metadata`, `get_computed_metadata` and
+  `get_serialized_computed_metadata` read that cache on one rank. The getters
+  raise if nothing is cached, and never check the cache against the current
+  state.
+- `computed_metadata_matches` is that check, for this rank only: whether the
+  items' local metadata and the layouts of resharded items still match the
+  cache.
+- `invalidate_computed_metadata` drops the cache. Call it on every rank after
+  changing the structure or sharding of a resharded item (see below).
+- `close` releases any resources the manager holds.
 
 ### `DefaultMetadataManager`
 
@@ -390,23 +398,17 @@ def __init__(
     self,
     rank_info: RankInfo,
     process_group: ProcessGroup | None = None,
-    should_cache_metadata: bool = True,
-    enable_serialization: bool = True,
 ):
 ```
 
 - `process_group=None` uses the default process group for its collectives.
-- `should_cache_metadata=True` caches the extracted local metadata and, on
-  subsequent `compute_metadata` calls, returns `None` if the extracted metadata
-  is unchanged. If the local metadata *has* changed it raises `RuntimeError`
-  ("State dictionary has changed since last checkpoint"), because a changed
-  state dict invalidates the cached global view. Only enable caching when your
-  state dict's structure and sharding are stable across checkpoints.
-- `enable_serialization=True` kicks off async serialization of the aggregated
-  metadata (in a single-worker `ThreadPoolExecutor`) after the first compute, so
-  the bytes are ready to write without blocking the async saver.
+- `compute_distributed_metadata` decides whether its cache still holds with one
+  all-reduce of a flag; only when some rank's metadata or layouts changed does it
+  run the aggregation below.
+- `get_serialized_computed_metadata` pickles the global view on first use and
+  returns the same bytes until the next recomputation or invalidation.
 
-What it computes:
+What `compute_distributed_metadata` computes:
 
 1. **Extract** local `ShardingMetadata` per item/path via
    `extract_object_metadata`.
@@ -421,7 +423,7 @@ What it computes:
    checks that every rank appears in each item's layout info and that no two
    ranks map to the same file path.
 
-The return value is a `CheckpointMetadata`
+`get_computed_metadata` returns the result, a `CheckpointMetadata`
 (`torch_checkpointing/distributed_metadata.py`) that bundles both views:
 
 ```python
@@ -442,11 +444,11 @@ item_key)` is what the resharder uses to find a source rank's shard file.
 
 One `MetadataManager` instance can serve both a `CheckpointLoader` and a saver.
 Loading never touches the manager's cache: every load extracts fresh local
-target metadata from the objects it is given, and issues no collectives. The
-first save computes the global view (the only step with collectives), caches it
-and serializes it; later saves reuse those bytes. So a load can be followed by a
-save of a different set of items, and a second load onto a different layout
-reshards correctly:
+target metadata from the objects it is given, and issues no collectives. A save
+calls `compute_distributed_metadata` only when the manager has nothing cached,
+so the first save is the only one with collectives; every save writes the cached
+metadata. So a load can be followed by a save of a different set of items, and a
+second load onto a different layout reshards correctly:
 
 ```python
 from torch_checkpointing.builder import make_async_checkpoint_saver
@@ -464,6 +466,22 @@ loader.close()
 saver = make_async_checkpoint_saver(checkpoint_metadata_manager=metadata_manager)
 saver.save(new_path, checkpoint)  # computes, caches and serializes metadata
 ```
+
+### When the structure changes
+
+If the structure or sharding of a resharded item changes after the first save —
+for example optimizer state that only exists after the first `step()`, or state
+added mid-run — call `invalidate_computed_metadata()` on every rank before the
+next save, which then recomputes the metadata.
+
+Without it, `SyncCheckpointSaver` raises: every save calls
+`computed_metadata_matches`, which re-extracts this rank's metadata, a cost that
+is small next to a blocking write. `AsyncCheckpointSaver` does not check, because the extraction would run
+on the training thread at every save; it writes metadata for the old structure,
+which a resharding load will misread. `AsyncCheckpointSaver.save(...,
+validate_state_dict=True)` does check and raise, but it is a debugging aid, too
+expensive for production. `CheckpointManager` does not expose its metadata
+manager, so after such a change, construct a new `CheckpointManager`.
 
 ---
 

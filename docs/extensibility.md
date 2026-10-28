@@ -30,8 +30,8 @@ Implement a resharder when a checkpoint saved under one parallelism layout must 
 
 The metadata manager extracts each item's sharding metadata and aggregates it across ranks; resharding on load depends on it. You do **not** wire one up by hand for the common case — `CheckpointManager` constructs and threads a `DefaultMetadataManager` through both save and load automatically whenever any item declares a resharder. Implement a custom one only to change the aggregation strategy itself.
 
-- **Interface:** `MetadataManager` — `compute_metadata` (save side: aggregate across ranks), `extract_object_metadata` (load side: this rank only; must stay free of collectives and caching), `close`.
-- **Built-in:** `DefaultMetadataManager` (representative-rank dedup, `all_gather`, async serialization). Saves compute and serialize the global view once and reuse it; loads only extract local metadata.
+- **Interface:** `MetadataManager` — `extract_object_metadata` (load side: this rank only; must stay free of collectives and caching); `compute_distributed_metadata` (save side: aggregate across ranks and cache the result; the only method with collectives); `has_computed_metadata`, `get_computed_metadata` and `get_serialized_computed_metadata` (read the cache); `computed_metadata_matches` (check the cache against this rank's items); `invalidate_computed_metadata`; `close`.
+- **Built-in:** `DefaultMetadataManager` (representative-rank dedup, `all_gather`, cached serialization). Saves compute and serialize the global view once and reuse it until it is invalidated; loads only extract local metadata.
 - **Wire it in:** the manager wires the default for you. To supply a custom implementation, drive the [lower-level savers and loaders](./api_reference.md#lower-level-savers--loaders-advanced) directly (`make_async_checkpoint_saver(checkpoint_metadata_manager=...)`, `CheckpointLoader(metadata_manager=...)`) rather than through `CheckpointManager`.
 
 ## Serialization formats & layout — select the on-disk representation
