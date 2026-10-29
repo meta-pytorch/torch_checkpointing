@@ -10,6 +10,7 @@ that can extract, process, and coordinate metadata from state dictionaries
 for distributed tensor checkpointing.
 """
 
+import functools
 import logging
 import pickle
 from abc import ABC, abstractmethod
@@ -605,12 +606,12 @@ class DefaultMetadataManager(MetadataManager):
 
         # For each item and nested path, group ranks by their ShardingMetadata
         result: dict[str, dict[NestedPath, list[GlobalObjectMetadata]]] = {}
+
         # Share equal rank tuples so pickle memoizes them across tensors instead
         # of serializing the same rank list for every tensor.
-        rank_tuples: dict[tuple[int, ...], tuple[int, ...]] = {}
-
-        def intern_ranks(ranks: tuple[int, ...]) -> tuple[int, ...]:
-            return rank_tuples.setdefault(ranks, ranks)
+        @functools.cache
+        def canonical_ranks(x: tuple[int, ...]) -> tuple[int, ...]:
+            return x
 
         for item_key, nested_paths in all_items.items():
             result[item_key] = {}
@@ -647,12 +648,11 @@ class DefaultMetadataManager(MetadataManager):
                     # If None, every rank sent its own metadata, so
                     # ranks_list is already complete.
                     equiv_ranks = sharding_meta.equivalent_ranks
-                    final_ranks = (
+                    final_ranks = canonical_ranks(
                         tuple(sorted(equiv_ranks))
                         if equiv_ranks is not None
                         else tuple(ranks_list)
                     )
-                    final_ranks = intern_ranks(final_ranks)
 
                     result[item_key][nested_path].append(
                         GlobalObjectMetadata(
