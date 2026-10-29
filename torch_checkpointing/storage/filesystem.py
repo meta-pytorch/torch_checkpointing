@@ -20,6 +20,10 @@ from .base_storage import ReadArgs, Storage, StorageConfig
 
 logger = logging.getLogger(__name__)
 
+# O_DIRECT is Linux-only. Platforms without it (macOS, Windows) take the
+# buffered I/O path, the same fallback used when a filesystem refuses O_DIRECT.
+_O_DIRECT: int | None = getattr(os, "O_DIRECT", None)
+
 
 def _occupied_destination_error(
     src_path: Path, dst_path: Path, error_number: int = errno.ENOTEMPTY
@@ -69,11 +73,11 @@ class WriteStream(io.IOBase):
                 f"Parent directory does not exist, create it!: {parent_dir}"
             )
 
-        if self._use_direct_io:
+        if self._use_direct_io and _O_DIRECT is not None:
             # Try directio first
             f_mode = os.O_RDWR | os.O_CREAT | os.O_TRUNC
             try:
-                self._fd = os.open(self._path, f_mode | os.O_DIRECT)
+                self._fd = os.open(self._path, f_mode | _O_DIRECT)
                 self._file = os.fdopen(self._fd, self._mode)
                 self._fd = None  # fdopen takes ownership
                 self._using_direct_io = True
@@ -219,7 +223,7 @@ class LocalFileSystemStorage(Storage):
         self._use_direct_io = config.use_direct_io
         # Cleared once the filesystem refuses an O_DIRECT open or read, so later
         # files are read with buffered I/O without trying O_DIRECT again.
-        self._try_direct_io_reads = True
+        self._try_direct_io_reads = _O_DIRECT is not None
 
     def _disable_direct_io_reads(self, path: Path, operation: str) -> None:
         if self._try_direct_io_reads:
