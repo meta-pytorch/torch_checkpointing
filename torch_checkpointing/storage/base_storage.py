@@ -8,10 +8,29 @@ import fnmatch
 import io
 import os
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Protocol
 
 from typing_extensions import Buffer
+
+
+class MmapLike(Protocol):
+    """Buffer-exporting, seekable object used like an anonymous mmap."""
+
+    def __len__(self) -> int: ...
+
+    def seek(self, offset: int, whence: int = 0) -> int: ...
+
+    def read(self, size: int = -1) -> bytes: ...
+
+    def close(self) -> None: ...
+
+
+# The callback allocates a private mmap-compatible object, fills it
+# synchronously, and publishes it only after all workers have joined.
+MmapFill = Callable[[int, Path, int, int], MmapLike]
 
 
 @dataclass
@@ -55,6 +74,11 @@ class Storage(ABC):
     """
     Abstract base class for storage backends.
     """
+
+    @property
+    def mmap_fill(self) -> MmapFill | None:
+        """Optional full-file fill; publish a private mapping only after completion."""
+        return None
 
     @property
     def mmap_fill_workers(self) -> int | None:

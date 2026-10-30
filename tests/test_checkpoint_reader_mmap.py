@@ -10,10 +10,11 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
 import torch
 from torch_checkpointing.checkpoint_layout import TorchSerialization
 from torch_checkpointing.checkpoint_reader import CheckpointReader
-from torch_checkpointing.storage.base_storage import Storage
+from torch_checkpointing.storage.base_storage import MmapFill, Storage
 from torch_checkpointing.types import RankInfo
 
 
@@ -23,7 +24,7 @@ class _BytesStorage(Storage):
         self.read_args: list[Any] = []
         self.getsize_calls = 0
 
-    def stream_read(self, path: Path, read_args: Any | None = None) -> io.BytesIO:
+    def stream_read(self, path: Path, read_args: Any | None = None) -> Any:
         self.read_args.append(read_args)
         return io.BytesIO(self._data_by_path[path])
 
@@ -31,40 +32,40 @@ class _BytesStorage(Storage):
         self.getsize_calls += 1
         return len(self._data_by_path[path])
 
-    def stream_write(self, _path: Path) -> io.IOBase:
+    def stream_write(self, path: Path) -> io.IOBase:
         raise NotImplementedError
 
-    def write(self, _path: Path, _data: Any) -> None:
+    def write(self, path: Path, data: Any) -> None:
         raise NotImplementedError
 
-    def delete(self, _path: Path) -> None:
+    def delete(self, path: Path) -> None:
         raise NotImplementedError
 
-    def mkdir(self, _path: Path, recursive: bool = True) -> None:
+    def mkdir(self, path: Path, recursive: bool = True) -> None:
         raise NotImplementedError
 
-    def rmdir(self, _path: Path) -> None:
+    def rmdir(self, path: Path) -> None:
         raise NotImplementedError
 
     def rename(
         self,
-        _src_path: Path,
-        _dst_path: Path,
+        src_path: Path,
+        dst_path: Path,
         is_directory: bool = False,
         background_cleanup: bool = False,
     ) -> None:
         raise NotImplementedError
 
-    def ls(self, _path: Path) -> list[str]:
+    def ls(self, path: Path) -> list[str]:
         raise NotImplementedError
 
-    def exists(self, _path: Path) -> bool:
+    def exists(self, path: Path) -> bool:
         raise NotImplementedError
 
-    def isdir(self, _path: Path) -> bool:
+    def isdir(self, path: Path) -> bool:
         raise NotImplementedError
 
-    def remap_path(self, _path: Path) -> str:
+    def remap_path(self, path: Path) -> str:
         raise NotImplementedError
 
 
@@ -186,3 +187,53 @@ def test_checkpoint_reader_does_not_resolve_mmap_fill_when_disabled() -> None:
     )
 
     assert factory_calls == []
+
+
+def test_storage_fill_defaults_to_none() -> None:
+    assert _BytesStorage({}).mmap_fill is None
+
+
+@pytest.mark.parametrize(
+    "selection", ["default", "capability", "explicit_source", "disabled"]
+)
+def test_storage_fill_capability_requires_explicit_reader_factory(
+    selection: str,
+) -> None:
+    path = Path("checkpoint.pt")
+    payload = _torch_payload()
+    calls: list[tuple[int, Path, int, int]] = []
+
+    class StorageWithFill(_BytesStorage):
+        @property
+        def mmap_fill(self) -> MmapFill:
+            def fill(
+                file_size: int, callback_path: Path, workers: int, chunk_bytes: int
+            ) -> mmap.mmap:
+                calls.append((file_size, callback_path, workers, chunk_bytes))
+                result = mmap.mmap(-1, file_size)
+                result[:] = payload
+                return result
+
+            return fill
+
+    storage = StorageWithFill({path: payload})
+    reader = CheckpointReader(
+        rank_info=_rank_info(),
+        storage_config=_StorageConfig(storage),
+        disable_use_mmap_backed_storage_on_load=selection == "disabled",
+        mmap_fill_factory=(
+            (lambda candidate: candidate.mmap_fill)
+            if selection in ("capability", "disabled")
+            else (lambda candidate: None)
+            if selection == "explicit_source"
+            else None
+        ),
+    )
+    loaded = reader._load_full_file(
+        path,
+        SimpleNamespace(serialization_format=TorchSerialization()),
+        map_location="cpu",
+    )
+    torch.testing.assert_close(loaded["weights"], torch.arange(4, dtype=torch.float32))
+    assert len(calls) == int(selection == "capability")
+    assert len(storage.read_args) == int(selection != "capability")

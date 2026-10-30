@@ -21,13 +21,12 @@ import mmap
 import os
 import pickle
 import time
-from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any
 
 import torch
 
-from .base_storage import ReadArgs, Storage
+from .base_storage import MmapFill as MmapFill, MmapLike as MmapLike, ReadArgs, Storage
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -40,23 +39,6 @@ _DEFAULT_PARALLEL_FILL_WORKERS = 8
 # Size of each ranged read when filling concurrently.
 _PARALLEL_FILL_CHUNK_MB_ENV = "TORCH_CKPT_PARALLEL_FILL_CHUNK_MB"
 _DEFAULT_PARALLEL_FILL_CHUNK_MB = 64
-
-
-class MmapLike(Protocol):
-    """Buffer-exporting, seekable object used like an anonymous mmap."""
-
-    def __len__(self) -> int: ...
-
-    def seek(self, offset: int, whence: int = 0) -> int: ...
-
-    def read(self, size: int = -1) -> bytes: ...
-
-    def close(self) -> None: ...
-
-
-# The callback allocates a private mmap-compatible object, fills it
-# synchronously, and publishes it only after all workers have joined.
-MmapFill = Callable[[int, Path, int, int], MmapLike]
 
 
 def _mmap_as_storage(mm_file: MmapLike) -> torch.UntypedStorage:
