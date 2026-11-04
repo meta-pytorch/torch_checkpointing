@@ -189,6 +189,57 @@ def _validate_source_slice_bounds(
             )
 
 
+def _validate_plans(item_key: ItemKey, resharding_info: ReshardingInfo) -> None:
+    """Reject plans that are not plain copies into writable local tensors."""
+    for path, load_plans in resharding_info.nested_path_to_load_plans.items():
+        target = resharding_info.nested_path_to_target_tensors[path]
+        checkpoint_path = CheckpointPath(item_key, path)
+        if isinstance(target, DTensor):
+            raise ValueError(
+                f"Target '{checkpoint_path}' is a DTensor, not its local tensor"
+            )
+        if target.is_meta or target.layout is not torch.strided:
+            raise ValueError(
+                f"Target '{checkpoint_path}' has no strided storage to load into "
+                f"(device={target.device}, layout={target.layout})"
+            )
+        for load_plan in load_plans:
+            _validate_load_plan(checkpoint_path, tuple(target.shape), load_plan)
+
+
+def _validate_load_plan(
+    checkpoint_path: CheckpointPath,
+    target_shape: tuple[int, ...],
+    load_plan: LoadPlan,
+) -> None:
+    transpose_dims = load_plan.transpose_dims
+    if transpose_dims and not all(i == d for i, d in enumerate(transpose_dims)):
+        raise NotImplementedError(
+            f"Load plan for '{checkpoint_path}' permutes source dimensions "
+            f"(transpose_dims={transpose_dims}), which "
+            "DefaultLoadPlanExecutor does not support"
+        )
+    if load_plan.sizes != load_plan.src_sizes:
+        raise ValueError(
+            f"Load plan for '{checkpoint_path}' copies a source chunk of shape "
+            f"{load_plan.src_sizes} into a target chunk of shape {load_plan.sizes}"
+        )
+    if not (len(load_plan.offsets) == len(load_plan.sizes) == len(target_shape)):
+        raise ValueError(
+            f"Load plan rank does not match target tensor '{checkpoint_path}' of shape "
+            f"{target_shape}"
+        )
+    for dimension, (target_size, offset, size) in enumerate(
+        zip(target_shape, load_plan.offsets, load_plan.sizes)
+    ):
+        if offset < 0 or size < 0 or offset + size > target_size:
+            raise ValueError(
+                f"Target slice for '{checkpoint_path}' is out of bounds in dimension "
+                f"{dimension}: offset={offset}, size={size}, "
+                f"target_size={target_size}"
+            )
+
+
 def _read_source_tensor_slice(
     stream: io.RawIOBase,
     source: torch.Tensor,
@@ -251,6 +302,13 @@ class DefaultLoadPlanExecutor(LoadPlanExecutor):
     Items are loaded one after another, in the order given. Within an item,
     source files are read concurrently.
 
+    Each load plan must be a plain copy: ``transpose_dims`` empty or the
+    identity, and source and target chunks of the same shape, inside a local,
+    strided target tensor. Targets may be views, contiguous or not. Every plan of
+    every item is checked before any file is read; a plan that permutes source
+    dimensions raises ``NotImplementedError``, and any other unsupported plan
+    raises ``ValueError``.
+
     Args:
         read_strategy: Whether to use offset reads, full-file reads, or try
             offset reads and fall back to full-file reads when unsupported.
@@ -284,6 +342,8 @@ class DefaultLoadPlanExecutor(LoadPlanExecutor):
         context: LoadExecutionContext,
     ) -> None:
         event_logger = EventLogger()
+        for item_key, resharding_info in items.items():
+            _validate_plans(item_key, resharding_info)
         for item_key, resharding_info in items.items():
             if not resharding_info.nested_path_to_load_plans:
                 logger.warning("No load plans generated for item %r", item_key)

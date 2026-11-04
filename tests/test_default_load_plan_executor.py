@@ -8,13 +8,18 @@ import io
 import logging
 import threading
 import time
+from collections.abc import Iterator
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
 import pytest
 import torch
+import torch.distributed as dist
 from safetensors.torch import save as serialize_safetensors, save_file
+from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
+from torch.distributed.tensor import distribute_tensor, Replicate
 from torch_checkpointing.checkpoint_layout import (
     LayoutInfo,
     SafetensorsSerialization,
@@ -1053,3 +1058,171 @@ def test_aliased_targets_disable_concurrent_reads() -> None:
     torch.testing.assert_close(other, torch.full((4,), 3.0))
     assert len(read_threads) == 2
     assert len(set(read_threads)) == 1
+
+
+_ONE_SAFETENSORS_FILE = {0: LayoutInfo("model.safetensors", SafetensorsSerialization())}
+
+
+def _one_safetensors_file_storage() -> _MultiFileTrackingStorage:
+    return _MultiFileTrackingStorage(
+        {
+            Path("model.safetensors"): serialize_safetensors(
+                {"weight": torch.arange(4.0)}
+            )
+        }
+    )
+
+
+def _copy_plan(**changes: Any) -> LoadPlan:
+    """A plan copying all of the source tensor ``weight`` into a 4-element target."""
+    plan = LoadPlan(
+        offsets=(0,),
+        sizes=(4,),
+        src_rank=0,
+        src_fqn="weight",
+        src_offsets=(0,),
+        src_sizes=(4,),
+    )
+    return replace(plan, **changes)
+
+
+@pytest.fixture
+def cpu_mesh() -> Iterator[DeviceMesh]:
+    dist.init_process_group("gloo", store=dist.HashStore(), rank=0, world_size=1)
+    try:
+        yield init_device_mesh("cpu", (1,))
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("transpose_dims", [(), (0,)], ids=["empty", "identity"])
+def test_unpermuted_transpose_dims_copy_the_source_unchanged(
+    transpose_dims: tuple[int, ...],
+) -> None:
+    target = torch.zeros(4)
+
+    _execute_load_plans(
+        {("weight",): [_copy_plan(transpose_dims=transpose_dims)]},
+        {"weight": target},
+        _ONE_SAFETENSORS_FILE,
+        _one_safetensors_file_storage(),
+    )
+
+    torch.testing.assert_close(target, torch.arange(4.0))
+
+
+@pytest.mark.parametrize("read_strategy", list(ReshardingReadStrategy))
+def test_permuting_source_dimensions_is_rejected_before_any_read(
+    read_strategy: ReshardingReadStrategy,
+) -> None:
+    storage = _MultiFileTrackingStorage(
+        {
+            Path("model.safetensors"): serialize_safetensors(
+                {"weight": torch.arange(4.0).reshape(2, 2)}
+            )
+        }
+    )
+    plan = _copy_plan(
+        offsets=(0, 0),
+        sizes=(2, 2),
+        src_offsets=(0, 0),
+        src_sizes=(2, 2),
+        transpose_dims=(1, 0),
+    )
+
+    with pytest.raises(NotImplementedError, match="permutes source dimensions"):
+        _execute_load_plans(
+            {("weight",): [plan]},
+            {"weight": torch.zeros(2, 2)},
+            _ONE_SAFETENSORS_FILE,
+            storage,
+            read_strategy=read_strategy,
+        )
+    assert storage.reads == []
+
+
+@pytest.mark.parametrize(
+    ("plan", "match"),
+    [
+        (_copy_plan(offsets=(1,)), "out of bounds in dimension 0"),
+        (_copy_plan(sizes=(2,)), r"source chunk of shape \(4,\) into a target"),
+        (
+            _copy_plan(
+                offsets=(0, 0), sizes=(1, 4), src_offsets=(0, 0), src_sizes=(1, 4)
+            ),
+            "rank does not match target tensor 'model::weight'",
+        ),
+    ],
+    ids=["out_of_bounds", "shape_mismatch", "rank_mismatch"],
+)
+def test_plan_that_does_not_fit_its_target_is_rejected_before_any_read(
+    plan: LoadPlan, match: str
+) -> None:
+    storage = _one_safetensors_file_storage()
+
+    with pytest.raises(ValueError, match=match):
+        _execute_load_plans(
+            {("weight",): [plan]},
+            {"weight": torch.zeros(4)},
+            _ONE_SAFETENSORS_FILE,
+            storage,
+        )
+    assert storage.reads == []
+
+
+@pytest.mark.parametrize(
+    "target",
+    [torch.empty(4, device="meta"), torch.zeros(4).to_sparse()],
+    ids=["meta", "sparse"],
+)
+def test_target_without_strided_storage_is_rejected(target: torch.Tensor) -> None:
+    storage = _one_safetensors_file_storage()
+
+    with pytest.raises(ValueError, match="has no strided storage to load into"):
+        _execute_load_plans(
+            {("weight",): [_copy_plan()]},
+            {"weight": target},
+            _ONE_SAFETENSORS_FILE,
+            storage,
+        )
+    assert storage.reads == []
+
+
+def test_dtensor_target_is_rejected(cpu_mesh: DeviceMesh) -> None:
+    target = distribute_tensor(torch.zeros(4), cpu_mesh, [Replicate()])
+    storage = _one_safetensors_file_storage()
+
+    with pytest.raises(ValueError, match="is a DTensor, not its local tensor"):
+        _execute_load_plans(
+            {("weight",): [_copy_plan()]},
+            {"weight": target},
+            _ONE_SAFETENSORS_FILE,
+            storage,
+        )
+    assert storage.reads == []
+
+
+def test_every_item_is_validated_before_any_file_is_read() -> None:
+    storage = _one_safetensors_file_storage()
+    items = {
+        key: ReshardingInfo(
+            nested_path_to_load_plans={("weight",): [plan]},
+            non_reshardable_paths=[],
+            nested_path_to_target_tensors={("weight",): torch.zeros(4)},
+        )
+        for key, plan in [("model", _copy_plan()), ("optim", _copy_plan(offsets=(1,)))]
+    }
+    context = LoadExecutionContext(
+        checkpoint_path=Path("."),
+        storage=storage,  # type: ignore[arg-type]
+        source_metadata={
+            key: DistributedItemMetadata(
+                nested_path_to_metadata={}, rank_to_layout_info=_ONE_SAFETENSORS_FILE
+            )
+            for key in items
+        },
+    )
+
+    with pytest.raises(ValueError, match="'optim::weight'"):
+        DefaultLoadPlanExecutor().execute(items, context)
+    assert storage.reads == []

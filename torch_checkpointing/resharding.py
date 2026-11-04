@@ -45,7 +45,8 @@ class LoadPlan:
         src_offsets: Position of the chunk inside the source tensor.
         src_sizes: Shape of the chunk inside the source tensor.
         src_dtype: Canonical source tensor dtype, such as ``torch.float16``.
-        transpose_dims: Transpose to apply to source chunk to match target layout.
+        transpose_dims: Permutation of the source chunk's dimensions to apply
+            before copying it into the target; empty means none.
     """
 
     # Target chunk info
