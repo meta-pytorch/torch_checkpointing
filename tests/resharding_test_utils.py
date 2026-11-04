@@ -12,6 +12,7 @@ import torch
 from torch.distributed.tensor._api import DTensor
 from torch_checkpointing.checkpoint_base import CheckpointInfo, CheckpointItem
 from torch_checkpointing.checkpoint_layout import LayoutInfo
+from torch_checkpointing.default_load_plan_executor import DefaultLoadPlanExecutor
 from torch_checkpointing.distributed_metadata import (
     DistributedItemMetadata,
     ShardingMetadata,
@@ -21,10 +22,59 @@ from torch_checkpointing.dtensor_metadata import (
     DTensorShardingMetadata,
     ReplicateSpec,
 )
-from torch_checkpointing.resharding import Resharder
+from torch_checkpointing.load_plan_executor import (
+    LoadExecutionContext,
+    LoadPlanExecutor,
+)
+from torch_checkpointing.resharding import Resharder, ReshardingInfo
 from torch_checkpointing.storage.base_storage import Storage
 from torch_checkpointing.types import CheckpointPath, NestedPath
 from torch_checkpointing.walk_utils import walk_checkpoint_structure
+
+
+def _plan_nothing_but_report_missing(
+    target_metadata: dict[NestedPath, ShardingMetadata],
+    source_metadata: DistributedItemMetadata,
+) -> ReshardingInfo:
+    """Plan no reads; report the target paths that the source does not have."""
+    source_paths = source_metadata.get_nested_paths()
+    return ReshardingInfo(
+        nested_path_to_load_plans={},
+        non_reshardable_paths=[
+            nested_path
+            for nested_path in target_metadata
+            if nested_path not in source_paths
+        ],
+    )
+
+
+def plan_and_execute(
+    resharder: Resharder,
+    *,
+    source_path: Path,
+    item_key: str,
+    target_metadata: dict[NestedPath, ShardingMetadata],
+    source_metadata: DistributedItemMetadata,
+    target: Any,
+    storage: Storage,
+    executor: LoadPlanExecutor | None = None,
+) -> list[NestedPath]:
+    """Load one item as the reader does: plan with ``resharder``, then execute.
+
+    Returns the paths that ``resharder`` could not plan.
+    """
+    resharding_info = resharder.generate_load_plans(
+        item_key, target, target_metadata, source_metadata
+    )
+    (executor or DefaultLoadPlanExecutor()).execute(
+        {item_key: resharding_info},
+        LoadExecutionContext(
+            checkpoint_path=source_path,
+            storage=storage,
+            source_metadata={item_key: source_metadata},
+        ),
+    )
+    return resharding_info.non_reshardable_paths
 
 
 class SimpleDTensorResharder(Resharder):
@@ -52,25 +102,14 @@ class SimpleDTensorResharder(Resharder):
         )
         return result
 
-    def load(
+    def generate_load_plans(
         self,
-        source_path: Path,
         item_key: str,
+        target: Any,
         target_metadata: dict[NestedPath, ShardingMetadata],
         source_metadata: DistributedItemMetadata,
-        target: Any,
-        storage: Storage,
-    ) -> list[NestedPath]:
-        # Test resharder - detect missing paths in source
-        # Collect all source paths from nested_path_to_metadata
-        source_paths = source_metadata.get_nested_paths()
-
-        # Return paths that are in target but not in source
-        return [
-            nested_path
-            for nested_path in target_metadata.keys()
-            if nested_path not in source_paths
-        ]
+    ) -> ReshardingInfo:
+        return _plan_nothing_but_report_missing(target_metadata, source_metadata)
 
 
 class CustomObjectResharder(Resharder):
@@ -100,22 +139,14 @@ class CustomObjectResharder(Resharder):
         )
         return result
 
-    def load(
+    def generate_load_plans(
         self,
-        source_path: Path,
         item_key: str,
+        target: Any,
         target_metadata: dict[NestedPath, ShardingMetadata],
         source_metadata: DistributedItemMetadata,
-        target: Any,
-        storage: Storage,
-    ) -> list[NestedPath]:
-        # Test resharder - detect missing paths in source
-        source_paths = source_metadata.get_nested_paths()
-        return [
-            nested_path
-            for nested_path in target_metadata.keys()
-            if nested_path not in source_paths
-        ]
+    ) -> ReshardingInfo:
+        return _plan_nothing_but_report_missing(target_metadata, source_metadata)
 
 
 class SimpleResharder(Resharder):
@@ -156,22 +187,14 @@ class SimpleResharder(Resharder):
         )
         return result
 
-    def load(
+    def generate_load_plans(
         self,
-        source_path: Path,
         item_key: str,
+        target: Any,
         target_metadata: dict[NestedPath, ShardingMetadata],
         source_metadata: DistributedItemMetadata,
-        target: Any,
-        storage: Storage,
-    ) -> list[NestedPath]:
-        # Test resharder - detect missing paths in source
-        source_paths = source_metadata.get_nested_paths()
-        return [
-            nested_path
-            for nested_path in target_metadata.keys()
-            if nested_path not in source_paths
-        ]
+    ) -> ReshardingInfo:
+        return _plan_nothing_but_report_missing(target_metadata, source_metadata)
 
 
 @dataclass(frozen=True)

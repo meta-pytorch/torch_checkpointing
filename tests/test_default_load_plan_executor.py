@@ -44,6 +44,8 @@ from torch_checkpointing.storage.base_storage import ReadArgs
 from torch_checkpointing.storage.filesystem import LocalFileSystemStorageConfig
 from torch_checkpointing.types import NestedPath
 
+from .resharding_test_utils import plan_and_execute
+
 
 class _TrackingReader(io.BytesIO):
     def __init__(self, data: bytes, storage: "_TrackingStorage") -> None:
@@ -171,7 +173,9 @@ def _load_second_half(
             return_value=1,
         ),
     ):
-        missing_paths = DefaultResharder(read_strategy=read_strategy).load(
+        missing_paths = plan_and_execute(
+            DefaultResharder(),
+            executor=DefaultLoadPlanExecutor(read_strategy=read_strategy),
             source_path=Path("."),
             item_key="model",
             target_metadata={("selected",): target_sharding},
@@ -339,7 +343,8 @@ def test_load_reads_one_span_for_noncontiguous_source_slice() -> None:
             return_value=1,
         ),
     ):
-        missing_paths = DefaultResharder().load(
+        missing_paths = plan_and_execute(
+            DefaultResharder(),
             source_path=Path("."),
             item_key="model",
             target_metadata={("selected",): target_sharding},
@@ -599,7 +604,8 @@ def test_load_falls_back_for_quantized_source_tensor() -> None:
             return_value=1,
         ),
     ):
-        missing_paths = DefaultResharder().load(
+        missing_paths = plan_and_execute(
+            DefaultResharder(),
             source_path=Path("."),
             item_key="model",
             target_metadata={("selected",): target_sharding},

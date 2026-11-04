@@ -68,6 +68,11 @@ class LoadPlanExecutor(abc.ABC):
         storage, so do not write two items concurrently unless their targets
         are disjoint.
 
+        The reader calls this once per read with the items that reshard on this
+        rank, and not at all when none does, for example when every layout
+        matches the checkpoint. Ranks can therefore differ in whether they call
+        it: do not rely on every rank calling it.
+
         Args:
             items: The bound load plans of each item, keyed by item key, in the
                 order the items should be loaded.

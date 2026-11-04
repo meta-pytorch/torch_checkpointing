@@ -10,7 +10,8 @@ import pickle
 import shutil
 import tempfile
 import unittest.mock as mock
-from dataclasses import replace
+from collections.abc import Mapping
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -30,6 +31,7 @@ from torch_checkpointing.checkpoint_layout import (
 from torch_checkpointing.checkpoint_reader import (
     CheckpointReader,
 )
+from torch_checkpointing.default_load_plan_executor import DefaultLoadPlanExecutor
 from torch_checkpointing.default_resharder import DefaultResharder
 from torch_checkpointing.distributed_metadata import (
     DistributedItemMetadata,
@@ -43,8 +45,12 @@ from torch_checkpointing.dtensor_metadata import (
     ReplicateSpec,
     ShardSpec,
 )
+from torch_checkpointing.load_plan_executor import (
+    LoadExecutionContext,
+    LoadPlanExecutor,
+)
 from torch_checkpointing.metadata_serialization import METADATA_FILE_NAME
-from torch_checkpointing.resharding import Resharder
+from torch_checkpointing.resharding import Resharder, ReshardingInfo
 from torch_checkpointing.storage.filesystem import LocalFileSystemStorageConfig
 from torch_checkpointing.types import NestedPath, RankInfo, STATE_DICT
 
@@ -91,17 +97,11 @@ class NoOpResharder(Resharder):
         """Extract metadata - returns empty dict since no-op."""
         return {}
 
-    def load(
-        self,
-        source_path,
-        item_key,
-        target_metadata,
-        source_metadata,
-        target,
-        storage,
-    ) -> list[NestedPath]:
+    def generate_load_plans(
+        self, item_key, target, target_metadata, source_metadata
+    ) -> ReshardingInfo:
         # No-op: never actually loads anything
-        return []
+        return ReshardingInfo(nested_path_to_load_plans={}, non_reshardable_paths=[])
 
     def should_reshard(self, source_metadata, target_metadata):
         return False  # Never actually reshard
@@ -117,25 +117,33 @@ class _SkippingResharder(NoOpResharder):
         raise AssertionError("should_reshard must not run when skip_resharding")
 
 
-class LoadRecordingDefaultResharder(DefaultResharder):
-    """DefaultResharder subclass whose public load method must remain authoritative."""
+class _RecordingExecutor(LoadPlanExecutor):
+    """Records the items of each batch, then loads them with the default executor."""
 
     def __init__(self) -> None:
-        super().__init__()
-        self.load_called = False
+        self.batches: list[tuple[list[str], LoadExecutionContext]] = []
 
-    def load(
+    def execute(
         self,
-        source_path,
-        item_key,
-        target_metadata,
-        source_metadata,
-        target,
-        storage,
-    ) -> list[NestedPath]:
-        self.load_called = True
-        target["weight"].fill_(17)
-        return []
+        items: Mapping[str, ReshardingInfo],
+        context: LoadExecutionContext,
+    ) -> None:
+        self.batches.append((list(items), context))
+        DefaultLoadPlanExecutor().execute(items, context)
+
+
+@dataclass
+class _WrappedLeaf:
+    """A target leaf from another annotation system, wrapping its local tensor."""
+
+    local: torch.Tensor
+
+
+class _WrappedLeafResharder(DefaultResharder):
+    def resolve_targets(
+        self, item_key: str, target: Any
+    ) -> dict[NestedPath, torch.Tensor]:
+        return {(name,): leaf.local for name, leaf in target.items()}
 
 
 class SimpleCheckpoint(CheckpointBase):
@@ -601,54 +609,6 @@ class TestCheckpointReader(TestCase):
         loaded, missing = self.reader.read(checkpoint_path, checkpoint_info)
 
         torch.testing.assert_close(loaded["model"]["weight"], source_value)
-        self.assertEqual(missing, [])
-
-    def test_default_resharder_subclass_uses_its_public_load_method(self):
-        checkpoint_path = os.path.join(self.temp_dir, "default_subclass")
-        os.makedirs(checkpoint_path)
-        source_value = torch.arange(8, dtype=torch.float32)
-        base_resharder = DefaultResharder()
-        source_sharding = base_resharder.extract_sharding_metadata(
-            "model", {"weight": source_value}
-        )[("weight",)]
-        target_sharding = replace(source_sharding, placements=(ShardSpec(0),))
-        source_distributed_metadata = DistributedMetadata(
-            metadata={
-                "model": DistributedItemMetadata(
-                    nested_path_to_metadata={
-                        ("weight",): [
-                            GlobalObjectMetadata(
-                                sharding_metadata=source_sharding,
-                                ranks=(0,),
-                            )
-                        ]
-                    },
-                    rank_to_layout_info={0: None},
-                )
-            },
-            world_size=1,
-        )
-        with open(os.path.join(checkpoint_path, METADATA_FILE_NAME), "wb") as stream:
-            pickle.dump(source_distributed_metadata.to_dict(), stream)
-
-        target = torch.zeros_like(source_value)
-        resharder = LoadRecordingDefaultResharder()
-        checkpoint_info = CheckpointInfo(
-            checkpoint_items={
-                "model": CheckpointItem(
-                    value={"weight": target},
-                    resharder=resharder,
-                )
-            }
-        ).for_reads({"model": {("weight",): target_sharding}})
-
-        loaded, missing = self.reader.read(checkpoint_path, checkpoint_info)
-
-        self.assertTrue(resharder.load_called)
-        torch.testing.assert_close(
-            loaded["model"]["weight"],
-            torch.full_like(source_value, 17),
-        )
         self.assertEqual(missing, [])
 
     def test_resharding_requires_source_metadata(self):
@@ -1343,6 +1303,71 @@ def test_skipping_item_is_read_directly_when_another_item_reshards(
     assert missing_keys == []
     torch.testing.assert_close(result["model"]["weight"], torch.ones(2))
     torch.testing.assert_close(result["optimizer"]["step"], torch.tensor(3))
+
+
+def test_reader_plans_every_resharded_item_then_executes_them_in_one_batch(
+    tmp_path: Path,
+) -> None:
+    values = {
+        "model": torch.arange(8, dtype=torch.float32),
+        "embedding": torch.arange(8, 16, dtype=torch.float32),
+    }
+    source_metadata = {}
+    target_metadata = {}
+    for key, value in values.items():
+        torch.save({"weight": value}, tmp_path / f"{key}_0.pt")
+        source_sharding = DefaultResharder().extract_sharding_metadata(
+            key, {"weight": value}
+        )[("weight",)]
+        source_metadata[key] = DistributedItemMetadata(
+            nested_path_to_metadata={
+                ("weight",): [
+                    GlobalObjectMetadata(sharding_metadata=source_sharding, ranks=(0,))
+                ]
+            },
+            rank_to_layout_info={0: LayoutInfo(f"{key}_0.pt", TorchSerialization())},
+        )
+        target_metadata[key] = {
+            ("weight",): replace(source_sharding, placements=(ShardSpec(0),))
+        }
+    with open(tmp_path / METADATA_FILE_NAME, "wb") as stream:
+        pickle.dump(
+            DistributedMetadata(metadata=source_metadata, world_size=1).to_dict(),
+            stream,
+        )
+    torch.save({"step": 9}, tmp_path / "epoch_0.pt")
+    model, embedding = torch.zeros(8), _WrappedLeaf(torch.zeros(8))
+    executor = _RecordingExecutor()
+    reader = CheckpointReader(
+        rank_info=RankInfo(
+            global_rank=0, global_world_size=1, role_rank=0, role_world_size=1
+        ),
+        storage_config=LocalFileSystemStorageConfig(),
+        load_plan_executor=executor,
+    )
+    checkpoint_info = CheckpointInfo(
+        checkpoint_items={
+            "model": CheckpointItem(
+                value={"weight": model}, resharder=DefaultResharder()
+            ),
+            "epoch": CheckpointItem(value={"step": 0}),
+            "embedding": CheckpointItem(
+                value={"weight": embedding}, resharder=_WrappedLeafResharder()
+            ),
+        }
+    ).for_reads(target_metadata)
+
+    loaded, missing = reader.read(str(tmp_path), checkpoint_info)
+
+    # One batch, in item order; the direct read of "epoch" is not part of it.
+    [(batch_items, context)] = executor.batches
+    assert batch_items == ["model", "embedding"]
+    assert context.checkpoint_path == tmp_path
+    assert context.source_metadata.keys() == {"model", "embedding"}
+    torch.testing.assert_close(model, values["model"])
+    torch.testing.assert_close(embedding.local, values["embedding"])
+    assert loaded["epoch"] == {"step": 9}
+    assert missing == []
 
 
 if __name__ == "__main__":

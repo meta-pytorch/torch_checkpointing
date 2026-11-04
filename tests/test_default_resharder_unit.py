@@ -41,6 +41,8 @@ from torch_checkpointing.safetensors_metadata import SafetensorsFileMetadata
 from torch_checkpointing.storage.filesystem import LocalFileSystemStorageConfig
 from torch_checkpointing.types import NestedPath
 
+from .resharding_test_utils import plan_and_execute
+
 
 def test_import_does_not_require_safetensors() -> None:
     subprocess.run(
@@ -280,7 +282,8 @@ def test_load_writes_through_a_non_contiguous_target_view(tmp_path: Path) -> Non
         rank_to_layout_info={0: LayoutInfo("checkpoint.pt", TorchSerialization())},
     )
 
-    missing_paths = _ColumnSliceResharder().load(
+    missing_paths = plan_and_execute(
+        _ColumnSliceResharder(),
         source_path=tmp_path,
         item_key="model",
         target_metadata={("weight",): _replicated((4, 2))},
@@ -310,7 +313,8 @@ def test_load_fills_a_planned_target_that_an_unplanned_path_also_binds(
     )
 
     # "unsaved" binds the same tensor after "weight", but has no plans.
-    missing_paths = DefaultResharder().load(
+    missing_paths = plan_and_execute(
+        DefaultResharder(),
         source_path=tmp_path,
         item_key="model",
         target_metadata={
@@ -373,7 +377,8 @@ def test_load_reshards_safetensors_shards_described_by_native_metadata(
             "torch_checkpointing.default_resharder.dist.get_world_size", return_value=1
         ),
     ):
-        missing = DefaultResharder().load(
+        missing = plan_and_execute(
+            DefaultResharder(),
             source_path=tmp_path,
             item_key="model",
             target_metadata={("weight",): sharded((1,), (0,), (ReplicateSpec(),))},

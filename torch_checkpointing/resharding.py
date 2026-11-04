@@ -8,13 +8,13 @@
 Resharding APIs for checkpoint loading across different distributed configurations.
 
 This module provides the abstract base class for customizing resharding logic
-during checkpoint loading. Implementations control how data from source checkpoints
-are mapped to target tensors when distributed configurations differ.
+during checkpoint loading. Implementations plan how data from source checkpoints
+maps to target tensors when distributed configurations differ; a
+``LoadPlanExecutor`` then reads the planned data.
 """
 
 import abc
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any
 
 import torch
@@ -24,7 +24,6 @@ from .distributed_metadata import (
     DistributedItemMetadata,
     ShardingMetadata,
 )
-from .storage.base_storage import Storage
 from .types import CheckpointPath, NestedPath
 from .walk_utils import walk_checkpoint_structure
 
@@ -259,10 +258,10 @@ class Resharder(abc.ABC):
         """
         Return the local tensor that each tensor leaf of ``target`` loads into.
 
-        Load plans address these tensors, so a resharder binds them into the
-        ``ReshardingInfo`` it plans. The default returns every tensor leaf, with
-        each ``DTensor`` replaced by its local shard. Override it for leaves that
-        wrap their local tensor in another type.
+        Load plans address these tensors, so ``generate_load_plans`` binds them
+        into the ``ReshardingInfo`` it returns. The default returns every tensor
+        leaf, with each ``DTensor`` replaced by its local shard. Override it for
+        leaves that wrap their local tensor in another type.
 
         A returned tensor must share storage with the live target, so that
         writing into it updates the target: return the tensor itself or a view of
@@ -294,31 +293,29 @@ class Resharder(abc.ABC):
         return tensors
 
     @abc.abstractmethod
-    def load(
+    def generate_load_plans(
         self,
-        source_path: Path,
         item_key: str,
+        target: Any,
         target_metadata: dict[NestedPath, ShardingMetadata],
         source_metadata: DistributedItemMetadata,
-        target: Any,
-        storage: Storage,
-    ) -> list[NestedPath]:
+    ) -> ReshardingInfo:
         """
-        Load and reshard checkpoint data into target.
+        Plan which saved chunks fill each target tensor of a checkpoint item.
 
-        This method combines load plan generation and execution into a single call,
-        allowing flexible resharding strategies. Implementations can generate load
-        plans internally or implement custom loading logic.
+        Planning reads no checkpoint data and does not modify ``target``: the
+        reader's ``LoadPlanExecutor`` performs the planned reads afterwards.
+        Bind each planned path to the tensor that its plans address, normally
+        with ``resolve_targets``.
 
         Args:
-            source_path: Base path to the source checkpoint directory
             item_key: The checkpoint item key being loaded (e.g., "model")
+            target: The item's live value, which loaded data is written into.
             target_metadata: This rank's target sharding (from extract_sharding_metadata)
             source_metadata: Source checkpoint's distributed metadata for this item
-            target: Target object to load data into (modified in-place)
-            storage: Storage backend for reading checkpoint files
 
         Returns:
-            List of NestedPaths that could not be resharded.
+            The item's load plans, bound to the target tensors they fill, and
+            the paths that could not be planned.
         """
         ...

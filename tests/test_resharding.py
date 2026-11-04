@@ -5,7 +5,6 @@
 # LICENSE file in the root directory of this source tree.
 
 from collections.abc import Iterator
-from pathlib import Path
 from typing import Any
 
 import pytest
@@ -18,7 +17,6 @@ from torch_checkpointing.distributed_metadata import (
     ShardingMetadata,
 )
 from torch_checkpointing.resharding import LoadPlan, Resharder, ReshardingInfo
-from torch_checkpointing.storage.base_storage import Storage
 from torch_checkpointing.types import NestedPath
 
 
@@ -30,16 +28,14 @@ class _MinimalResharder(Resharder):
     ) -> dict[NestedPath, ShardingMetadata]:
         return {}
 
-    def load(
+    def generate_load_plans(
         self,
-        source_path: Path,
         item_key: str,
+        target: Any,
         target_metadata: dict[NestedPath, ShardingMetadata],
         source_metadata: DistributedItemMetadata,
-        target: Any,
-        storage: Storage,
-    ) -> list[NestedPath]:
-        return []
+    ) -> ReshardingInfo:
+        return ReshardingInfo(nested_path_to_load_plans={}, non_reshardable_paths=[])
 
 
 @pytest.fixture

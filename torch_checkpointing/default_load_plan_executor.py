@@ -32,6 +32,7 @@ from .checkpoint_layout import (
 from .distributed_metadata import DistributedItemMetadata
 from .hf.metadata import HuggingFaceSafetensorsItemMetadata
 from .load_plan_executor import LoadExecutionContext, LoadPlanExecutor
+from .logging_utils import EventLogger, EventType
 from .resharding import LoadPlan, ReshardingInfo
 from .resharding_utils import (
     convert_nested_path_dict_to_fqn,
@@ -282,6 +283,7 @@ class DefaultLoadPlanExecutor(LoadPlanExecutor):
         items: Mapping[ItemKey, ReshardingInfo],
         context: LoadExecutionContext,
     ) -> None:
+        event_logger = EventLogger()
         for item_key, resharding_info in items.items():
             if not resharding_info.nested_path_to_load_plans:
                 logger.warning("No load plans generated for item %r", item_key)
@@ -292,6 +294,13 @@ class DefaultLoadPlanExecutor(LoadPlanExecutor):
                 item_key,
                 resharding_info,
                 context.storage,
+            )
+            logger.info(
+                f"Done reading planned data for {item_key}.",
+                extra=event_logger(
+                    EventType.LOG_METRIC,
+                    metric_name=f"train.checkpoint_read.execute.filesystem.{item_key}.read.latency_ms",
+                ),
             )
 
     def _execute_item(

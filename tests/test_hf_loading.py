@@ -41,6 +41,8 @@ from torch_checkpointing.safetensors_metadata import SafetensorsFileMetadata
 from torch_checkpointing.schema import ItemSpec
 from torch_checkpointing.storage.filesystem import LocalFileSystemStorageConfig
 
+from .resharding_test_utils import plan_and_execute
+
 
 def _manager() -> CheckpointManager:
     config = CheckpointManager.Config.with_sync_save()
@@ -577,7 +579,8 @@ def test_hf_resharder_reads_only_target_shard_range(tmp_path: Path) -> None:
             wraps=_executor._read_exact,
         ) as read_exact,
     ):
-        missing = resharder.load(
+        missing = plan_and_execute(
+            resharder,
             source_path=tmp_path,
             item_key="model",
             target_metadata=target_metadata,
@@ -632,7 +635,8 @@ def test_hf_resharder_reuses_shard_headers_read_for_metadata(tmp_path: Path) -> 
             side_effect=AssertionError("shard header read a second time"),
         ),
     ):
-        missing = DefaultResharder().load(
+        missing = plan_and_execute(
+            DefaultResharder(),
             source_path=tmp_path,
             item_key="model",
             target_metadata=target_metadata,

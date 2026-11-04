@@ -8,7 +8,7 @@ from typing import Any
 
 import pytest
 from torch_checkpointing.checkpoint_layout import LayoutInfo, TorchSerialization
-from torch_checkpointing.resharding import Resharder
+from torch_checkpointing.resharding import Resharder, ReshardingInfo
 from torch_checkpointing.schema import _CheckpointSchema, ItemSpec
 
 
@@ -20,16 +20,14 @@ class _StubResharder(Resharder):
     ) -> dict[Any, Any]:
         return {}
 
-    def load(
+    def generate_load_plans(
         self,
-        source_path: Any,
         item_key: str,
+        target: Any,
         target_metadata: Any,
         source_metadata: Any,
-        target: Any,
-        storage: Any,
-    ) -> list[Any]:
-        return []
+    ) -> ReshardingInfo:
+        return ReshardingInfo(nested_path_to_load_plans={}, non_reshardable_paths=[])
 
 
 def test_reconcile_overlays_value_onto_spec() -> None:

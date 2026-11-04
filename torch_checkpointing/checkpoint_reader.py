@@ -33,7 +33,9 @@ from .checkpoint_layout import (
     SafetensorsSerialization,
     TorchSerialization,
 )
+from .default_load_plan_executor import DefaultLoadPlanExecutor
 from .distributed_metadata import DistributedItemMetadata, LocalMetadata
+from .load_plan_executor import LoadExecutionContext, LoadPlanExecutor
 from .logging_utils import EventLogger, EventType
 from .metadata_serialization import (
     DistributedMetadataFormat,
@@ -41,9 +43,10 @@ from .metadata_serialization import (
     RankAddressableDistributedMetadataFormat,
     TorchDistributedMetadataFormat,
 )
+from .resharding import ReshardingInfo
 from .storage.base_storage import Storage, StorageConfig
 from .storage.torch_serialization import MmapFill
-from .types import CheckpointPath, RankInfo, STATE_DICT
+from .types import CheckpointPath, ItemKey, RankInfo, STATE_DICT
 from .utils import from_dict
 from .walk_utils import walk_checkpoint_structure
 
@@ -78,6 +81,7 @@ class CheckpointReader:
         disable_use_mmap_backed_storage_on_load: bool = False,
         mmap_fill_factory: Callable[[Storage], MmapFill | None] | None = None,
         storage: Storage | None = None,
+        load_plan_executor: LoadPlanExecutor | None = None,
     ):
         """
         Initialize a CheckpointReader.
@@ -94,6 +98,8 @@ class CheckpointReader:
                 fill callback. It is resolved only for mmap-backed torch loads.
             storage: Optional operation-scoped storage instance. When supplied,
                 it is reused instead of constructing another backend client.
+            load_plan_executor: Reads the data that resharders plan, for every item
+                that reshards. Defaults to a ``DefaultLoadPlanExecutor``.
         """
 
         self._rank_info = rank_info
@@ -104,6 +110,11 @@ class CheckpointReader:
             disable_use_mmap_backed_storage_on_load
         )
         self._mmap_fill_factory = mmap_fill_factory
+        self._load_plan_executor = (
+            load_plan_executor
+            if load_plan_executor is not None
+            else DefaultLoadPlanExecutor()
+        )
 
     def read(
         self,
@@ -452,9 +463,9 @@ class CheckpointReader:
         Load checkpoint with resharding support.
 
         This method handles loading checkpoint data when the distributed configuration
-        differs between save time and load time. It uses resharders to generate load
-        plans that determine which source ranks to read from and how to redistribute
-        the data to match the current distributed layout.
+        differs between save time and load time. Each item's resharder plans which
+        source ranks to read from and where their data goes in the current layout.
+        Once every item is planned, the load executor reads all of them in one call.
 
         All items in checkpoint_info are expected to need resharding with valid resharders.
 
@@ -478,12 +489,9 @@ class CheckpointReader:
 
         result_dict: dict[str, Any] = checkpoint_info.state_dict  # type: ignore
         unhandled_paths: list[CheckpointPath] = []
+        planned_items: dict[ItemKey, ReshardingInfo] = {}
 
         for key, item in checkpoint_info.checkpoint_items.items():
-            logger.info(
-                f"Loading {key} checkpoint with resharder.",
-                extra=event_logger(EventType.LOG_METRIC),
-            )
             resharder = item.resharder
             assert resharder is not None  # API contract guarantees this
 
@@ -494,28 +502,40 @@ class CheckpointReader:
                 logger.warning(f"Missing metadata for item {key}, skipping resharding")
                 continue
 
-            # Load and reshard checkpoint data using per-path API
-            unhandled_nested_paths = resharder.load(
-                source_path=Path(path),
+            resharding_info = resharder.generate_load_plans(
                 item_key=key,
+                target=result_dict[key],
                 target_metadata=target_item_metadata,
                 source_metadata=source_item_metadata,
-                target=result_dict[key],
+            )
+            planned_items[key] = resharding_info
+            unhandled_paths.extend(
+                CheckpointPath(key, nested_path)
+                for nested_path in resharding_info.non_reshardable_paths
+            )
+
+        logger.info(
+            f"Planned resharded loads of {list(planned_items)}.",
+            extra=event_logger(
+                EventType.LOG_METRIC,
+                metric_name="train.checkpoint_read.execute.plan.latency_ms",
+            ),
+        )
+        self._load_plan_executor.execute(
+            planned_items,
+            LoadExecutionContext(
+                checkpoint_path=Path(path),
                 storage=self._storage,
-            )
-
-            # Convert NestedPath to CheckpointPath for reporting
-            for nested_path in unhandled_nested_paths:
-                unhandled_paths.append(CheckpointPath(key, nested_path))
-
-            logger.info(
-                f"Done Loading {key} checkpoint with resharder.",
-                extra=event_logger(
-                    EventType.LOG_METRIC,
-                    metric_name=f"train.checkpoint_read.execute.filesystem.{key}.read.latency_ms",
-                ),
-            )
-
+                source_metadata={key: source_metadata[key] for key in planned_items},
+            ),
+        )
+        logger.info(
+            f"Read resharded loads of {list(planned_items)}.",
+            extra=event_logger(
+                EventType.LOG_METRIC,
+                metric_name="train.checkpoint_read.execute.load_plan_executor.latency_ms",
+            ),
+        )
         return result_dict, unhandled_paths
 
     def _load_full_file(

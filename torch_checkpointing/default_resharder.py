@@ -8,7 +8,7 @@
 DTensor resharding for checkpoint loading across different distributed configurations.
 
 This module provides a Resharder implementation that uses DTensor's native placement APIs
-to compute shard geometry and perform resharding.
+to compute shard geometry and plan resharding.
 
 The core algorithm:
 1. For each target nested path, compute the target rank's local shape and global offset
@@ -21,7 +21,6 @@ The core algorithm:
 
 import functools
 import logging
-from pathlib import Path
 from typing import Any
 
 import torch
@@ -37,10 +36,6 @@ from torch.distributed.tensor.placement_types import (
 from typing_extensions import override
 
 from .checkpoint_layout import SafetensorsSerialization
-from .default_load_plan_executor import (
-    DefaultLoadPlanExecutor,
-    ReshardingReadStrategy,
-)
 from .distributed_metadata import (
     DistributedItemMetadata,
     ShardingMetadata,
@@ -53,7 +48,6 @@ from .dtensor_metadata import (
     ShardSpec,
     StridedShardSpec,
 )
-from .load_plan_executor import LoadExecutionContext
 from .resharding import (
     LoadPlan,
     Resharder,
@@ -64,13 +58,12 @@ from .resharding_utils import (
     deduplicate_source_chunks,
     get_fqn_from_nested_path,
 )
-from .storage.base_storage import Storage
 from .types import CheckpointPath, NestedPath
 from .walk_utils import walk_checkpoint_structure
 
 logger: logging.Logger = logging.getLogger(__name__)
 
-__all__ = ["DefaultResharder", "ReshardingReadStrategy"]
+__all__ = ["DefaultResharder"]
 
 
 @functools.lru_cache(maxsize=None)
@@ -206,27 +199,10 @@ def _global_to_local_slice(
 class DefaultResharder(Resharder):
     """Resharder for DTensor checkpoints.
 
-    Uses DTensor's native placement APIs to compute shard geometry and perform
+    Uses DTensor's native placement APIs to compute shard geometry and plan
     resharding during checkpoint loading. Supports transitions between different
     Shard/Replicate placements and device mesh configurations.
-
-    Args:
-        read_strategy: Passed to the ``DefaultLoadPlanExecutor`` that ``load``
-            executes plans with.
-        file_read_workers: Passed to the ``DefaultLoadPlanExecutor`` that
-            ``load`` executes plans with.
     """
-
-    def __init__(
-        self,
-        *,
-        read_strategy: ReshardingReadStrategy = ReshardingReadStrategy.AUTO,
-        file_read_workers: int | None = None,
-    ) -> None:
-        self._executor = DefaultLoadPlanExecutor(
-            read_strategy=read_strategy,
-            file_read_workers=file_read_workers,
-        )
 
     @override
     def extract_sharding_metadata(
@@ -294,45 +270,6 @@ class DefaultResharder(Resharder):
         return super().should_reshard(source_metadata, target_metadata)
 
     @override
-    def load(
-        self,
-        source_path: Path,
-        item_key: str,
-        target_metadata: dict[NestedPath, ShardingMetadata],
-        source_metadata: DistributedItemMetadata,
-        target: Any,
-        storage: Storage,
-    ) -> list[NestedPath]:
-        """Load and reshard checkpoint data into target.
-
-        Orchestrates the full resharding pipeline:
-        1. Generate load plans, bound to the target tensors they fill.
-        2. Execute load plans to read source files and copy data into target.
-
-        Args:
-            source_path: Base path to the source checkpoint directory.
-            item_key: The checkpoint item key being loaded (e.g., "model").
-            target_metadata: This rank's target sharding from extract_sharding_metadata.
-            source_metadata: Source checkpoint's distributed metadata for this item.
-            target: Target object to load data into (modified in-place).
-            storage: Storage backend for reading checkpoint files.
-
-        Returns:
-            List of NestedPaths that could not be resharded.
-        """
-        resharding_info = self.generate_load_plans(
-            item_key, target, target_metadata, source_metadata
-        )
-        self._executor.execute(
-            {item_key: resharding_info},
-            LoadExecutionContext(
-                checkpoint_path=source_path,
-                storage=storage,
-                source_metadata={item_key: source_metadata},
-            ),
-        )
-        return resharding_info.non_reshardable_paths
-
     def generate_load_plans(
         self,
         item_key: str,
