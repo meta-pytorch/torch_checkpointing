@@ -36,7 +36,7 @@ resharders see [./key_concepts.md](./key_concepts.md).
 | Store already-serialized bytes | `ItemSpec(layout=LayoutInfo(..., RawSerialization()))` |
 | Store tensors in safetensors format | `ItemSpec(layout=LayoutInfo(..., SafetensorsSerialization()))` |
 | Resume on a different mesh / world size (DTensor) | `ItemSpec(resharder=DefaultResharder())` |
-| Reshard non-DTensor sharded state | `ItemSpec(resharder=MyCustomResharder())` |
+| Reshard tensors sharded by another annotation system | `ItemSpec(resharder=MyCustomResharder())` |
 | Require an item to be present (fail fast if missing) | `ItemSpec(required=True)` (default) |
 | Make an un-listed key raise instead of using defaults | `Config(default=None)` |
 
@@ -107,9 +107,10 @@ different parallelization layout than the one it was saved with (for example,
 resuming on a different device mesh or with different sharding). Items with no
 resharder are read back directly.
 
-The built-in `DefaultResharder` handles DTensor state. For state that is not a
-plain DTensor (such as dataloader progress) you attach your own `Resharder`
-subclass. See [Resharders](#resharders) below. When an item declares a resharder,
+The built-in `DefaultResharder` handles DTensor state. For tensors sharded by
+another annotation system you attach your own `Resharder` subclass. A resharder
+moves tensor data only; other state, such as dataloader progress, is read back
+directly by each rank. See [Resharders](#resharders) below. When an item declares a resharder,
 the manager auto-wires the sharding-metadata pipeline on both save and load — you
 do not set up any metadata plumbing yourself.
 
@@ -335,9 +336,12 @@ this rank's target layout. Items with no resharder are read back directly.
   Shard/Replicate placements, StridedShard layouts, and device mesh
   configurations. Disjoint rank-local layouts are represented as multiple
   contiguous load-plan slices. It takes no constructor arguments.
-- **Custom `Resharder`** — for state that is not a plain DTensor (for example,
-  dataloader progress), subclass `Resharder` and implement its two abstract
-  methods, `extract_sharding_metadata()` and `load()`.
+- **Custom `Resharder`** — for tensors sharded by another annotation system,
+  subclass `Resharder` and implement its two abstract methods,
+  `extract_sharding_metadata()` and `generate_load_plans()`. A resharder plans
+  copies of saved tensor chunks into local tensors, so it cannot reshard
+  non-tensor state such as dataloader progress. See
+  [Writing a custom `Resharder`](./distributed_and_resharding.md#6-writing-a-custom-resharder).
 
 You attach a resharder through the item's `ItemSpec`:
 
@@ -370,50 +374,14 @@ Putting it together with the state a training job usually checkpoints — `model
 `Config.items`, then pass plain payloads to `save()` and `load()`. Model and
 optimizer are DTensor tensor state: copied during staging (`requires_copy=True`)
 and resharded with the built-in `DefaultResharder`. The dataloader is an unmutated
-snapshot, so it skips the staging copy (`requires_copy=False`) and uses a custom
-`MyCustomDataloaderResharder`. `misc_state` is small per-rank bookkeeping,
-written as human-readable JSON.
+per-rank snapshot, so it skips the staging copy (`requires_copy=False`) and has
+no resharder: each rank reads back its own. `misc_state` is small per-rank
+bookkeeping, written as human-readable JSON.
 
 ```python
-from pathlib import Path
-from typing import Any
-
 from torch_checkpointing import CheckpointManager, ItemSpec
 from torch_checkpointing.checkpoint_layout import JsonSerialization, LayoutInfo
 from torch_checkpointing.default_resharder import DefaultResharder
-from torch_checkpointing.distributed_metadata import (
-    DistributedItemMetadata,
-    ShardingMetadata,
-)
-from torch_checkpointing.resharding import Resharder
-from torch_checkpointing.storage.base_storage import Storage
-from torch_checkpointing.types import NestedPath
-
-
-class MyCustomDataloaderResharder(Resharder):
-    """A resharder for non-DTensor dataloader progress state.
-
-    Implement the two abstract methods to describe how the item's sharded
-    objects map from the saved layout onto this rank's target layout.
-    """
-
-    def extract_sharding_metadata(
-        self,
-        item_key: str,
-        item_value: Any,
-    ) -> dict[NestedPath, ShardingMetadata]:
-        ...
-
-    def load(
-        self,
-        source_path: Path,
-        item_key: str,
-        target_metadata: dict[NestedPath, ShardingMetadata],
-        source_metadata: DistributedItemMetadata,
-        target: Any,
-        storage: Storage,
-    ) -> list[NestedPath]:
-        ...
 
 
 # Declare the per-item specs once. The manager auto-wires the sharding-metadata
@@ -432,12 +400,9 @@ manager = CheckpointManager(CheckpointManager.Config(
             requires_copy=True,
             resharder=DefaultResharder(),
         ),
-        # dataloader: not a plain DTensor, so a custom resharder. An unmutated
-        # snapshot, so skip the staging copy.
-        "dataloader": ItemSpec(
-            requires_copy=False,
-            resharder=MyCustomDataloaderResharder(),
-        ),
+        # dataloader: per-rank progress, not tensor state, so no resharder; each
+        # rank reads back its own. An unmutated snapshot, so skip the staging copy.
+        "dataloader": ItemSpec(requires_copy=False),
         # misc_state: small per-rank bookkeeping (step, config, RNG). No copy or
         # resharder, and kept human-readable in a rank-specific JSON file.
         "misc_state": ItemSpec(
@@ -478,11 +443,10 @@ With no explicit `layout`, `model`, `optimizer`, and `dataloader` are each writt
 as one per-rank `torch.save` file (`model_0.pt`, `optimizer_0.pt`, and
 `dataloader_0.pt` on rank 0), and each rank writes its own
 `misc_state_<rank>.json`. On load, the model and optimizer are resharded onto the
-current mesh, the dataloader state is resharded by your custom `Resharder`, and
-each rank directly reads its own `misc_state` copy. Tensors in the `into=`
-templates are copied in place (identity preserved), so the model does not need
-a second `load_state_dict()` call; the returned mapping lets you read scalars
-back and re-apply object-owned state.
+current mesh, and each rank directly reads its own `dataloader` and `misc_state`
+copies. Tensors in the `into=` templates are copied in place (identity
+preserved), so the model does not need a second `load_state_dict()` call; the
+returned mapping lets you read scalars back and re-apply object-owned state.
 
 ## See also
 

@@ -432,9 +432,11 @@ The reader inspects each item's `resharder`. If **no** item has a resharder, or
 directly. Otherwise it loads the source `DistributedMetadata`, pivots it into
 per-source-rank layout mappings, and — per item — calls
 `Resharder.should_reshard(source_item_metadata, target_metadata)` to split items
-into those that need resharding (routed through `_read_with_resharding`, which
-delegates to each item's `Resharder.load`) and those that do not (routed through
-`_read_without_resharding`).
+into those that need resharding and those that do not (routed through
+`_read_without_resharding`). For the items that reshard, `_read_with_resharding`
+asks each item's `Resharder.generate_load_plans` for its load plans, bound to the
+target tensors they fill, and then passes every item's plans to the reader's
+`LoadPlanExecutor` in a single `execute` call, which performs the reads.
 
 ### Dispatch on serialization format
 

@@ -21,10 +21,20 @@ Implement a backend when you want checkpoints on something other than a local fi
 Implement a resharder when a checkpoint saved under one parallelism layout must load into another (different world size, mesh, or placement).
 
 - **Interface:** `Resharder` (`torch_checkpointing.resharding`).
-- **Implement:** `extract_sharding_metadata(item_key, item_value)` and `load(...)`; optionally override `should_reshard(...)` and the `skip_resharding` property.
+- **Implement:** `extract_sharding_metadata(item_key, item_value)` and `generate_load_plans(...)`, which plans what to read without reading it; optionally override `resolve_targets(...)`, `should_reshard(...)` and the `skip_resharding` property.
 - **Built-in:** `DefaultResharder` (`.default_resharder`) — handles `DTensor` mesh/placement changes.
 - **Wire it in:** attach it per item via `ItemSpec(resharder=YourResharder())` in `CheckpointManager.Config(items={...})`. That is the whole contract: the manager **auto-wires** the sharding-metadata pipeline on both save and load — recording the source layout on save and computing the target layout on load — so a declared resharder actually runs. (Under the hood this is a `MetadataManager`; see the next section.)
 - **Deep dive:** [Distributed and resharding](./distributed_and_resharding.md).
+
+## Load plan executors — change how resharded data is read
+
+Resharders decide *what* to load; an executor decides *how*: which files are read when, with what concurrency, and how the planned chunks reach their targets. Implement one to prefetch, or to schedule and combine reads across items, for every resharder at once.
+
+- **Interface:** `LoadPlanExecutor` (`torch_checkpointing.load_plan_executor`).
+- **Implement:** `execute(items, context)`, which fills the bound target tensors of every resharded item in one call.
+- **Built-in:** `DefaultLoadPlanExecutor` (`.default_load_plan_executor`) — offset or full-file reads, files read concurrently within each item, items loaded in order.
+- **Wire it in:** `CheckpointManager.Config(load=CheckpointLoaderConfig(load_plan_executor=YourExecutor()))`. One executor serves the whole load; it is not set per item.
+- **Deep dive:** [Distributed and resharding](./distributed_and_resharding.md#7-customizing-how-plans-are-read-loadplanexecutor).
 
 ## Metadata managers — customize cross-rank metadata aggregation
 

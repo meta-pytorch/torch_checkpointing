@@ -42,7 +42,10 @@ to the selected serialization format.
 | `RawSerialization` | `.checkpoint_layout` | Raw bytes. |
 | `SafetensorsSerialization` | `.checkpoint_layout` | safetensors format for tensors. |
 | `DefaultResharder` | `.default_resharder` | Built-in resharder for `DTensor` state. |
-| `Resharder` | `.resharding` | Base class for custom resharding. |
+| `Resharder` | `.resharding` | Base class for custom resharding: plans what to load. |
+| `LoadPlan`, `ReshardingInfo` | `.resharding` | A planned chunk copy; one item's load plans, bound to the tensors they fill. |
+| `LoadPlanExecutor`, `LoadExecutionContext` | `.load_plan_executor` | Base class for custom load execution: reads what was planned. |
+| `DefaultLoadPlanExecutor`, `ReshardingReadStrategy` | `.default_load_plan_executor` | Built-in executor and its read strategies. |
 
 ## Lower-level savers & loaders (advanced)
 
@@ -55,7 +58,7 @@ than the manager exposes (for example, driving a load-only eval job by hand).
 | `make_async_checkpoint_saver(...)`, `make_sync_checkpoint_saver(...)` | `.builder` | Build a saver directly (auto-detects rank). |
 | `AsyncCheckpointSaver`, `SyncCheckpointSaver`, `CheckpointSaver` | `.checkpoint_saver` | Saver classes returned by the factories. |
 | `CheckpointSaverConfig`, `AsyncCheckpointSaverConfig`, `SyncCheckpointSaverConfig` | `.config` | Save-side manager configuration, including `wait_timeout_secs`. |
-| `CheckpointLoaderConfig` | `.config` | Load-side manager configuration (`use_mmap`). |
+| `CheckpointLoaderConfig` | `.config` | Load-side manager configuration (`use_mmap`, `load_plan_executor`). |
 | `CheckpointStager`, `DefaultStager`, `CheckpointStagerConfig` | `.staging` | Async staging. |
 | `CheckpointReader` | `.checkpoint_reader` | Reads bytes from storage into a state dict. |
 | `CheckpointLoader` | `.checkpoint_loader` | Wraps a reader and applies a `load_state_dict`. |

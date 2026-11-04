@@ -593,25 +593,26 @@ slices and emits one `LoadPlan` for each overlapping source and target region.
 This preserves disjoint layouts such as a packed local tensor whose elements map
 to nonadjacent global indices.
 
-Its `load` computes, for the current rank's target shard, which source ranks'
-shards overlap it, generates `LoadPlan`s for each overlapping chunk, reads the
-relevant source files, and copies the intersecting slices into the target
-tensor:
+Its `generate_load_plans` computes, for the current rank's target shard, which
+source ranks' shards overlap it, and emits a `LoadPlan` for each overlapping
+chunk. It reads no data:
 
 ```python
-def load(
+def generate_load_plans(
     self,
-    source_path: Path,
     item_key: str,
+    target: Any,
     target_metadata: dict[NestedPath, ShardingMetadata],
     source_metadata: DistributedItemMetadata,
-    target: Any,
-    storage: Storage,
-) -> list[NestedPath]:
+) -> ReshardingInfo:
 ```
 
-It returns the list of `NestedPath`s that could not be resharded (for example a
-target path whose source metadata is missing, or a non-DTensor target).
+The returned `ReshardingInfo` binds each planned path to the local tensor its
+plans write into (`nested_path_to_target_tensors`; a `DTensor`'s local shard), and lists the
+`NestedPath`s that could not be resharded (for example a target path whose source
+metadata is missing, or a non-DTensor target). The reader then hands the plans of
+every resharded item to its load executor, which reads the source files and
+copies the planned chunks (§7).
 
 ### The direct-read fast path vs. `should_reshard`
 
@@ -629,8 +630,10 @@ provably identical between save and load, to avoid the metadata-loading overhead
 ## 6. Writing a custom `Resharder`
 
 To support a sharding scheme beyond DTensor, subclass `Resharder`
-(`torch_checkpointing/resharding.py`). Two methods are abstract; two are
-optional overrides.
+(`torch_checkpointing/resharding.py`). A resharder decides *what* to load: it
+plans which chunks of which saved tensors fill each target tensor, and never
+reads checkpoint data itself. The load executor (§7) does the reading, the same
+way for every resharder. Two methods are abstract; three are optional overrides.
 
 ### Required: `extract_sharding_metadata`
 
@@ -650,26 +653,55 @@ holds no sharded objects. Your `ShardingMetadata` subclass must implement
 `to_dict` / `from_dict` (it auto-registers by type name for polymorphic
 deserialization) and the `equivalent_ranks` property.
 
-### Required: `load`
+### Required: `generate_load_plans`
 
 ```python
 @abc.abstractmethod
-def load(
+def generate_load_plans(
     self,
-    source_path: Path,
     item_key: str,
+    target: Any,
     target_metadata: dict[NestedPath, ShardingMetadata],
     source_metadata: DistributedItemMetadata,
-    target: Any,
-    storage: Storage,
-) -> list[NestedPath]:
+) -> ReshardingInfo:
     ...
 ```
 
-Read from the source checkpoint and populate `target` in place, returning any
-`NestedPath`s you could not reshard. Use
-`source_metadata.get_file_path(rank, source_path, item_key)` to locate a source
-rank's file and `storage` to read it.
+Return a `ReshardingInfo` with:
+
+- `nested_path_to_load_plans` — for each target path, the `LoadPlan`s that fill
+  it. A plan copies the chunk at `src_offsets`/`src_sizes` of tensor `src_fqn` in
+  source `src_rank`'s file into the chunk at `offsets`/`sizes` of the target.
+- `nested_path_to_target_tensors` — the tensor each planned path writes into, normally all of
+  `resolve_targets`. Every planned path needs one (construction rejects a plan
+  without one); paths without plans may have one and are not written.
+- `non_reshardable_paths` — the paths you could not plan.
+
+Do not read checkpoint data or modify `target` here.
+
+### Optional: `resolve_targets`
+
+```python
+def resolve_targets(
+    self,
+    item_key: str,
+    target: Any,
+) -> dict[NestedPath, torch.Tensor]:
+```
+
+Return the local tensor that each tensor leaf of `target` loads into. The default
+returns every tensor leaf, with each `DTensor` replaced by its local shard.
+Override it when your annotation system wraps local tensors in its own type. The
+returned tensors must follow these rules:
+
+- **Share storage with the live target.** Return the tensor itself or a view of
+  it, never a copy: no `clone()`, no `contiguous()`, no `reshape` that copies.
+  Views need not be contiguous: narrowed, transposed, and strided views are fine.
+- **Plan in the returned tensor's coordinates.** `LoadPlan.offsets` and `sizes`
+  index the returned tensor's own shape, not the shape of the tensor it views.
+  Writing through a transposed view does not need `transpose_dims`.
+- **Stay put until the load finishes.** Do not resize, replace, or write the
+  targets between planning and the end of the load.
 
 ### Optional: `should_reshard`
 
@@ -700,6 +732,87 @@ altogether (identical save/load configuration on retry).
 
 ---
 
+## 7. Customizing how plans are read: `LoadPlanExecutor`
+
+A load executor decides *how* planned data is read: which files are open at once,
+in what order, and how the planned chunks reach their targets. It is separate
+from the resharders, which decide *what* to read, so one executor serves every
+annotation system. Replace it to prefetch, or to schedule and combine reads
+across items, without touching any resharder.
+
+The reader owns one executor, which loads every resharded item. It first plans
+all of them, then makes a single call:
+
+```python
+class LoadPlanExecutor(abc.ABC):
+    @abc.abstractmethod
+    def execute(
+        self,
+        items: Mapping[str, ReshardingInfo],
+        context: LoadExecutionContext,
+    ) -> None:
+        ...
+```
+
+`items` maps each item key to its bound plans, in load order. `context` carries
+the checkpoint directory, the storage backend, and each item's source metadata;
+`context.source_metadata[item_key].get_layout_info(src_rank, item_key)` locates
+the file a plan reads. An executor must:
+
+- Return only when no work it started can still write a target: CPU targets
+  filled, accelerator copies queued on the caller's current stream.
+- Raise on failure. Targets may then be partly written.
+- Treat `items` as read-only. Different items may share storage, so it may write
+  two items concurrently only if their targets are disjoint.
+
+Items that are read directly, without resharding, never reach the executor, and
+the reader does not call it at all when nothing reshards on this rank. Ranks can
+therefore differ in whether they call `execute`, so an executor must not rely on
+every rank calling it, for example to run collectives.
+
+### The built-in `DefaultLoadPlanExecutor`
+
+`DefaultLoadPlanExecutor` (`torch_checkpointing/default_load_plan_executor.py`)
+loads items one at a time, in order, reading each item's source files
+concurrently. It reads only the bytes each plan needs where the file format
+allows it, and otherwise reads whole files, one at a time to bound memory:
+
+```python
+DefaultLoadPlanExecutor(
+    read_strategy=ReshardingReadStrategy.AUTO,  # or OFFSET, FULL_FILE
+    file_read_workers=None,  # files read concurrently; None splits a per-host default
+)
+```
+
+It runs plain copies only: `transpose_dims` must be empty or the identity (a
+permutation raises `NotImplementedError`), source and target chunks must have
+the same shape, and targets must be local strided tensors. It checks every plan
+of every item before it reads any file.
+
+### Wiring an executor in
+
+Through `CheckpointManager`, set it on the load configuration:
+
+```python
+from torch_checkpointing import CheckpointManager, ItemSpec
+from torch_checkpointing.config import CheckpointLoaderConfig
+from torch_checkpointing.default_load_plan_executor import DefaultLoadPlanExecutor
+from torch_checkpointing.default_resharder import DefaultResharder
+
+manager = CheckpointManager(CheckpointManager.Config(
+    items={"model": ItemSpec(resharder=DefaultResharder())},
+    load=CheckpointLoaderConfig(
+        load_plan_executor=DefaultLoadPlanExecutor(file_read_workers=4),
+    ),
+))
+```
+
+When driving the reader directly, pass it as
+`CheckpointReader(..., load_plan_executor=...)`. Either way the default is a
+`DefaultLoadPlanExecutor()`.
+
+---
+
 ## Summary
 
 | Concern | Class / knob | File |
@@ -712,8 +825,11 @@ altogether (identical save/load configuration on retry).
 | Write hooks | `pre_write_callback`, `pre_finalize_callback`, `finalize_callback` | `builder.py`, `checkpoint_writer.py` |
 | Metadata pipeline | `MetadataManager`, `DefaultMetadataManager` | `metadata_manager.py` |
 | Metadata payload | `CheckpointMetadata`, `DistributedMetadata`, `DistributedItemMetadata` | `distributed_metadata.py` |
-| Resharding interface | `Resharder` | `resharding.py` |
+| Resharding (planning) interface | `Resharder`, `LoadPlan`, `ReshardingInfo` | `resharding.py` |
 | Built-in DTensor resharder | `DefaultResharder`, `DTensorShardingMetadata` | `default_resharder.py`, `dtensor_metadata.py` |
+| Load execution interface | `LoadPlanExecutor`, `LoadExecutionContext` | `load_plan_executor.py` |
+| Built-in executor | `DefaultLoadPlanExecutor`, `ReshardingReadStrategy` | `default_load_plan_executor.py` |
+| Executor wiring | `CheckpointLoaderConfig(load_plan_executor=...)`, `CheckpointReader(load_plan_executor=...)` | `config.py`, `checkpoint_reader.py` |
 | Loader wiring | `CheckpointLoader(reader, metadata_manager)` | `checkpoint_loader.py` |
 
 Through `CheckpointManager` resharding is a single declaration: give an item's
