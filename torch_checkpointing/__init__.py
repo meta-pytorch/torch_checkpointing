@@ -55,6 +55,7 @@ from .dtensor_metadata import (
     ShardSpec,
     StridedShardSpec,
 )
+from .load_plan_executor import LoadExecutionContext, LoadPlanExecutor
 from .metadata_manager import DefaultMetadataManager, MetadataManager
 from .resharding import LoadPlan, Resharder, ReshardingInfo
 from .schema import ItemSpec

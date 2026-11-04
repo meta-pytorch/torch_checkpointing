@@ -15,7 +15,7 @@ import torch.distributed as dist
 from safetensors.torch import save_file
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 from torch.distributed.tensor import distribute_tensor, Replicate
-from torch_checkpointing import default_resharder as _dr
+from torch_checkpointing import default_load_plan_executor as _executor
 from torch_checkpointing.checkpoint_layout import (
     LayoutInfo,
     SafetensorsSerialization,
@@ -572,9 +572,9 @@ def test_hf_resharder_reads_only_target_shard_range(tmp_path: Path) -> None:
             return_value=1,
         ),
         patch.object(
-            _dr,
+            _executor,
             "_read_exact",
-            wraps=_dr._read_exact,
+            wraps=_executor._read_exact,
         ) as read_exact,
     ):
         missing = resharder.load(
