@@ -31,13 +31,15 @@ from .checkpoint_manager import CheckpointManager
 from .checkpoint_reader import CheckpointReader
 from .checkpoint_saver import AsyncCheckpointSaver, CheckpointSaver, SyncCheckpointSaver
 from .checkpoint_writer import CheckpointWriter, CheckpointWriterConfig
+from .checkpointable_tensor_metadata import (  # noqa: F401
+    CheckpointableTensorShardingMetadata,
+)
 from .config import (
     AsyncCheckpointSaverConfig,
     CheckpointLoaderConfig,
     CheckpointSaverConfig,
     SyncCheckpointSaverConfig,
 )
-from .default_metadata import DefaultShardingMetadata  # noqa: F401
 from .distributed_metadata import (
     CheckpointMetadata,
     DistributedItemMetadata,

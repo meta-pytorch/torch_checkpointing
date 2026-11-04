@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Sharding metadata for tensors that expose checkpoint shard geometry."""
+"""Sharding metadata for local tensors with ``CheckpointableTensor`` annotations."""
 
 from __future__ import annotations
 
@@ -18,8 +18,14 @@ from .distributed_metadata import ShardingMetadata
 
 
 @dataclass(frozen=True)
-class DefaultShardingMetadata(ShardingMetadata, type_name="default_tensor_v1"):
-    """Shard geometry for a local tensor within a logical global tensor."""
+class CheckpointableTensorShardingMetadata(
+    ShardingMetadata, type_name="checkpointable_tensor_v1"
+):
+    """Metadata representing a local tensor with ``CheckpointableTensor`` annotations.
+
+    The annotations place one or more shards of the local tensor within a logical
+    global tensor; see ``CheckpointableTensor`` for the meaning of each field.
+    """
 
     global_shape: tuple[int, ...]
     global_offsets: tuple[tuple[int, ...], ...]
@@ -134,13 +140,15 @@ class DefaultShardingMetadata(ShardingMetadata, type_name="default_tensor_v1"):
                 raise ValueError(f"Shard {shard_index} extends beyond the local tensor")
 
     @classmethod
-    def from_tensor(cls, tensor: torch.Tensor) -> "DefaultShardingMetadata":
+    def from_tensor(
+        cls, tensor: torch.Tensor
+    ) -> "CheckpointableTensorShardingMetadata":
         """Create metadata from a tensor implementing ``CheckpointableTensor``."""
         if not isinstance(tensor, torch.Tensor) or not isinstance(
             tensor, CheckpointableTensor
         ):
             raise TypeError(
-                "DefaultShardingMetadata.from_tensor requires a torch.Tensor "
+                "CheckpointableTensorShardingMetadata.from_tensor requires a torch.Tensor "
                 "implementing CheckpointableTensor"
             )
 
@@ -165,7 +173,7 @@ class DefaultShardingMetadata(ShardingMetadata, type_name="default_tensor_v1"):
         }
 
     @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> "DefaultShardingMetadata":
+    def from_dict(cls, d: dict[str, Any]) -> "CheckpointableTensorShardingMetadata":
         """Create metadata from a serialized dictionary."""
         return cls(
             global_shape=d["global_shape"],
@@ -177,5 +185,5 @@ class DefaultShardingMetadata(ShardingMetadata, type_name="default_tensor_v1"):
 
     @property
     def equivalent_ranks(self) -> tuple[int, ...] | None:
-        """Default metadata is rank-specific and cannot be compacted by rank."""
+        """Annotations are rank-specific, so this metadata cannot be compacted by rank."""
         return None
