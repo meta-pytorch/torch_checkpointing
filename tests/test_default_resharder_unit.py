@@ -10,6 +10,7 @@ import subprocess
 import sys
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
@@ -42,10 +43,11 @@ from torch_checkpointing.dtensor_metadata import (
     ReplicateSpec,
     ShardSpec,
 )
-from torch_checkpointing.resharding import LoadPlan
+from torch_checkpointing.resharding import LoadPlan, ReshardingInfo
 from torch_checkpointing.safetensors_metadata import SafetensorsFileMetadata
 from torch_checkpointing.storage.base_storage import ReadArgs
 from torch_checkpointing.storage.filesystem import LocalFileSystemStorageConfig
+from torch_checkpointing.types import NestedPath
 
 
 def test_import_does_not_require_safetensors() -> None:
@@ -201,6 +203,34 @@ def _load_second_half(
     return target_tensor, storage
 
 
+def _execute_load_plans(
+    load_plans: dict[NestedPath, list[LoadPlan]],
+    target: dict[str, torch.Tensor],
+    source_layouts: dict[int, LayoutInfo],
+    storage: Any,
+    *,
+    source_path: str | Path = ".",
+    **resharder_options: Any,
+) -> None:
+    """Read ``load_plans`` into the tensors of ``target`` from ``source_layouts``."""
+    DefaultResharder(**resharder_options)._execute_load_plans(
+        source_path=Path(source_path),
+        source_metadata=DistributedItemMetadata(
+            nested_path_to_metadata={},
+            rank_to_layout_info=dict(source_layouts),
+        ),
+        item_key="model",
+        resharding_info=ReshardingInfo(
+            nested_path_to_load_plans=load_plans,
+            non_reshardable_paths=[],
+            nested_path_to_target_tensors={
+                (name,): tensor for name, tensor in target.items()
+            },
+        ),
+        storage=storage,
+    )
+
+
 def _source_load_plan(
     src_offsets: tuple[int, ...],
     src_sizes: tuple[int, ...],
@@ -351,8 +381,11 @@ def test_generate_load_plans_resolves_source_ranks_without_mesh_tensor(
         rank_to_layout_info=dict.fromkeys(range(4)),
     )
 
-    info = DefaultResharder()._generate_load_plans(
-        {("weight",): metadata(ReplicateSpec())}, source
+    info = DefaultResharder().generate_load_plans(
+        "model",
+        {"weight": torch.zeros(8, 8)},
+        {("weight",): metadata(ReplicateSpec())},
+        source,
     )
 
     assert info.non_reshardable_paths == []
@@ -370,6 +403,115 @@ def test_generate_load_plans_resolves_source_ranks_without_mesh_tensor(
         )
         for rank in range(4)
     ]
+
+
+def _replicated(shape: tuple[int, ...]) -> DTensorShardingMetadata:
+    return DTensorShardingMetadata(
+        global_shape=shape,
+        dtype="torch.float32",
+        stride=torch.empty(shape).stride(),
+        mesh_spec=DeviceMeshSpec(device_type="cpu", mesh_shape=(1,), mesh_data=(0,)),
+        placements=(ReplicateSpec(),),
+    )
+
+
+def test_generate_load_plans_binds_planned_paths_to_their_target_tensors() -> None:
+    weight = torch.zeros(8, 8)
+    target = {"weight": weight, "unsaved": torch.zeros(2), "step": 3}
+    source = DistributedItemMetadata(
+        nested_path_to_metadata={
+            ("weight",): [
+                GlobalObjectMetadata(sharding_metadata=_replicated((8, 8)), ranks=(0,))
+            ]
+        },
+        rank_to_layout_info={0: None},
+    )
+
+    info = DefaultResharder().generate_load_plans(
+        "model",
+        target,
+        {("weight",): _replicated((8, 8)), ("unsaved",): _replicated((2,))},
+        source,
+    )
+
+    assert info.nested_path_to_load_plans.keys() == {("weight",)}
+    assert info.non_reshardable_paths == [("unsaved",)]
+    assert info.nested_path_to_target_tensors[("weight",)] is weight
+
+
+@dataclass
+class _ColumnSlice:
+    """A target leaf that loads into a range of columns of a wider tensor."""
+
+    backing: torch.Tensor
+    columns: slice
+
+
+class _ColumnSliceResharder(DefaultResharder):
+    def resolve_targets(
+        self, item_key: str, target: Any
+    ) -> dict[NestedPath, torch.Tensor]:
+        return {(name,): leaf.backing[:, leaf.columns] for name, leaf in target.items()}
+
+
+def test_load_writes_through_a_non_contiguous_target_view(tmp_path: Path) -> None:
+    source = torch.arange(8, dtype=torch.float32).reshape(4, 2)
+    torch.save({"weight": source}, tmp_path / "checkpoint.pt")
+    storage = LocalFileSystemStorageConfig(use_direct_io=False).create_storage()
+    backing = torch.full((4, 4), -1.0)
+    source_metadata = DistributedItemMetadata(
+        nested_path_to_metadata={
+            ("weight",): [
+                GlobalObjectMetadata(sharding_metadata=_replicated((4, 2)), ranks=(0,))
+            ]
+        },
+        rank_to_layout_info={0: LayoutInfo("checkpoint.pt", TorchSerialization())},
+    )
+
+    missing_paths = _ColumnSliceResharder().load(
+        source_path=tmp_path,
+        item_key="model",
+        target_metadata={("weight",): _replicated((4, 2))},
+        source_metadata=source_metadata,
+        target={"weight": _ColumnSlice(backing, slice(1, 3))},
+        storage=storage,
+    )
+
+    assert missing_paths == []
+    torch.testing.assert_close(backing[:, 1:3], source)
+    torch.testing.assert_close(backing[:, [0, 3]], torch.full((4, 2), -1.0))
+
+
+def test_load_fills_a_planned_target_that_an_unplanned_path_also_binds(
+    tmp_path: Path,
+) -> None:
+    source = torch.arange(4, dtype=torch.float32)
+    torch.save({"weight": source}, tmp_path / "checkpoint.pt")
+    tied = torch.zeros(4)
+    source_metadata = DistributedItemMetadata(
+        nested_path_to_metadata={
+            ("weight",): [
+                GlobalObjectMetadata(sharding_metadata=_replicated((4,)), ranks=(0,))
+            ]
+        },
+        rank_to_layout_info={0: LayoutInfo("checkpoint.pt", TorchSerialization())},
+    )
+
+    # "unsaved" binds the same tensor after "weight", but has no plans.
+    missing_paths = DefaultResharder().load(
+        source_path=tmp_path,
+        item_key="model",
+        target_metadata={
+            ("weight",): _replicated((4,)),
+            ("unsaved",): _replicated((4,)),
+        },
+        source_metadata=source_metadata,
+        target={"weight": tied, "unsaved": tied},
+        storage=LocalFileSystemStorageConfig(use_direct_io=False).create_storage(),
+    )
+
+    assert missing_paths == [("unsaved",)]
+    torch.testing.assert_close(tied, source)
 
 
 @pytest.mark.parametrize(
@@ -523,18 +665,12 @@ def test_full_file_strategy_loads_dotted_safetensors() -> None:
     )
 
     target = {fqn: torch.empty(4)}
-    DefaultResharder(
-        read_strategy=ReshardingReadStrategy.FULL_FILE
-    )._execute_load_plans(
-        source_path=Path("."),
-        source_metadata=DistributedItemMetadata(
-            nested_path_to_metadata={},
-            rank_to_layout_info={0: LayoutInfo(str(path), SafetensorsSerialization())},
-        ),
-        item_key="model",
-        nested_path_to_load_plans={(fqn,): [plan]},
-        target=target,
-        storage=storage,  # type: ignore[arg-type]
+    _execute_load_plans(
+        {(fqn,): [plan]},
+        target,
+        {0: LayoutInfo(str(path), SafetensorsSerialization())},
+        storage,
+        read_strategy=ReshardingReadStrategy.FULL_FILE,
     )
 
     torch.testing.assert_close(target[fqn], source[4:])
@@ -574,19 +710,11 @@ def test_auto_uses_offset_reads_for_safetensors(device: str) -> None:
     span_bytes = source.numel() * source.element_size()
     assert span_bytes < len(checkpoint_data) <= 2 * span_bytes
 
-    DefaultResharder()._execute_load_plans(
-        source_path=Path("."),
-        source_metadata=DistributedItemMetadata(
-            nested_path_to_metadata={},
-            rank_to_layout_info={0: LayoutInfo(str(path), SafetensorsSerialization())},
-        ),
-        item_key="model",
-        nested_path_to_load_plans={
-            ("first",): [plan],
-            ("second",): [plan],
-        },
-        target=target,
-        storage=storage,  # type: ignore[arg-type]
+    _execute_load_plans(
+        {("first",): [plan], ("second",): [plan]},
+        target,
+        {0: LayoutInfo(str(path), SafetensorsSerialization())},
+        storage,
     )
 
     torch.testing.assert_close(target["first"].cpu(), source)
@@ -798,13 +926,10 @@ def test_auto_falls_back_to_full_file_reads_per_unsupported_file(
         )
         for rank in range(3)
     ]
-    source_metadata = DistributedItemMetadata(
-        nested_path_to_metadata={},
-        rank_to_layout_info={
-            rank: LayoutInfo(str(path), TorchSerialization())
-            for rank, path in enumerate(paths)
-        },
-    )
+    source_layouts = {
+        rank: LayoutInfo(str(path), TorchSerialization())
+        for rank, path in enumerate(paths)
+    }
 
     with (
         caplog.at_level(logging.WARNING),
@@ -818,13 +943,12 @@ def test_auto_falls_back_to_full_file_reads_per_unsupported_file(
         ) as validate_archive,
     ):
         # One worker, so files are read in order.
-        DefaultResharder(file_read_workers=1)._execute_load_plans(
-            source_path=Path("."),
-            source_metadata=source_metadata,
-            item_key="model",
-            nested_path_to_load_plans={("selected",): load_plans},
-            target={"selected": target_tensor},
-            storage=storage,  # type: ignore[arg-type]
+        _execute_load_plans(
+            {("selected",): load_plans},
+            {"selected": target_tensor},
+            source_layouts,
+            storage,
+            file_read_workers=1,
         )
 
     torch.testing.assert_close(target_tensor, torch.arange(12, dtype=torch.float32))
@@ -875,21 +999,16 @@ def test_full_file_reads_run_one_at_a_time_on_the_calling_thread() -> None:
         for rank in range(len(paths))
     ]
 
-    DefaultResharder(
-        read_strategy=ReshardingReadStrategy.FULL_FILE, file_read_workers=len(paths)
-    )._execute_load_plans(
-        source_path=Path("."),
-        source_metadata=DistributedItemMetadata(
-            nested_path_to_metadata={},
-            rank_to_layout_info={
-                rank: LayoutInfo(str(path), TorchSerialization())
-                for rank, path in enumerate(paths)
-            },
-        ),
-        item_key="model",
-        nested_path_to_load_plans={("selected",): load_plans},
-        target={"selected": target_tensor},
-        storage=storage,  # type: ignore[arg-type]
+    _execute_load_plans(
+        {("selected",): load_plans},
+        {"selected": target_tensor},
+        {
+            rank: LayoutInfo(str(path), TorchSerialization())
+            for rank, path in enumerate(paths)
+        },
+        storage,
+        read_strategy=ReshardingReadStrategy.FULL_FILE,
+        file_read_workers=len(paths),
     )
 
     torch.testing.assert_close(
@@ -962,19 +1081,15 @@ def test_reads_source_files_concurrently() -> None:
     ]
 
     storage = _BarrierStorage(files)
-    DefaultResharder(file_read_workers=num_files)._execute_load_plans(
-        source_path=Path("."),
-        source_metadata=DistributedItemMetadata(
-            nested_path_to_metadata={},
-            rank_to_layout_info={
-                rank: LayoutInfo(str(path), SafetensorsSerialization())
-                for rank, path in enumerate(paths)
-            },
-        ),
-        item_key="model",
-        nested_path_to_load_plans={("weight",): load_plans},
-        target={"weight": target_tensor},
-        storage=storage,  # type: ignore[arg-type]
+    _execute_load_plans(
+        {("weight",): load_plans},
+        {"weight": target_tensor},
+        {
+            rank: LayoutInfo(str(path), SafetensorsSerialization())
+            for rank, path in enumerate(paths)
+        },
+        storage,
+        file_read_workers=num_files,
     )
 
     torch.testing.assert_close(
@@ -1051,19 +1166,16 @@ def test_concurrent_reads_of_many_tensors_fill_shared_targets(
     }
 
     with patch.object(storage, "stream_read", stream_read_once_all_are_open):
-        DefaultResharder(file_read_workers=num_files)._execute_load_plans(
+        _execute_load_plans(
+            load_plans,
+            target,
+            {
+                rank: LayoutInfo(name, SafetensorsSerialization())
+                for rank, name in enumerate(names)
+            },
+            storage,
             source_path=tmp_path,
-            source_metadata=DistributedItemMetadata(
-                nested_path_to_metadata={},
-                rank_to_layout_info={
-                    rank: LayoutInfo(name, SafetensorsSerialization())
-                    for rank, name in enumerate(names)
-                },
-            ),
-            item_key="model",
-            nested_path_to_load_plans=load_plans,
-            target=target,
-            storage=storage,
+            file_read_workers=num_files,
         )
 
     torch.testing.assert_close(
@@ -1094,18 +1206,11 @@ def test_copies_follow_pending_work_on_the_callers_stream() -> None:
     target = torch.empty_like(source, device="cuda")
 
     def load() -> None:
-        DefaultResharder()._execute_load_plans(
-            source_path=Path("."),
-            source_metadata=DistributedItemMetadata(
-                nested_path_to_metadata={},
-                rank_to_layout_info={
-                    0: LayoutInfo(str(path), SafetensorsSerialization())
-                },
-            ),
-            item_key="model",
-            nested_path_to_load_plans={("weight",): [plan]},
-            target={"weight": target},
-            storage=storage,  # type: ignore[arg-type]
+        _execute_load_plans(
+            {("weight",): [plan]},
+            {"weight": target},
+            {0: LayoutInfo(str(path), SafetensorsSerialization())},
+            storage,
         )
 
     # First kernel launches and first-time host allocations can synchronize the
@@ -1147,17 +1252,8 @@ def test_aliased_targets_load_once_from_the_last_path(device: str) -> None:
     }
     tied = torch.zeros(4, device=device)
     storage = _MultiFileTrackingStorage(files)
-    DefaultResharder(file_read_workers=2)._execute_load_plans(
-        source_path=Path("."),
-        source_metadata=DistributedItemMetadata(
-            nested_path_to_metadata={},
-            rank_to_layout_info={
-                rank: LayoutInfo(str(path), SafetensorsSerialization())
-                for rank, path in enumerate(paths)
-            },
-        ),
-        item_key="model",
-        nested_path_to_load_plans={
+    _execute_load_plans(
+        {
             (name,): [
                 LoadPlan(
                     offsets=(0,),
@@ -1170,8 +1266,13 @@ def test_aliased_targets_load_once_from_the_last_path(device: str) -> None:
             ]
             for rank, name in [(1, "first"), (0, "second")]
         },
-        target={"first": tied, "second": tied},
-        storage=storage,  # type: ignore[arg-type]
+        {"first": tied, "second": tied},
+        {
+            rank: LayoutInfo(str(path), SafetensorsSerialization())
+            for rank, path in enumerate(paths)
+        },
+        storage,
+        file_read_workers=2,
     )
 
     torch.testing.assert_close(tied.cpu(), torch.full((4,), 1.0))
@@ -1202,17 +1303,8 @@ def test_aliased_targets_disable_concurrent_reads() -> None:
     tied = torch.zeros(4)
     other = torch.zeros(4)
     storage = _SlowThreadRecordingStorage(files)
-    DefaultResharder(file_read_workers=3)._execute_load_plans(
-        source_path=Path("."),
-        source_metadata=DistributedItemMetadata(
-            nested_path_to_metadata={},
-            rank_to_layout_info={
-                rank: LayoutInfo(str(path), SafetensorsSerialization())
-                for rank, path in enumerate(paths)
-            },
-        ),
-        item_key="model",
-        nested_path_to_load_plans={
+    _execute_load_plans(
+        {
             (name,): [
                 LoadPlan(
                     offsets=(0,),
@@ -1225,8 +1317,13 @@ def test_aliased_targets_disable_concurrent_reads() -> None:
             ]
             for rank, name in [(1, "first"), (0, "second"), (2, "other")]
         },
-        target={"first": tied, "second": tied, "other": other},
-        storage=storage,  # type: ignore[arg-type]
+        {"first": tied, "second": tied, "other": other},
+        {
+            rank: LayoutInfo(str(path), SafetensorsSerialization())
+            for rank, path in enumerate(paths)
+        },
+        storage,
+        file_read_workers=3,
     )
 
     torch.testing.assert_close(tied, torch.full((4,), 1.0))

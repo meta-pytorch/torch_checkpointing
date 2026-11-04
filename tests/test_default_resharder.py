@@ -120,7 +120,9 @@ def test_generate_load_plans_skips_path_with_unsupported_source_metadata() -> No
         rank_to_layout_info={},
     )
 
-    resharding_info = DefaultResharder()._generate_load_plans(
+    resharding_info = DefaultResharder().generate_load_plans(
+        item_key="model",
+        target={"weight": torch.zeros(8, 8)},
         target_metadata={nested_path: dtensor_metadata},
         source_metadata=source_metadata,
     )
@@ -150,7 +152,9 @@ def test_generate_load_plans_marks_non_intersecting_target_shard_non_reshardable
     )
 
     with caplog.at_level(logging.WARNING):
-        resharding_info = DefaultResharder()._generate_load_plans(
+        resharding_info = DefaultResharder().generate_load_plans(
+            item_key="model",
+            target={"weight": torch.zeros(4, 8)},
             target_metadata={nested_path: dtensor_metadata},
             source_metadata=source_metadata,
         )

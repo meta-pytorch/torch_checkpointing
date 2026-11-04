@@ -13,16 +13,20 @@ are mapped to target tensors when distributed configurations differ.
 """
 
 import abc
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+import torch
+from torch.distributed.tensor import DTensor
 
 from .distributed_metadata import (
     DistributedItemMetadata,
     ShardingMetadata,
 )
 from .storage.base_storage import Storage
-from .types import NestedPath
+from .types import CheckpointPath, NestedPath
+from .walk_utils import walk_checkpoint_structure
 
 
 @dataclass
@@ -34,8 +38,9 @@ class LoadPlan:
     and copy it to the correct location in the target tensor.
 
     Attributes:
-        offsets: Position of the chunk inside the target tensor.
-        sizes: Shape of the chunk inside the target tensor.
+        offsets: Position of the chunk inside the target tensor that
+            ``ReshardingInfo.nested_path_to_target_tensors`` binds to the plan's path.
+        sizes: Shape of the chunk inside that target tensor.
         src_rank: Source rank identifying which checkpoint file to read from.
         src_fqn: Fully qualified name of the source tensor to read.
         src_offsets: Position of the chunk inside the source tensor.
@@ -68,16 +73,33 @@ class LoadPlan:
 @dataclass
 class ReshardingInfo:
     """
-    Container for resharding information generated during checkpoint loading.
+    The load plans for one checkpoint item, bound to the tensors they fill.
 
     Attributes:
         nested_path_to_load_plans: Dictionary mapping NestedPaths to lists of LoadPlan
             objects describing how to load and reshard from source to target.
         non_reshardable_paths: List of NestedPaths that could not be resharded.
+        nested_path_to_target_tensors: The tensor each planned path loads into; plan
+            coordinates are in its shape. Every path of
+            ``nested_path_to_load_plans`` must have one. Paths without plans may
+            have one too, and are not written.
     """
 
     nested_path_to_load_plans: dict[NestedPath, list[LoadPlan]]
     non_reshardable_paths: list[NestedPath]
+    # Left out of repr and ==: printing tensors dumps their data, and comparing
+    # them is elementwise rather than a bool.
+    nested_path_to_target_tensors: dict[NestedPath, torch.Tensor] = field(
+        default_factory=dict, repr=False, compare=False
+    )
+
+    def __post_init__(self) -> None:
+        unbound = (
+            self.nested_path_to_load_plans.keys()
+            - self.nested_path_to_target_tensors.keys()
+        )
+        if unbound:
+            raise ValueError(f"Planned paths have no target tensor: {list(unbound)}")
 
 
 class Resharder(abc.ABC):
@@ -228,6 +250,48 @@ class Resharder(abc.ABC):
                 return True  # This path needs resharding
 
         return False
+
+    def resolve_targets(
+        self,
+        item_key: str,
+        target: Any,
+    ) -> dict[NestedPath, torch.Tensor]:
+        """
+        Return the local tensor that each tensor leaf of ``target`` loads into.
+
+        Load plans address these tensors, so a resharder binds them into the
+        ``ReshardingInfo`` it plans. The default returns every tensor leaf, with
+        each ``DTensor`` replaced by its local shard. Override it for leaves that
+        wrap their local tensor in another type.
+
+        A returned tensor must share storage with the live target, so that
+        writing into it updates the target: return the tensor itself or a view of
+        it, never a copy (``clone()``, ``contiguous()``, or a ``reshape`` that
+        copies). Views need not be contiguous. Load plan coordinates are in the
+        returned tensor's own shape, not in the shape of the tensor it views.
+
+        Args:
+            item_key: The checkpoint item key (e.g., "model", "optimizer")
+            target: The item's live value, which loaded data is written into.
+
+        Returns:
+            Dictionary mapping the NestedPath of each tensor leaf to its local
+            tensor.
+        """
+        tensors: dict[NestedPath, torch.Tensor] = {}
+
+        def _collect(path: CheckpointPath, obj: Any, _: Any) -> None:
+            if isinstance(obj, torch.Tensor):
+                local = obj._local_tensor if isinstance(obj, DTensor) else obj
+                tensors[path.nested_path] = local
+
+        walk_checkpoint_structure(
+            item_key=item_key,
+            source=target,
+            target=None,
+            leaf_fn=_collect,
+        )
+        return tensors
 
     @abc.abstractmethod
     def load(

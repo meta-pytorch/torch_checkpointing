@@ -519,7 +519,7 @@ class DefaultResharder(Resharder):
         """Load and reshard checkpoint data into target.
 
         Orchestrates the full resharding pipeline:
-        1. Generate load plans computing chunk mappings between source and target.
+        1. Generate load plans, bound to the target tensors they fill.
         2. Execute load plans to read source files and copy data into target.
 
         Args:
@@ -533,15 +533,16 @@ class DefaultResharder(Resharder):
         Returns:
             List of NestedPaths that could not be resharded.
         """
-        resharding_info = self._generate_load_plans(target_metadata, source_metadata)
+        resharding_info = self.generate_load_plans(
+            item_key, target, target_metadata, source_metadata
+        )
 
         if resharding_info.nested_path_to_load_plans:
             self._execute_load_plans(
                 source_path,
                 source_metadata,
                 item_key,
-                resharding_info.nested_path_to_load_plans,
-                target,
+                resharding_info,
                 storage,
             )
         else:
@@ -551,11 +552,38 @@ class DefaultResharder(Resharder):
 
         return resharding_info.non_reshardable_paths
 
-    def _generate_load_plans(
+    def generate_load_plans(
         self,
+        item_key: str,
+        target: Any,
         target_metadata: dict[NestedPath, ShardingMetadata],
         source_metadata: DistributedItemMetadata,
     ) -> ReshardingInfo:
+        """Plan which source chunks fill each target tensor, without reading data.
+
+        Args:
+            item_key: The checkpoint item key being loaded (e.g., "model").
+            target: The item's live value, which the planned chunks are written into.
+            target_metadata: This rank's target sharding from extract_sharding_metadata.
+            source_metadata: Source checkpoint's distributed metadata for this item.
+
+        Returns:
+            ReshardingInfo binding each planned path to its target tensor.
+        """
+        load_plans, non_reshardable_paths = self._plan_from_metadata(
+            target_metadata, source_metadata
+        )
+        return ReshardingInfo(
+            nested_path_to_load_plans=load_plans,
+            non_reshardable_paths=non_reshardable_paths,
+            nested_path_to_target_tensors=self.resolve_targets(item_key, target),
+        )
+
+    def _plan_from_metadata(
+        self,
+        target_metadata: dict[NestedPath, ShardingMetadata],
+        source_metadata: DistributedItemMetadata,
+    ) -> tuple[dict[NestedPath, list[LoadPlan]], list[NestedPath]]:
         """Generate load plans by computing chunk mappings between source and target.
 
         For each NestedPath in target_metadata:
@@ -570,7 +598,8 @@ class DefaultResharder(Resharder):
             source_metadata: Source distributed metadata with rank groups.
 
         Returns:
-            ReshardingInfo with load plans and non-reshardable paths.
+            The load plans for each target path, and the paths that could not
+            be planned.
         """
         current_rank = dist.get_rank() if dist.is_initialized() else 0
 
@@ -680,40 +709,35 @@ class DefaultResharder(Resharder):
                 fqn_to_path[fqn]: plans for fqn, plans in optimized_str_result.items()
             }
 
-        return ReshardingInfo(
-            nested_path_to_load_plans=result,
-            non_reshardable_paths=non_reshardable_paths,
-        )
+        return result, non_reshardable_paths
 
     def _execute_load_plans(
         self,
         source_path: Path,
         source_metadata: DistributedItemMetadata,
         item_key: str,
-        nested_path_to_load_plans: dict[NestedPath, list[LoadPlan]],
-        target: Any,
+        resharding_info: ReshardingInfo,
         storage: Storage,
     ) -> None:
         """Execute load plans by reading source files and copying data into target.
 
         Groups load plans by source rank, then reads and copies the planned
-        source data into target tensors.
+        source data into the bound target tensors.
 
         Args:
             source_path: Base path to the source checkpoint directory.
             source_metadata: Source checkpoint metadata for this item.
             item_key: The checkpoint item key being loaded.
-            nested_path_to_load_plans: Mapping from NestedPath to LoadPlans.
-            target: Target dict-like structure to load data into.
+            resharding_info: The load plans and the target tensors they fill.
             storage: Storage backend for reading checkpoint files.
         """
-        target_by_path = _collect_leaf_values(item_key, target)
+        target_tensors = {
+            path: resharding_info.nested_path_to_target_tensors[path]
+            for path in resharding_info.nested_path_to_load_plans
+        }
         _, nested_path_to_load_plans, aliased_paths = dedupe_aliased_targets(
-            {
-                path: _unwrap_dtensor(target_by_path[path])
-                for path in nested_path_to_load_plans
-            },
-            nested_path_to_load_plans,
+            target_tensors,
+            resharding_info.nested_path_to_load_plans,
         )
         # Aliased targets share memory, so concurrent reads could race on it.
         # Read one file at a time whenever any are found.
@@ -754,7 +778,7 @@ class DefaultResharder(Resharder):
             source_layouts_by_rank,
             item_key,
             plans_by_rank,
-            target_by_path,
+            target_tensors,
             storage,
             file_read_workers,
             shard_headers,
@@ -767,7 +791,7 @@ class DefaultResharder(Resharder):
         source_layouts_by_rank: dict[int, LayoutInfo],
         item_key: str,
         plans_by_rank: dict[int, list[tuple[NestedPath, LoadPlan]]],
-        target_by_path: dict[NestedPath, Any],
+        target_tensors: dict[NestedPath, torch.Tensor],
         storage: Storage,
         file_read_workers: int,
         shard_headers: dict[int, SafetensorsFileMetadata],
@@ -776,7 +800,7 @@ class DefaultResharder(Resharder):
         # current stream so the writes are ordered after its pending work on the
         # targets. Assumes accelerator targets are on the current device.
         on_accelerator = any(
-            _unwrap_dtensor(target_by_path[path]).device.type != "cpu"
+            target_tensors[path].device.type != "cpu"
             for rank_plans in plans_by_rank.values()
             for path, _ in rank_plans
         )
@@ -786,7 +810,7 @@ class DefaultResharder(Resharder):
             if caller_stream is not None:
                 torch.accelerator.set_stream(caller_stream)
             for nested_path, load_plan, src_data in staged:
-                target_tensor = _unwrap_dtensor(target_by_path[nested_path])
+                target_tensor = target_tensors[nested_path]
                 tgt_slice = tuple(
                     slice(o, o + s) for o, s in zip(load_plan.offsets, load_plan.sizes)
                 )
