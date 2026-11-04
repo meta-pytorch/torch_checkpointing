@@ -169,6 +169,7 @@ class CheckpointManager:
             rank_info=rank_info,
             storage_config=self._storage_config,
             disable_use_mmap_backed_storage_on_load=not self._config.load.use_mmap,
+            load_plan_executor=self._config.load.load_plan_executor,
         )
         self._loader = CheckpointLoader(
             reader=self._reader,

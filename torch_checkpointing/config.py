@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 
 from .checkpoint_process import CheckpointProcessConfig
 from .checkpoint_writer import CheckpointWriterConfig
+from .load_plan_executor import LoadPlanExecutor
 from .staging import CheckpointStagerConfig
 
 DEFAULT_WAIT_TIMEOUT_SECS = 600
@@ -39,9 +40,18 @@ class CheckpointSaverConfig:
 
 @dataclass(kw_only=True)
 class CheckpointLoaderConfig:
-    """Configuration for checkpoint loading."""
+    """Configuration for checkpoint loading.
+
+    Attributes:
+        use_mmap: Whether torch-serialized files load into one mmap-backed
+            storage, which reduces allocator fragmentation, rather than through
+            a plain ``torch.load`` stream.
+        load_plan_executor: Reads the data that resharders plan, for every item
+            that reshards. None uses a ``DefaultLoadPlanExecutor``.
+    """
 
     use_mmap: bool = True
+    load_plan_executor: LoadPlanExecutor | None = None
 
 
 @dataclass

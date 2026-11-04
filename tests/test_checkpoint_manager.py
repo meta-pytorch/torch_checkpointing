@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import os
+from collections.abc import Mapping
 from concurrent.futures import Future
 from pathlib import Path
 from typing import Any
@@ -20,11 +21,17 @@ from torch_checkpointing.config import (
     CheckpointLoaderConfig,
     SyncCheckpointSaverConfig,
 )
+from torch_checkpointing.default_load_plan_executor import DefaultLoadPlanExecutor
 from torch_checkpointing.default_resharder import DefaultResharder
+from torch_checkpointing.load_plan_executor import (
+    LoadExecutionContext,
+    LoadPlanExecutor,
+)
 from torch_checkpointing.metadata_serialization import (
     load_distributed_metadata,
     TorchDistributedMetadataFormat,
 )
+from torch_checkpointing.resharding import ReshardingInfo
 from torch_checkpointing.schema import ItemSpec
 from torch_checkpointing.staging import CheckpointStagerConfig
 from torch_checkpointing.storage.filesystem import LocalFileSystemStorageConfig
@@ -136,6 +143,7 @@ def test_config_has_default_load_config() -> None:
 
     assert isinstance(config.load, CheckpointLoaderConfig)
     assert config.load.use_mmap is True
+    assert config.load.load_plan_executor is None
 
 
 def test_sync_save_returns_none_and_writes_checkpoint(tmp_path: Path) -> None:
@@ -355,6 +363,47 @@ def test_load_subset_then_save_all_items_writes_metadata_for_all(
         manager.close()
     torch.testing.assert_close(loaded["model"]["w"], weights["w"])
     torch.testing.assert_close(loaded["optim"]["exp_avg"], optim["exp_avg"])
+
+
+class _AlwaysReshardResharder(DefaultResharder):
+    """Reshards an unchanged layout too, so a one-process load reaches the executor."""
+
+    def should_reshard(self, source_metadata: Any, target_metadata: Any) -> bool:
+        return True
+
+
+class _RecordingExecutor(LoadPlanExecutor):
+    def __init__(self) -> None:
+        self.batches: list[list[str]] = []
+
+    def execute(
+        self, items: Mapping[str, ReshardingInfo], context: LoadExecutionContext
+    ) -> None:
+        self.batches.append(list(items))
+        DefaultLoadPlanExecutor().execute(items, context)
+
+
+def test_load_reads_resharded_items_with_the_configured_executor(
+    tmp_path: Path,
+) -> None:
+    executor = _RecordingExecutor()
+    config = CheckpointManager.Config.with_sync_save()
+    config.items = {"model": ItemSpec(resharder=_AlwaysReshardResharder())}
+    config.load = CheckpointLoaderConfig(load_plan_executor=executor)
+    config.storage_config = LocalFileSystemStorageConfig(use_direct_io=False)
+    path = str(tmp_path / "checkpoint")
+    weights = {"w": torch.arange(4, dtype=torch.float32)}
+    target = {"w": torch.zeros(4)}
+
+    manager = config.build()
+    try:
+        manager.save(path, {"model": weights})
+        manager.load(path, into={"model": target}, strict=True)
+    finally:
+        manager.close()
+
+    assert executor.batches == [["model"]]
+    torch.testing.assert_close(target["w"], weights["w"])
 
 
 def test_save_strict_schema_rejects_unknown_key(tmp_path: Path) -> None:
