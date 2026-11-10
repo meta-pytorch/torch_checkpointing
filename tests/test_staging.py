@@ -4,7 +4,9 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import io
 import json
+from collections.abc import Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
@@ -12,7 +14,11 @@ from unittest.mock import patch
 
 import pytest
 import torch
+import torch.distributed as dist
+from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.tensor import DTensor, Shard
 from torch.testing._internal.common_utils import requires_cuda, run_tests, TestCase
+from torch.testing._internal.distributed.fake_pg import FakeStore
 from torch_checkpointing import _pin_memory_utils as pin_memory_utils
 from torch_checkpointing._state_dict_stager import StateDictStager, StorageManager
 from torch_checkpointing.staging import (
@@ -56,6 +62,76 @@ def test_staging_preserves_storage_for_aliased_views(
         assert refreshed["strided"].untyped_storage() is storage
         torch.testing.assert_close(refreshed["bytes"], base.view(torch.uint8))
         assert stager._storage_manager.total_num_bytes() == storage.nbytes()
+    finally:
+        stager.close()
+
+
+@pytest.fixture
+def fake_process_group() -> Iterator[None]:
+    dist.init_process_group("fake", store=FakeStore(), rank=0, world_size=2)
+    try:
+        yield
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda",
+            marks=[
+                pytest.mark.gpus_needed_1,
+                pytest.mark.skipif(
+                    not torch.cuda.is_available(), reason="requires CUDA"
+                ),
+            ],
+        ),
+    ],
+)
+@pytest.mark.parametrize("local_offset", [0, 2])
+def test_staging_dtensor_whose_local_tensor_is_a_view(
+    fake_process_group: None, device: str, local_offset: int
+) -> None:
+    # DTensor gives its wrapper the storage offset of its local tensor, so with a
+    # nonzero offset the wrapper's data_ptr() is nonzero although its storage holds
+    # no data.
+    mesh = init_device_mesh(device, (2,))
+    base = torch.arange(12, dtype=torch.float32, device=device)
+    local = base[local_offset : local_offset + 4]
+    dtensor = DTensor.from_local(local, mesh, [Shard(0)], run_check=False)
+
+    stager = StateDictStager(pin_memory=False, share_memory=False)
+    try:
+        staged = stager.stage({"weight": dtensor})
+        buffer = io.BytesIO()
+        torch.save(staged, buffer)
+        buffer.seek(0)
+        loaded = torch.load(buffer, weights_only=False)
+
+        for result in (staged["weight"], loaded["weight"]):
+            assert isinstance(result, DTensor)
+            assert result.shape == dtensor.shape
+            assert result.placements == dtensor.placements
+            torch.testing.assert_close(result.to_local(), local.cpu(), rtol=0, atol=0)
+        assert staged["weight"].to_local().storage_offset() == local_offset
+    finally:
+        stager.close()
+
+
+def test_staging_parameter_whose_storage_access_is_forbidden_raises() -> None:
+    # PyTorch can forbid access to a storage that holds data, e.g. a CUDA graph
+    # output overwritten by a later replay. Staging must fail loudly rather than
+    # stage an uninitialized tensor.
+    param = torch.nn.Parameter(torch.arange(4.0))
+    torch._C._set_storage_data_ptr_access_error_msg(
+        param.untyped_storage()._cdata, "access forbidden for this test"
+    )
+    stager = StateDictStager(pin_memory=False, share_memory=False)
+    try:
+        with pytest.raises(RuntimeError, match="access forbidden for this test"):
+            stager.stage({"weight": param})
     finally:
         stager.close()
 

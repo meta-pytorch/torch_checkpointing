@@ -18,6 +18,7 @@ from torch.distributed.tensor import DTensor
 from torch.storage import UntypedStorage
 
 from . import _pin_memory_utils as pin_memory_utils
+from ._tensor_utils import has_storage_data
 
 logger = logging.getLogger(__name__)
 
@@ -301,15 +302,19 @@ class StateDictStager:
                 "Checkpointing DTensor with partial placements is not supported."
             )
 
-        # if data_ptr is not 0, we allocate a new storage below. so we can skip
-        # memory allocation by using [] for size.
-        y = x.new_empty([] if x.data_ptr() != 0 else x.size(), device="cpu")
+        # A tensor without storage data (e.g. DTensor) is copied through its
+        # attributes below. Do not test x.data_ptr() here: see has_storage_data.
+        copy_storage = type(x) is torch.Tensor or has_storage_data(x)
+
+        # If we copy the storage, y is pointed at a new storage below, so we can
+        # skip memory allocation by using [] for size.
+        y = x.new_empty([] if copy_storage else x.size(), device="cpu")
 
         # Store in memo dict early to handle recursive references
         d = id(x)
         memo[d] = y
 
-        if type(x) is torch.Tensor or x.data_ptr() != 0:
+        if copy_storage:
             # Get the untyped storage
             untyped_storage = x.untyped_storage()
             storage_id = id(untyped_storage)
