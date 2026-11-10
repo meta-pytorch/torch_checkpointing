@@ -36,6 +36,7 @@ resharders see [./key_concepts.md](./key_concepts.md).
 | Store already-serialized bytes | `ItemSpec(layout=LayoutInfo(..., RawSerialization()))` |
 | Store tensors in safetensors format | `ItemSpec(layout=LayoutInfo(..., SafetensorsSerialization()))` |
 | Resume on a different mesh / world size (DTensor) | `ItemSpec(resharder=DefaultResharder())` |
+| Reshard tensors that describe their own shards (`CheckpointableTensor`; experimental) | `ItemSpec(resharder=CheckpointableTensorResharder())` |
 | Reshard tensors sharded by another annotation system | `ItemSpec(resharder=MyCustomResharder())` |
 | Require an item to be present (fail fast if missing) | `ItemSpec(required=True)` (default) |
 | Make an un-listed key raise instead of using defaults | `Config(default=None)` |
@@ -336,6 +337,13 @@ this rank's target layout. Items with no resharder are read back directly.
   Shard/Replicate placements, StridedShard layouts, and device mesh
   configurations. Disjoint rank-local layouts are represented as multiple
   contiguous load-plan slices. It takes no constructor arguments.
+- **`CheckpointableTensorResharder()`** (experimental; for DTensor state,
+  `DefaultResharder` is still preferred) — reshards tensors implementing the
+  `CheckpointableTensor` protocol, which describe their own shards of a global
+  tensor, and DTensors, whose shards it derives from their placements. Unlike
+  `DefaultResharder`, it does not treat other tensors as replicated: when their
+  item reshards, they are reported missing instead of loaded. Import it from
+  `torch_checkpointing.checkpointable_tensor_resharder`.
 - **Custom `Resharder`** — for tensors sharded by another annotation system,
   subclass `Resharder` and implement its two abstract methods,
   `extract_sharding_metadata()` and `generate_load_plans()`. A resharder plans

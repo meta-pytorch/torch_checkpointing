@@ -12,7 +12,14 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
+from torch.distributed.tensor import DTensor
+from torch.distributed.tensor.placement_types import (
+    _StridedShard as DTensorStridedShard,
+    Replicate as DTensorReplicate,
+    Shard as DTensorShard,
+)
 
+from ._dtensor_utils import compute_local_shape_and_chunks
 from .checkpointable import CheckpointableTensor
 from .distributed_metadata import ShardingMetadata
 
@@ -161,6 +168,53 @@ class CheckpointableTensorShardingMetadata(
         )
         metadata._validate_local_bounds(tuple(tensor.shape))
         return metadata
+
+    @classmethod
+    def from_dtensor(cls, dtensor: DTensor) -> "CheckpointableTensorShardingMetadata":
+        """Derive metadata for this rank's local tensor of ``dtensor``.
+
+        The placements may give the local tensor several shards: a
+        ``_StridedShard`` placement can leave it holding blocks that are not
+        adjacent in the global tensor. Each shard is a non-empty block of the
+        local tensor whose global indices are consecutive along every dimension,
+        and the shards together cover the local tensor. A rank outside the device
+        mesh holds no shards.
+        """
+        for placement in dtensor.placements:
+            if not isinstance(
+                placement, (DTensorShard, DTensorStridedShard, DTensorReplicate)
+            ):
+                raise ValueError(
+                    f"Cannot checkpoint a DTensor with placement {placement}: only "
+                    "Shard, StridedShard and Replicate placements are supported"
+                )
+        mesh = dtensor.device_mesh
+        local_shape, global_offsets, local_offsets, local_sizes = (
+            compute_local_shape_and_chunks(dtensor.shape, mesh, dtensor.placements)
+        )
+        actual_shape = tuple(dtensor._local_tensor.shape)
+        if mesh.get_coordinate() is not None and local_shape != actual_shape:
+            raise ValueError(
+                f"The placements {tuple(dtensor.placements)} of a DTensor of "
+                f"shape {tuple(dtensor.shape)} give this rank a local tensor "
+                f"of shape {local_shape}, but it has shape {actual_shape}"
+            )
+        # Upstream keeps empty chunks so that every rank gets the same number of
+        # chunks, which keeps it traceable. Checkpointing needs no tracing, and
+        # an empty chunk can share its global offset with a non-empty one, so
+        # list only the non-empty chunks. Untraced, every value is an int.
+        chunks = [
+            tuple(tuple(map(int, field)) for field in chunk)
+            for chunk in zip(global_offsets, local_offsets, local_sizes)
+            if 0 not in chunk[2]
+        ]
+        return cls(
+            global_shape=tuple(dtensor.shape),
+            global_offsets=tuple(chunk[0] for chunk in chunks),
+            local_offsets=tuple(chunk[1] for chunk in chunks),
+            local_sizes=tuple(chunk[2] for chunk in chunks),
+            dtype=str(dtensor.dtype),
+        )
 
     def to_dict(self) -> dict[str, Any]:
         """Convert the metadata to a JSON-compatible dictionary."""

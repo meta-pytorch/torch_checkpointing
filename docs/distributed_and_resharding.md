@@ -614,6 +614,37 @@ metadata is missing, or a non-DTensor target). The reader then hands the plans o
 every resharded item to its load executor, which reads the source files and
 copies the planned chunks (§7).
 
+### 5d. The built-in `CheckpointableTensorResharder`
+
+> **Experimental.** For state made of `DTensor`s, `DefaultResharder` is still
+> preferred.
+
+`CheckpointableTensorResharder` (`torch_checkpointing/checkpointable_tensor_resharder.py`)
+records every tensor it reshards as `CheckpointableTensorShardingMetadata`: the
+global shape, and for each shard of the rank's local tensor, its global offset,
+its local offset and its size. It accepts two kinds of tensors:
+
+- Tensors implementing the `CheckpointableTensor` protocol
+  (`torch_checkpointing/checkpointable.py`), whose `global_shape`,
+  `global_offsets`, `local_offsets` and `local_sizes` attributes describe their
+  shards. A local tensor may hold several shards, and padding between them.
+- `DTensor`s, whose shards it derives from their placements. A `_StridedShard`
+  placement that leaves a rank holding blocks that are not adjacent globally
+  yields one shard per block.
+
+Any other tensor gets no metadata. Where `DefaultResharder` treats a plain
+tensor as replicated, this resharder reports it as non-reshardable when its item
+reshards, so the load lists it as missing; when nothing in the item needs
+resharding, the reader loads the item directly, plain tensors included.
+
+On load, each target shard is filled from the saved shards that overlap it, and
+each part is read from the lowest source rank that saved it, so replicated or
+overlapping saved shards are read once. A path whose target shards the saved
+shards do not fully cover is reported as non-reshardable. The metadata describes
+one rank, so `should_reshard` compares each target with what *this* rank saved,
+not with any rank's metadata. The plans it emits are plain copies that
+`DefaultLoadPlanExecutor` executes.
+
 ### The direct-read fast path vs. `should_reshard`
 
 Even with a resharder and a metadata manager wired up, resharding only *runs*

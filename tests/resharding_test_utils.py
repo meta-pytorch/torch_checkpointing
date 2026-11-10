@@ -4,12 +4,21 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import torch
+import torch.distributed as dist
 from torch.distributed.tensor._api import DTensor
+from torch.distributed.tensor.placement_types import (
+    _StridedShard,
+    Placement,
+    Shard,
+)
+from torch.testing._internal.distributed.fake_pg import FakeStore
 from torch_checkpointing.checkpoint_base import CheckpointInfo, CheckpointItem
 from torch_checkpointing.checkpoint_layout import LayoutInfo
 from torch_checkpointing.default_load_plan_executor import DefaultLoadPlanExecutor
@@ -46,6 +55,33 @@ def _plan_nothing_but_report_missing(
             if nested_path not in source_paths
         ],
     )
+
+
+@contextmanager
+def fake_process_group(rank: int, world_size: int) -> Iterator[None]:
+    """Join a fake process group as ``rank``, to build DTensors without peers."""
+    dist.init_process_group("fake", store=FakeStore(), rank=rank, world_size=world_size)
+    try:
+        yield
+    finally:
+        dist.destroy_process_group()
+
+
+def dtensor_local_shard(
+    global_tensor: torch.Tensor,
+    mesh_shape: Sequence[int],
+    coordinate: Sequence[int],
+    placements: Sequence[Placement],
+) -> torch.Tensor:
+    """The local tensor that DTensor's own splitting gives the rank at ``coordinate``."""
+    local = global_tensor
+    for mesh_dim, placement in enumerate(placements):
+        if isinstance(placement, (Shard, _StridedShard)):
+            shards, _ = placement._split_tensor(
+                local, mesh_shape[mesh_dim], with_padding=False, contiguous=False
+            )
+            local = shards[coordinate[mesh_dim]]
+    return local
 
 
 def plan_and_execute(

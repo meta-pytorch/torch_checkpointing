@@ -42,6 +42,8 @@ to the selected serialization format.
 | `RawSerialization` | `.checkpoint_layout` | Raw bytes. |
 | `SafetensorsSerialization` | `.checkpoint_layout` | safetensors format for tensors. |
 | `DefaultResharder` | `.default_resharder` | Built-in resharder for `DTensor` state. |
+| `CheckpointableTensorResharder` | `.checkpointable_tensor_resharder` | Experimental. Built-in resharder for `CheckpointableTensor` and `DTensor` state; other tensors are not resharded. For `DTensor` state, `DefaultResharder` is still preferred. |
+| `CheckpointableTensor` | `.checkpointable` | Experimental. Protocol for a local tensor that describes its shards of a global tensor. |
 | `Resharder` | `.resharding` | Base class for custom resharding: plans what to load. |
 | `LoadPlan`, `ReshardingInfo` | `.resharding` | A planned chunk copy; one item's load plans, bound to the tensors they fill. |
 | `LoadPlanExecutor`, `LoadExecutionContext` | `.load_plan_executor` | Base class for custom load execution: reads what was planned. |
