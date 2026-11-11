@@ -216,12 +216,12 @@ class TestCheckpointWriterConfig(TestCase):
 
     def test_file_write_max_threads_rejects_non_positive_values(self):
         """Test that file_write_max_threads must be positive."""
-        with self.assertRaisesRegex(ValueError, "file_write_max_threads"):
+        with pytest.raises(ValueError, match="file_write_max_threads"):
             CheckpointWriterConfig(file_write_max_threads=0)
 
     def test_empty_temp_dir_prefix_rejected_with_barrier(self):
         """Test that an empty prefix is rejected when a barrier commits the write."""
-        with self.assertRaisesRegex(ValueError, "temp_dir_prefix"):
+        with pytest.raises(ValueError, match="temp_dir_prefix"):
             CheckpointWriterConfig(
                 barrier_config=_NoopBarrierConfig(), temp_dir_prefix=""
             )

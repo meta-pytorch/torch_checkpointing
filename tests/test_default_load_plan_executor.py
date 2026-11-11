@@ -57,14 +57,14 @@ class _TrackingReader(io.BytesIO):
         super().__init__(data)
         self._storage = storage
 
-    def read(self, size: int = -1) -> bytes:
+    def read(self, size: int | None = -1, /) -> bytes:
         data = super().read(size)
         self._storage.bytes_read += len(data)
         return data
 
-    def readinto(self, buffer: Any) -> int | None:
+    def readinto(self, buffer: Any, /) -> int:
         bytes_read = super().readinto(buffer)
-        self._storage.bytes_read += bytes_read or 0
+        self._storage.bytes_read += bytes_read
         return bytes_read
 
 

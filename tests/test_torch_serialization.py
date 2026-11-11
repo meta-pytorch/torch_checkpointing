@@ -38,7 +38,7 @@ class _BytesStorage:
         self.mmap_fill_chunk_bytes = mmap_fill_chunk_bytes
         self.read_args: list[Any] = []
 
-    def stream_read(self, path: Path, read_args: Any | None = None) -> io.BytesIO:
+    def stream_read(self, path: Path, read_args: Any | None = None) -> io.IOBase:
         self.read_args.append(read_args)
         return io.BytesIO(self._data_by_path[path])
 
@@ -53,9 +53,7 @@ class _ReadintoFailingStream(io.BytesIO):
 
 
 class _ReadintoFailingStorage(_BytesStorage):
-    def stream_read(  # pyre-ignore[15]
-        self, path: Path, read_args: Any | None = None
-    ) -> io.BytesIO:
+    def stream_read(self, path: Path, read_args: Any | None = None) -> io.BytesIO:
         self.read_args.append(read_args)
         return _ReadintoFailingStream(self._data_by_path[path])
 
@@ -160,9 +158,7 @@ class _NonSeekableStream(io.RawIOBase):
 
 
 class _NonSeekableStorage(_BytesStorage):
-    def stream_read(  # pyre-ignore[15]
-        self, path: Path, read_args: Any | None = None
-    ) -> io.RawIOBase:
+    def stream_read(self, path: Path, read_args: Any | None = None) -> io.RawIOBase:
         self.read_args.append(read_args)
         return _NonSeekableStream(self._data_by_path[path])
 
@@ -198,9 +194,7 @@ class _MisSeekingStorage(_BytesStorage):
         super().__init__(data_by_path)
         self._mask = mask
 
-    def stream_read(  # pyre-ignore[15]
-        self, path: Path, read_args: Any | None = None
-    ) -> io.RawIOBase:
+    def stream_read(self, path: Path, read_args: Any | None = None) -> io.RawIOBase:
         self.read_args.append(read_args)
         return _MisSeekingStream(self._data_by_path[path], self._mask)
 

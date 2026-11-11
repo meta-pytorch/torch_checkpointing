@@ -195,12 +195,12 @@ class TestStorage(TestCase):
         self.assertFalse(os.path.exists(nonexistent_dir))
 
         # Test that write() fails with FileNotFoundError
-        with self.assertRaises(RuntimeError):
+        with pytest.raises(RuntimeError):
             self.storage.write(Path(test_file), b"test data")
 
         # Test that stream_write() also fails with FileNotFoundError
-        with self.assertRaises(RuntimeError):
-            stream = self.storage.stream_write(Path(test_file))
+        stream = self.storage.stream_write(Path(test_file))
+        with pytest.raises(RuntimeError):
             with stream:
                 stream.write(b"test data")
 

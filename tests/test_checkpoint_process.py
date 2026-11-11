@@ -10,6 +10,7 @@ import os
 import tempfile
 import threading
 import time
+import unittest
 from collections.abc import Iterator
 from concurrent.futures import Future
 from typing import Any
@@ -576,10 +577,10 @@ class TestCheckpointProcess(TestCase):
         )
 
         # This should timeout
-        with self.assertRaises(TimeoutError) as cm:
+        with pytest.raises(TimeoutError) as cm:
             checkpoint_process._creation_future.result()
 
-        self.assertIn("Timed out", str(cm.exception))
+        self.assertIn("Timed out", str(cm.value))
 
     def test_subprocess_initialization_failure(self) -> None:
         """Test subprocess initialization failure."""
@@ -589,7 +590,7 @@ class TestCheckpointProcess(TestCase):
 
         # The subprocess should fail to initialize
         # We expect this to raise an exception when we try to use it
-        with self.assertRaises(RuntimeError):
+        with pytest.raises(RuntimeError):
             checkpoint_process._creation_future.result()
 
     def test_graceful_termination(self) -> None:
@@ -665,10 +666,10 @@ class TestCheckpointProcess(TestCase):
 
         # Attempting to write should raise an error
         future = checkpoint_process.write(checkpoint_info, "/tmp/test")
-        with self.assertRaises(RuntimeError) as cm:
+        with pytest.raises(RuntimeError) as cm:
             future.result()
 
-        self.assertIn("Child process terminated unexpectedly", str(cm.exception))
+        self.assertIn("Child process terminated unexpectedly", str(cm.value))
 
     def test_shared_memory_tensor_ipc(self):
         """Test that shared memory tensors are backed by the same memory across processes."""
@@ -819,9 +820,9 @@ class TestCheckpointProcess(TestCase):
             try:
                 baseline = _rss_mib(child_pid)
             except Exception as e:
-                self.skipTest(
+                raise unittest.SkipTest(
                     f"Could not measure RSS of the child process; it currently only works on Linux. {e!r}"
-                )
+                ) from e
 
             tensors = [
                 torch.zeros(

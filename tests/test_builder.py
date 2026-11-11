@@ -8,6 +8,7 @@ import os
 import shutil
 import tempfile
 
+import pytest
 import torch
 from torch.testing._internal.common_utils import run_tests, TestCase
 from torch_checkpointing.builder import (
@@ -276,7 +277,7 @@ class TestMakeCheckpointer(TestCase):
 
         try:
             with checkpointer.staging_lock.read:
-                with self.assertRaisesRegex(RuntimeError, "after 0 seconds"):
+                with pytest.raises(RuntimeError, match="after 0 seconds"):
                     checkpointer.save(
                         os.path.join(self.temp_dir, "timeout_checkpoint"),
                         SimpleCheckpoint(self.state_dict),

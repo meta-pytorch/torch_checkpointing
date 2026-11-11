@@ -148,7 +148,7 @@ def test_default_stagers_can_share_a_caller_owned_executor() -> None:
     stagers = [DefaultStager(config, staging_executor=executor) for _ in range(2)]
 
     try:
-        staged = [
+        staged: list[dict[str, torch.Tensor]] = [
             ensure_future(stager.stage({"value": torch.tensor(index)})).result()
             for index, stager in enumerate(stagers)
         ]
@@ -354,7 +354,7 @@ class TestDefaultStager(TestCase):
                         "stage",
                         side_effect=RuntimeError("boom"),
                     ):
-                        with self.assertRaises(RuntimeError):
+                        with pytest.raises(RuntimeError):
                             ensure_future(
                                 stager.stage({"tensor": torch.randn(4, 4)})
                             ).result()
@@ -372,7 +372,7 @@ class TestDefaultStager(TestCase):
             options = CheckpointStagerConfig(
                 use_pinned_memory=True, use_non_blocking_copy=True
             )
-            with self.assertRaises(AssertionError):
+            with pytest.raises(AssertionError):
                 DefaultStager(options)
 
     def test_config_defaults_to_pinned_memory_if_available(self) -> None:
@@ -755,7 +755,9 @@ def test_default_stager_copies_run_on_side_stream(tmp_path: Path) -> None:
             ]
         ) as profiler:
             result = left @ right
-            staged = ensure_future(stager.stage({"result": result})).result()
+            staged: dict[str, torch.Tensor] = ensure_future(
+                stager.stage({"result": result})
+            ).result()
             torch.cuda.synchronize()
 
         torch.testing.assert_close(staged["result"], result.cpu())

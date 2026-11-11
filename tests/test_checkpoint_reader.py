@@ -323,7 +323,7 @@ class TestCheckpointReader(TestCase):
         # Call read and expect a FileNotFoundError
         template_state_dict = {k: None for k in self.state_dict.keys()}
         template_checkpoint = SimpleCheckpoint({"checkpoint": template_state_dict})
-        with self.assertRaises(FileNotFoundError):
+        with pytest.raises(FileNotFoundError):
             _read_wrapper(self.reader, nonexistent_path, template_checkpoint)
 
     def test_partial_read(self):
@@ -626,9 +626,9 @@ class TestCheckpointReader(TestCase):
 
         with (
             mock.patch.object(resharder, "should_reshard", return_value=True),
-            self.assertRaisesRegex(
+            pytest.raises(
                 AssertionError,
-                "Missing source metadata for checkpoint item 'model'",
+                match="Missing source metadata for checkpoint item 'model'",
             ),
         ):
             self.reader.read(checkpoint_path, checkpoint_info)
@@ -643,6 +643,7 @@ class TestCheckpointReader(TestCase):
         source_sharding = resharder.extract_sharding_metadata(
             "model", {"weight": source_value}
         )[("weight",)]
+        assert isinstance(source_sharding, DTensorShardingMetadata)
         target_sharding = replace(source_sharding, placements=(ShardSpec(0),))
         source_distributed_metadata = DistributedMetadata(
             metadata={
@@ -887,10 +888,10 @@ class TestCheckpointReader(TestCase):
                 side_effect=AssertionError("direct reads must not call storage.glob()"),
             ),
         ):
-            with self.assertRaises(FileNotFoundError) as context:
+            with pytest.raises(FileNotFoundError) as context:
                 self.reader.read(checkpoint_path, checkpoint_info)
 
-        self.assertIn("missing_custom_model.pt", str(context.exception))
+        self.assertIn("missing_custom_model.pt", str(context.value))
 
     def test_layout_without_resharding_defaults_to_torch_without_probing(self):
         with mock.patch.object(
@@ -1163,7 +1164,7 @@ class TestCheckpointReader(TestCase):
         items = template_checkpoint.get_items()
         checkpoint_info = CheckpointInfo(checkpoint_items=items)
 
-        with self.assertRaises(FileNotFoundError):
+        with pytest.raises(FileNotFoundError):
             self.reader.read(
                 path=nonexistent_path,
                 checkpoint_info=checkpoint_info,
@@ -1268,13 +1269,13 @@ class TestCheckpointReader(TestCase):
         )
 
         # Should raise FileNotFoundError for missing optimizer file
-        with self.assertRaises(FileNotFoundError) as context:
+        with pytest.raises(FileNotFoundError) as context:
             self.reader.read(
                 path=single_item_path,
                 checkpoint_info=checkpoint_info_with_missing.for_reads(),
             )
-        self.assertIn("Missing file", str(context.exception))
-        self.assertIn("optimizer", str(context.exception))
+        self.assertIn("Missing file", str(context.value))
+        self.assertIn("optimizer", str(context.value))
 
 
 def test_skipping_item_is_read_directly_when_another_item_reshards(
@@ -1319,6 +1320,7 @@ def test_reader_plans_every_resharded_item_then_executes_them_in_one_batch(
         source_sharding = DefaultResharder().extract_sharding_metadata(
             key, {"weight": value}
         )[("weight",)]
+        assert isinstance(source_sharding, DTensorShardingMetadata)
         source_metadata[key] = DistributedItemMetadata(
             nested_path_to_metadata={
                 ("weight",): [

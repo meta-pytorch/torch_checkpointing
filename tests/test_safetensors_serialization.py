@@ -577,9 +577,9 @@ def test_write_read_with_metadata(
     from safetensors import safe_open
 
     sf_path = os.path.join(checkpoint_path, "model.safetensors")
-    with safe_open(sf_path, framework="pt") as f:
-        assert f.metadata() is not None
-        assert f.metadata()["format_version"] == "2"
+    metadata = safe_open(sf_path, framework="pt").metadata()
+    assert metadata is not None
+    assert metadata["format_version"] == "2"
 
 
 def test_mixed_serialization_formats(
