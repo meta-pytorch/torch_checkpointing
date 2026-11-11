@@ -207,11 +207,6 @@ def test_every_load_extracts_local_target_metadata_without_aggregating(
         metadata_manager.close()
 
 
-@pytest.mark.gpus_needed_1
-@pytest.mark.skipif(
-    not torch.accelerator.is_available(),
-    reason="requires an accelerator (async saver staging)",
-)
 def test_shared_metadata_manager_load_then_save(rank_info, sample_state_dict):
     """Test that a metadata_manager can be shared between a loader and a saver."""
     with tempfile.TemporaryDirectory() as tmpdir:

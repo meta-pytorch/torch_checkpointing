@@ -59,16 +59,6 @@ from torch_checkpointing.metadata_serialization import METADATA_FILE_NAME
 from torch_checkpointing.storage.filesystem import LocalFileSystemStorageConfig
 from torch_checkpointing.types import RankInfo
 
-# These tests spawn a multi-process group and exercise the async saver's
-# accelerator staging, so they require an accelerator.
-pytestmark = [
-    pytest.mark.gpus_needed_4,
-    pytest.mark.skipif(
-        not torch.accelerator.is_available(),
-        reason="requires an accelerator (multi-process DTensor resharding)",
-    ),
-]
-
 
 class _UnsupportedShardingMetadata(ShardingMetadata):
     def to_dict(self) -> dict[str, Any]:

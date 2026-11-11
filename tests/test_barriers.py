@@ -337,13 +337,6 @@ def _run_barrier_worker(
         all_done.wait(timeout=30)
 
 
-# Multi-rank barrier tests spawn multiple processes; gate them on an
-# accelerator so they only run in a multi-GPU environment.
-@pytest.mark.gpus_needed_4
-@pytest.mark.skipif(
-    not torch.accelerator.is_available(),
-    reason="requires an accelerator (multi-rank barrier coordination)",
-)
 def test_tcpstore_barrier_execute():
     """Test TCPStoreBarrier with a real TCPStore (no mocks)."""
     world_size = 4
@@ -365,11 +358,6 @@ def test_tcpstore_barrier_execute():
             )
 
 
-@pytest.mark.gpus_needed_4
-@pytest.mark.skipif(
-    not torch.accelerator.is_available(),
-    reason="requires an accelerator (multi-rank barrier coordination)",
-)
 @pytest.mark.parametrize("missed_rank", [0, 2])
 def test_tcpstore_barrier_timeout_on_missing_rank(missed_rank: int):
     """Test that barrier times out when one rank is too slow to get to the barrier."""
