@@ -16,9 +16,7 @@ from datetime import timedelta
 import pytest
 import torch
 import torch.distributed as dist
-from torch._C._distributed_c10d import (
-    FakeStore,  # pyrefly: ignore[missing-module-attribute]
-)
+from torch.testing._internal.distributed.fake_pg import FakeStore
 from torch_checkpointing.barriers import (
     _default_store_connection_info,
     _FileStoreConnectionInfo,
