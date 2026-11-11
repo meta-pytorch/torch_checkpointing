@@ -411,9 +411,12 @@ def test_full_file_strategy_loads_dotted_safetensors() -> None:
         "cpu",
         pytest.param(
             "cuda",
-            marks=pytest.mark.skipif(
-                not torch.cuda.is_available(), reason="requires CUDA"
-            ),
+            marks=[
+                pytest.mark.gpus_needed_1,
+                pytest.mark.skipif(
+                    not torch.cuda.is_available(), reason="requires CUDA"
+                ),
+            ],
         ),
     ],
 )
@@ -831,9 +834,12 @@ def test_reads_source_files_concurrently() -> None:
         "cpu",
         pytest.param(
             "cuda",
-            marks=pytest.mark.skipif(
-                not torch.cuda.is_available(), reason="requires CUDA"
-            ),
+            marks=[
+                pytest.mark.gpus_needed_1,
+                pytest.mark.skipif(
+                    not torch.cuda.is_available(), reason="requires CUDA"
+                ),
+            ],
         ),
     ],
 )
@@ -918,6 +924,7 @@ def test_concurrent_reads_of_many_tensors_fill_shared_targets(
     )
 
 
+@pytest.mark.gpus_needed_1
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_copies_follow_pending_work_on_the_callers_stream() -> None:
     source = torch.arange(1024, dtype=torch.float32)
@@ -965,9 +972,12 @@ def test_copies_follow_pending_work_on_the_callers_stream() -> None:
         "cpu",
         pytest.param(
             "cuda",
-            marks=pytest.mark.skipif(
-                not torch.cuda.is_available(), reason="requires CUDA"
-            ),
+            marks=[
+                pytest.mark.gpus_needed_1,
+                pytest.mark.skipif(
+                    not torch.cuda.is_available(), reason="requires CUDA"
+                ),
+            ],
         ),
     ],
 )
