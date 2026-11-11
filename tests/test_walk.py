@@ -18,6 +18,9 @@ from collections import deque, OrderedDict as OrderedDictType
 
 import pytest
 import torch
+import torch.distributed as dist
+from torch.distributed.device_mesh import DeviceMesh
+from torch.distributed.tensor import DTensor, Replicate
 from torch_checkpointing.types import CheckpointPath
 from torch_checkpointing.walk_utils import walk_checkpoint_structure
 
@@ -232,29 +235,26 @@ class TestWalkCheckpointStructure:
 
     def test_dtensor_tensor_mismatch_raises_error(self):
         """Test that copying between DTensor and regular Tensor raises error."""
-        from torch.distributed.device_mesh import DeviceMesh
-        from torch.distributed.tensor import DTensor
-
-        # Skip if distributed not available
+        dist.init_process_group(
+            backend="gloo", store=dist.HashStore(), rank=0, world_size=1
+        )
         try:
             mesh = DeviceMesh("cpu", [0])
-        except Exception:
-            pytest.skip("DeviceMesh not available in this environment")
+            tgt_dtensor = DTensor.from_local(torch.zeros(3), mesh, [Replicate()])
 
-        src_tensor = torch.tensor([1.0, 2.0, 3.0])
-        tgt_dtensor = DTensor.from_local(torch.zeros(3), mesh, [])
+            source = {"weight": torch.tensor([1.0, 2.0, 3.0])}
+            target = {"weight": tgt_dtensor}
 
-        source = {"weight": src_tensor}
-        target = {"weight": tgt_dtensor}
-
-        with pytest.raises(
-            RuntimeError, match="Cannot copy between DTensor and regular Tensor"
-        ):
-            walk_checkpoint_structure(
-                item_key="model",
-                source=source,
-                target=target,
-            )
+            with pytest.raises(
+                RuntimeError, match="Cannot copy between DTensor and regular Tensor"
+            ):
+                walk_checkpoint_structure(
+                    item_key="model",
+                    source=source,
+                    target=target,
+                )
+        finally:
+            dist.destroy_process_group()
 
     # ========== Complex structure tests ==========
 
