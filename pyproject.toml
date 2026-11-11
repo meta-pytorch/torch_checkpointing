@@ -88,6 +88,14 @@ reportIncompatibleMethodOverride = "warning"
 # pytest configuration
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Tests that need GPUs declare how many. Each also skips itself when fewer are
+# visible.
+markers = [
+    "gpus_needed_1: requires 1 GPU",
+    "gpus_needed_2: requires 2 GPUs",
+    "gpus_needed_4: requires 4 GPUs",
+    "gpus_needed_8: requires 8 GPUs",
+]
 
 [tool.ruff]
 target-version = "py310"
