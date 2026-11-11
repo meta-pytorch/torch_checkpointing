@@ -309,8 +309,15 @@ def _find_free_port():
         return s.getsockname()[1]
 
 
-def _run_barrier_worker(rank, world_size, port, timeout=3, miss_barrier=False):
-    """Create a TCPStoreBarrier and maybe execute it."""
+def _run_barrier_worker(
+    rank, world_size, port, timeout=3, miss_barrier=False, all_done=None
+):
+    """Create a TCPStoreBarrier and maybe execute it.
+
+    If ``all_done`` is given, wait on it before returning. Rank 0 hosts the
+    store, and returning destroys it: without the wait it can close the store
+    while another rank is still waiting for the barrier's last reply.
+    """
     rank_info = RankInfo(
         global_rank=rank,
         global_world_size=world_size,
@@ -326,6 +333,8 @@ def _run_barrier_worker(rank, world_size, port, timeout=3, miss_barrier=False):
     barrier = config.create_barrier(rank_info)
     if not miss_barrier:
         barrier.execute_barrier(timeout_secs=timeout)
+    if all_done is not None:
+        all_done.wait(timeout=30)
 
 
 # Multi-rank barrier tests spawn multiple processes; gate them on an
@@ -339,9 +348,13 @@ def test_tcpstore_barrier_execute():
     """Test TCPStoreBarrier with a real TCPStore (no mocks)."""
     world_size = 4
     port = _find_free_port()
-    with cf.ProcessPoolExecutor(max_workers=world_size) as pool:
+    with (
+        mp.Manager() as manager,
+        cf.ProcessPoolExecutor(max_workers=world_size) as pool,
+    ):
+        all_done = manager.Barrier(world_size)
         futs = [
-            pool.submit(_run_barrier_worker, rank, world_size, port)
+            pool.submit(_run_barrier_worker, rank, world_size, port, all_done=all_done)
             for rank in range(world_size)
         ]
         cf.wait(futs, timeout=30)
