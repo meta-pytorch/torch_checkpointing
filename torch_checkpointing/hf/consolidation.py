@@ -746,7 +746,7 @@ def _validate_fqn_to_index_mapping(
         )
     # DCPv1's QuantizedHuggingFaceStorageReader can read auxiliary scale FQNs
     # while committing only the requested weight. See
-    # fbcode/caffe2/torch/distributed/checkpoint/quantized_hf_storage.py.
+    # torch/distributed/checkpoint/quantized_hf_storage.py in PyTorch.
     mapping_only_fqns = requested_fqns - checkpoint_fqns
     if mapping_only_fqns:
         logger.info(
