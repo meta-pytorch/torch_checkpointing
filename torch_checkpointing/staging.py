@@ -413,3 +413,6 @@ class DefaultStager(CheckpointStager):
         # Check if StateDictStager has a close method before calling it
         if hasattr(self._state_dict_stager, "close"):
             self._state_dict_stager.close()
+        # The staged state dict views the pooled storages; a caller that keeps the closed
+        # stager alive must not keep them.
+        self._staged_state_dict = None

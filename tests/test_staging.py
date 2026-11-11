@@ -6,6 +6,7 @@
 
 import io
 import json
+import weakref
 from collections.abc import Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
@@ -159,6 +160,26 @@ def test_default_stagers_can_share_a_caller_owned_executor() -> None:
         assert executor.submit(lambda: 42).result() == 42
     finally:
         executor.shutdown(wait=True)
+
+
+def test_closing_the_stager_releases_the_staged_state_dict() -> None:
+    stager = DefaultStager(
+        CheckpointStagerConfig(
+            use_async_staging=False,
+            use_pinned_memory=False,
+            use_non_blocking_copy=False,
+        )
+    )
+    staged = stager.stage({"model": {"weight": torch.ones(4)}})
+    assert isinstance(staged, dict)
+    staged_weight = weakref.ref(staged["model"]["weight"])
+    del staged
+
+    stager.close()
+
+    # The caller still holds the closed stager, but not its staged tensors.
+    assert stager.get_staged_state_dict() is None
+    assert staged_weight() is None
 
 
 class TestDefaultStager(TestCase):
