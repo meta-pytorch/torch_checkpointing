@@ -12,9 +12,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # torch_checkpointing supports Python >=3.9; CI covers 3.10-3.12 to
-        # match the torch CPU wheels used below.
-        python-version: ["3.10", "3.11", "3.12"]
+        python-version: ["3.11", "3.12"]
         torch-version: ["stable", "nightly"]
     steps:
       - uses: actions/checkout@v7

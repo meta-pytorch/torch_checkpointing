@@ -9,7 +9,7 @@ clear and has sufficient instructions to be able to reproduce the issue.
 
 ## Development setup
 
-`torch_checkpointing` requires Python >= 3.9 and torch >= 2.11. Clone the repo,
+`torch_checkpointing` requires Python >= 3.11 and torch >= 2.11. Clone the repo,
 install it in editable mode with the dev extras, and run the tests:
 
 ```bash
