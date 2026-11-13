@@ -112,6 +112,10 @@ def test_has_storage_data_without_real_memory(
     assert not has_storage_data(make())
 
 
+@pytest.mark.skipif(
+    not hasattr(torch._C, "_set_storage_data_ptr_access_error_msg"),
+    reason="forbidding access to a storage needs torch >= 2.14",
+)
 @pytest.mark.parametrize("make", [torch.Tensor, torch.nn.Parameter])
 def test_has_storage_data_raises_when_access_to_real_data_is_forbidden(
     make: Callable[[torch.Tensor], torch.Tensor],

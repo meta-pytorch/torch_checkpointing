@@ -121,6 +121,10 @@ def test_staging_dtensor_whose_local_tensor_is_a_view(
         stager.close()
 
 
+@pytest.mark.skipif(
+    not hasattr(torch._C, "_set_storage_data_ptr_access_error_msg"),
+    reason="forbidding access to a storage needs torch >= 2.14",
+)
 def test_staging_parameter_whose_storage_access_is_forbidden_raises() -> None:
     # PyTorch can forbid access to a storage that holds data, e.g. a CUDA graph
     # output overwritten by a later replay. Staging must fail loudly rather than
