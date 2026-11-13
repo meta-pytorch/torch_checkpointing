@@ -23,6 +23,10 @@ concurrency:
   # upload and the GitHub Release, which would leave inconsistent state.
   cancel-in-progress: false
 
+# Jobs that need more (publish, release) request it themselves.
+permissions:
+  contents: read
+
 jobs:
   build:
     name: Build sdist and wheel
@@ -33,55 +37,35 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v7
 
-      - name: Set up Python
-        uses: actions/setup-python@v7
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v10
         with:
           python-version: "3.12"
+          enable-cache: false
 
       - name: Stamp release version
         if: ${{ inputs.version != '' }}
         env:
           RELEASE_VERSION: ${{ inputs.version }}
-        run: |
-          python - <<'PY'
-          import os, pathlib, re
-          version = os.environ["RELEASE_VERSION"]
-          path = pathlib.Path("pyproject.toml")
-          # Match the project version line. No `count` limit: if a second
-          # `version = "..."` line ever appears, `n != 1` fails loudly here
-          # rather than silently stamping the wrong line.
-          text, n = re.subn(
-              r'(?m)^version = ".*"$',
-              f'version = "{version}"',
-              path.read_text(),
-          )
-          assert n == 1, f"expected exactly one top-level version line, found {n}"
-          path.write_text(text)
-          print(f"Stamped version {version}")
-          PY
+        # --frozen: update pyproject.toml only; uv.lock is not needed to build.
+        run: uv version --frozen "$RELEASE_VERSION"
 
       - name: Build sdist and wheel
         run: |
-          python -m pip install --upgrade pip build twine
-          python -m build
-          twine check dist/*
+          uv build
+          uvx twine check --strict dist/*
           ls -la dist/
 
       - name: Resolve built version
         id: version
-        run: |
-          python - <<'PY' >> "$GITHUB_OUTPUT"
-          import pathlib, tomllib
-          data = tomllib.loads(pathlib.Path("pyproject.toml").read_text())
-          print(f"version={data['project']['version']}")
-          PY
+        run: echo "version=$(uv version --short --color never)" >> "$GITHUB_OUTPUT"
 
       - name: Smoke-test the wheel
         run: |
-          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
-          python -m pip install dist/*.whl
-          cd /tmp
-          python -c "import torch_checkpointing as m; print('torch_checkpointing', getattr(m, '__version__', 'imported ok'))"
+          uv venv --no-project "$RUNNER_TEMP/smoke"
+          uv pip install --python "$RUNNER_TEMP/smoke" --torch-backend cpu dist/*.whl
+          cd "$RUNNER_TEMP"
+          "$RUNNER_TEMP/smoke/bin/python" -c "import torch_checkpointing as m; print('torch_checkpointing', m.__version__)"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v7

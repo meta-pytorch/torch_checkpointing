@@ -1,6 +1,6 @@
 [build-system]
-requires = ["setuptools>=77.0.3"]
-build-backend = "setuptools.build_meta"
+requires = ["uv_build>=0.9.7,<0.14"]
+build-backend = "uv_build"
 
 [project]
 name = "torch_checkpointing"
@@ -31,6 +31,8 @@ classifiers = [
 ]
 requires-python = ">=3.11"
 dependencies = [
+    # 2.11 is the first release whose `torch.load(map_location="meta")` reads
+    # only the headers of a file, which the offset-based reads rely on.
     "torch>=2.11.0",
     # The first numpy with Python 3.11 wheels.
     "numpy>=1.23.2",
@@ -43,29 +45,55 @@ Homepage = "https://github.com/meta-pytorch/torch_checkpointing"
 Repository = "https://github.com/meta-pytorch/torch_checkpointing"
 Issues = "https://github.com/meta-pytorch/torch_checkpointing/issues"
 
-[project.optional-dependencies]
-dev = [
-    "pytest>=7.0.0",
-    "pytest-cov>=4.0.0",
-    "expecttest",
-    "black>=23.0.0",
-    "isort>=5.12.0",
-    "mypy>=1.5.0",
-]
+[dependency-groups]
 test = [
-    "pytest>=7.0.0",
-    "pytest-cov>=4.0.0",
-    "expecttest",
+    "pytest>=8.0",
+    # Parallel runs: `uv run pytest -n 8 --dist loadfile`.
+    "pytest-xdist>=3.5",
+    # Reports failures as annotations on GitHub Actions run pages; inactive elsewhere.
+    "pytest-github-actions-annotate-failures>=0.3",
+    # Both imported by torch.testing._internal.common_utils, which torch does
+    # not declare as dependencies on every supported Python version.
+    "expecttest>=0.2.1",
+    "setuptools>=77.0.3",
+]
+# Pinned, so that every environment lints with the same rules.
+lint = ["ruff==0.15.4"]
+dev = [
+    { include-group = "test" },
+    { include-group = "lint" },
+]
+# Which torch build `uv sync` installs; pick one. `cuda` (the default) is the
+# PyPI build, which is CUDA-enabled on Linux. `cpu` is the CPU-only build, for
+# CI and machines without a GPU: `uv sync --no-group cuda --group cpu`.
+cuda = ["torch>=2.11.0"]
+cpu = ["torch>=2.11.0"]
+
+[tool.uv]
+required-version = ">=0.9.7"
+default-groups = ["dev", "cuda"]
+conflicts = [[{ group = "cpu" }, { group = "cuda" }]]
+# Only resolve versions with wheels for these platforms. Without this, uv may
+# pick a torch version from the CPU index that has wheels for macOS only.
+required-environments = [
+    "sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "sys_platform == 'linux' and platform_machine == 'aarch64'",
+    "sys_platform == 'darwin' and platform_machine == 'arm64'",
 ]
 
-[tool.setuptools.packages.find]
-where = ["."]
-include = ["torch_checkpointing*"]
-exclude = ["tests*"]
+[tool.uv.build-backend]
+module-root = ""
+source-include = ["tests/**"]
 
-[tool.setuptools.package-data]
-"torch_checkpointing" = ["py.typed"]
+# Scoped to the `cpu` group, so it never applies when another project installs
+# this one from git or a path. Published metadata depends on plain `torch`.
+[tool.uv.sources]
+torch = { index = "pytorch-cpu", group = "cpu" }
 
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
 
 # Pyright type checker configuration
 [tool.pyright]

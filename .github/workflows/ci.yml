@@ -5,45 +5,85 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+# The runners have no GPUs: the test jobs install the `cpu` dependency group
+# instead of the default `cuda` one, and the GPU tests skip themselves.
+# `uv run --no-sync` keeps uv from switching back to the default groups.
 jobs:
   test:
+    name: test (Python ${{ matrix.python-version }}, locked deps)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
         python-version: ["3.11", "3.12", "3.13", "3.14"]
-        torch-version: ["stable", "nightly"]
     steps:
       - uses: actions/checkout@v7
-      - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v7
+      - uses: astral-sh/setup-uv@v10
         with:
           python-version: ${{ matrix.python-version }}
-      - name: Install dependencies
-        run: |
-          pip install --upgrade pip
-          if [ "${{ matrix.torch-version }}" = "nightly" ]; then
-            pip install --pre torch --index-url https://download.pytorch.org/whl/nightly/cpu
-          else
-            pip install torch --index-url https://download.pytorch.org/whl/cpu
-          fi
-          pip install -e ".[test]"
-          # Reports each failing test as an annotation on the run page, which,
-          # unlike the job log, is readable without signing in.
-          pip install pytest-github-actions-annotate-failures
+          enable-cache: true
+      - name: Install
+        run: uv sync --locked --no-group cuda --group cpu
       - name: Run tests
-        run: pytest tests/
+        run: uv run --no-sync pytest
+
+  test-torch-nightly:
+    name: test (Python 3.14, torch nightly)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10
+        with:
+          python-version: "3.14"
+          enable-cache: true
+          cache-suffix: nightly
+      - name: Install
+        run: |
+          uv sync --locked --no-group cuda --group cpu
+          uv pip install --python .venv --pre --upgrade-package torch torch --index-url https://download.pytorch.org/whl/nightly/cpu
+          uv run --no-sync python -c "import torch; print(torch.__version__)"
+      - name: Run tests
+        run: uv run --no-sync pytest
 
   lint:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
-      - name: Set up Python
-        uses: actions/setup-python@v7
+      - uses: astral-sh/setup-uv@v10
         with:
-          python-version: "3.12"
-      - name: Install ruff
-        run: pip install ruff
-      - name: Ruff lint
-        run: ruff check .
+          enable-cache: true
+          cache-suffix: lint
+      - name: Check that uv.lock is up to date
+        run: uv lock --check
+      - name: Ruff
+        run: uv run --locked --only-group lint ruff check .
+
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10
+        with:
+          enable-cache: true
+          cache-suffix: build
+      - name: Build sdist and wheel
+        run: uv build
+      - name: Smoke-test the wheel
+        run: |
+          uv venv --python 3.12 --no-project "$RUNNER_TEMP/smoke"
+          uv pip install --python "$RUNNER_TEMP/smoke" --torch-backend cpu dist/*.whl
+          cd "$RUNNER_TEMP"
+          "$RUNNER_TEMP/smoke/bin/python" -c "import torch_checkpointing as m; print(m.__version__)"
