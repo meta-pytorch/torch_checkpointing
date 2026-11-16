@@ -125,6 +125,7 @@ markers = [
     "gpus_needed_2: requires 2 GPUs",
     "gpus_needed_4: requires 4 GPUs",
     "gpus_needed_8: requires 8 GPUs",
+    "no_pack: Never run this test file in one pytest process with other test files (Buildkite shard packing).",
 ]
 
 [tool.ruff]
