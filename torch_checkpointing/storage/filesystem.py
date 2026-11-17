@@ -12,17 +12,22 @@ import shutil
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import IO
 
 from typing_extensions import Buffer, override
 
 from .base_storage import ReadArgs, Storage, StorageConfig
 
+try:
+    import fcntl
+except ModuleNotFoundError:
+    fcntl = None
+
 logger = logging.getLogger(__name__)
 
 # O_DIRECT is Linux-only. Platforms without it (macOS, Windows) take the
 # buffered I/O path, the same fallback used when a filesystem refuses O_DIRECT.
-_O_DIRECT: int | None = getattr(os, "O_DIRECT", None)
+# It is only used where fcntl can clear it again.
+_O_DIRECT: int | None = getattr(os, "O_DIRECT", None) if fcntl is not None else None
 
 
 def _occupied_destination_error(
@@ -51,92 +56,61 @@ class LocalFileSystemStorageConfig(StorageConfig):
         return LocalFileSystemStorage(config=self)
 
 
-class WriteStream(io.IOBase):
+def _buffer_size(fd: int) -> int:
+    """The buffer size ``open()`` would pick for ``fd``."""
+    block_size = os.fstat(fd).st_blksize
+    return block_size if block_size > 1 else io.DEFAULT_BUFFER_SIZE
+
+
+def _clear_o_direct(fd: int) -> None:
+    """Switch ``fd`` to buffered I/O at its current offset.
+
+    Clears O_DIRECT on the open file description, so the offset carries over
+    and the file is not reopened by path.
     """
-    File-like write stream with directio support.
-    Automatically tries O_DIRECT and falls back to regular I/O if needed.
+    assert fcntl is not None, "O_DIRECT is only used where fcntl is available"
+    flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+    fcntl.fcntl(fd, fcntl.F_SETFL, flags & ~os.O_DIRECT)
+
+
+class _DirectIOWriter(io.FileIO):
+    """Raw writer for a file opened with O_DIRECT, with a buffered fallback.
+
+    A serialized byte stream cannot keep O_DIRECT's alignment rules: it writes
+    small headers and payloads at arbitrary offsets, from buffers that are not
+    block aligned. FUSE mounts and btrfs accept such writes (btrfs by routing
+    them through the page cache), while ext4 and XFS accept the O_DIRECT open
+    but reject the writes with EINVAL. On the first rejected write this clears
+    O_DIRECT on the descriptor and retries the write. A failed write(2) leaves
+    the file offset where it was, so the retry continues at the right place.
+    The refusal is reported through ``on_unsupported``, so the owner can stop
+    asking for O_DIRECT on later files.
+
+    The fallback lives in the raw file because the ``io.BufferedWriter`` that
+    wraps it issues the actual writes, including from ``flush()`` and
+    ``close()``, so only here are a failed write's bytes and offset known.
     """
 
-    def __init__(self, path: str | Path, mode: str = "wb", use_direct_io: bool = True):
+    def __init__(
+        self, fd: int, path: Path, on_unsupported: Callable[[Path, str], None]
+    ) -> None:
+        super().__init__(fd, "w", closefd=True)
         self._path = path
-        self._mode = mode
-        self._use_direct_io = use_direct_io
-        self._fd: int | None = None
-        self._file: IO | None = None
-        self._using_direct_io = False
+        self._on_unsupported = on_unsupported
+        self._direct_io = True
 
-    def __enter__(self):
-        # Check if parent directory exists and raise an error if it doesn't.
-        parent_dir = os.path.dirname(self._path)
-        if parent_dir and not os.path.exists(parent_dir):
-            raise RuntimeError(
-                f"Parent directory does not exist, create it!: {parent_dir}"
-            )
-
-        if self._use_direct_io and _O_DIRECT is not None:
-            # Try directio first
-            f_mode = os.O_RDWR | os.O_CREAT | os.O_TRUNC
+    @override
+    def write(self, b: Buffer, /) -> int:
+        if self._direct_io:
             try:
-                self._fd = os.open(self._path, f_mode | _O_DIRECT)
-                self._file = os.fdopen(self._fd, self._mode)
-                self._fd = None  # fdopen takes ownership
-                self._using_direct_io = True
-                logger.debug(f"Opened {self._path} with O_DIRECT")
+                return os.write(self.fileno(), b)
             except OSError as e:
-                if (
-                    e.errno == 22
-                ):  # Invalid argument - filesystem doesn't support O_DIRECT
-                    logger.warning(
-                        f"File system does not support O_DIRECT, falling back to default mode for {self._path}"
-                    )
-                    # Fall through to regular open
-                    if self._fd is not None:
-                        try:
-                            os.close(self._fd)
-                        except OSError:
-                            pass
-                        self._fd = None
-                else:
+                if e.errno != errno.EINVAL:
                     raise
-
-        # Use regular I/O (either by choice or as fallback)
-        if self._file is None:
-            self._file = open(self._path, self._mode)
-            self._using_direct_io = False
-
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self.close()
-
-    def write(self, data: Buffer) -> int:
-        if self._file is None:
-            raise ValueError("File is not open")
-        if isinstance(data, (bytes, bytearray)):
-            return self._file.write(data)
-        else:
-            mv = memoryview(data)
-            return self._file.write(mv)
-
-    def flush(self):
-        if self._file is not None:
-            self._file.flush()
-
-    def close(self):
-        if self._file:
-            self._file.close()
-            self._file = None
-        if self._fd is not None:
-            try:
-                os.close(self._fd)
-            except OSError:
-                pass
-            self._fd = None
-
-    @property
-    def using_direct_io(self) -> bool:
-        """Returns True if this stream is using direct I/O."""
-        return self._using_direct_io
+            _clear_o_direct(self.fileno())
+            self._direct_io = False
+            self._on_unsupported(self._path, "write")
+        return os.write(self.fileno(), b)
 
 
 class _DirectIOReader(io.RawIOBase):
@@ -221,22 +195,40 @@ class LocalFileSystemStorage(Storage):
         if config is None:
             raise ValueError("config must be provided")
         self._use_direct_io = config.use_direct_io
-        # Cleared once the filesystem refuses an O_DIRECT open or read, so later
-        # files are read with buffered I/O without trying O_DIRECT again.
-        self._try_direct_io_reads = _O_DIRECT is not None
+        # Cleared once the filesystem refuses an O_DIRECT open, read or write,
+        # so later files are read and written with buffered I/O without trying
+        # O_DIRECT again. One flag covers both directions: filesystems apply the
+        # same alignment rules to O_DIRECT reads and writes.
+        self._try_direct_io = _O_DIRECT is not None
 
-    def _disable_direct_io_reads(self, path: Path, operation: str) -> None:
-        if self._try_direct_io_reads:
-            self._try_direct_io_reads = False
+    def _disable_direct_io(self, path: Path, operation: str) -> None:
+        if self._try_direct_io:
+            self._try_direct_io = False
             logger.warning(
-                f"O_DIRECT {operation} failed for {path}; reading later files "
-                "with buffered I/O"
+                f"O_DIRECT {operation} failed for {path}; using buffered I/O for "
+                "it and for later files"
             )
+
+    def _open_for_write(self, path: Path) -> io.BufferedWriter:
+        """Open file for writing, with O_DIRECT where the filesystem allows it."""
+        if self._use_direct_io and self._try_direct_io:
+            try:
+                fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_DIRECT)
+            except OSError as e:
+                if e.errno != errno.EINVAL:
+                    raise
+                self._disable_direct_io(path, "open")
+            else:
+                return io.BufferedWriter(
+                    _DirectIOWriter(fd, path, self._disable_direct_io),
+                    buffer_size=_buffer_size(fd),
+                )
+        return open(path, "wb")
 
     def _open_for_read(self, path: Path, use_direct_io: bool) -> io.RawIOBase:
         """Open file for reading, with optional O_DIRECT support."""
-        if use_direct_io and self._try_direct_io_reads:
-            return _DirectIOReader(path, self._disable_direct_io_reads)
+        if use_direct_io and self._try_direct_io:
+            return _DirectIOReader(path, self._disable_direct_io)
         return open(path, "rb", buffering=0)
 
     def _read_full_file(self, path: Path, use_direct_io: bool) -> io.BytesIO:
@@ -272,11 +264,11 @@ class LocalFileSystemStorage(Storage):
     @override
     def stream_write(self, path: Path) -> io.IOBase:
         """Return a file-like object for writing. Object must have a write() method."""
-        return WriteStream(path, "wb", self._use_direct_io)
+        return self._open_for_write(path)
 
     @override
     def write(self, path: Path, data: Buffer) -> None:
-        with WriteStream(path, "wb", self._use_direct_io) as f:
+        with self._open_for_write(path) as f:
             f.write(data)
 
     @override

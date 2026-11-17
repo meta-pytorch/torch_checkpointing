@@ -10,6 +10,7 @@ import logging
 import os
 import random
 import shutil
+from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from unittest import mock
@@ -21,6 +22,7 @@ from torch.testing._internal.common_utils import TestCase
 from torch_checkpointing.storage import filesystem
 from torch_checkpointing.storage.base_storage import ReadArgs
 from torch_checkpointing.storage.filesystem import LocalFileSystemStorageConfig
+from typing_extensions import Buffer
 
 
 @contextmanager
@@ -195,14 +197,12 @@ class TestStorage(TestCase):
         self.assertFalse(os.path.exists(nonexistent_dir))
 
         # Test that write() fails with FileNotFoundError
-        with pytest.raises(RuntimeError):
+        with pytest.raises(FileNotFoundError):
             self.storage.write(Path(test_file), b"test data")
 
         # Test that stream_write() also fails with FileNotFoundError
-        stream = self.storage.stream_write(Path(test_file))
-        with pytest.raises(RuntimeError):
-            with stream:
-                stream.write(b"test data")
+        with pytest.raises(FileNotFoundError):
+            self.storage.stream_write(Path(test_file))
 
         # Verify the file was not created
         self.assertFalse(os.path.exists(test_file))
@@ -338,6 +338,22 @@ class TestStorage(TestCase):
         self.assertEqual(dst.read_bytes(), b"new")
 
 
+# Tests of the O_DIRECT paths, which the storage uses only where O_DIRECT exists.
+requires_o_direct = pytest.mark.skipif(
+    filesystem._O_DIRECT is None,
+    reason="the storage does not use O_DIRECT on this platform",
+)
+
+
+def _has_o_direct(fd: int) -> bool:
+    """Whether ``fd`` has O_DIRECT set."""
+    # fcntl is missing on Windows; only tests that require O_DIRECT call this.
+    import fcntl
+
+    return bool(fcntl.fcntl(fd, fcntl.F_GETFL) & os.O_DIRECT)
+
+
+@requires_o_direct
 def test_direct_io_stream_falls_back_to_buffered_reads_on_einval(
     tmp_path: Path,
 ) -> None:
@@ -361,6 +377,7 @@ def test_direct_io_stream_falls_back_to_buffered_reads_on_einval(
         assert stream.read(7) == data[1013:1020]
 
 
+@requires_o_direct
 def test_direct_io_refusal_is_remembered_by_the_storage(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -392,6 +409,7 @@ def test_direct_io_refusal_is_remembered_by_the_storage(
     assert caplog.text.count("O_DIRECT open failed") == 1
 
 
+@requires_o_direct
 def test_direct_io_fallback_resumes_from_where_the_failed_read_started(
     tmp_path: Path,
 ) -> None:
@@ -415,3 +433,115 @@ def test_direct_io_fallback_resumes_from_where_the_failed_read_started(
             buffer = bytearray(1000)
             assert stream.readinto(buffer) == 1000
         assert bytes(buffer) == data[13:1013]
+
+
+@contextmanager
+def _rejecting_direct_writes() -> Iterator[None]:
+    """Refuse every write on an O_DIRECT descriptor, as ext4 and XFS refuse
+    unaligned ones."""
+    real_write = os.write
+
+    def write(fd: int, data: Buffer) -> int:
+        if _has_o_direct(fd):
+            raise OSError(errno.EINVAL, "unaligned O_DIRECT write")
+        return real_write(fd, data)
+
+    with mock.patch.object(filesystem.os, "write", write):
+        yield
+
+
+@contextmanager
+def _recording_direct_opens(*, refuse: bool) -> Iterator[list[str]]:
+    """Record the paths opened with O_DIRECT, refusing those opens if asked."""
+    real_open = os.open
+    direct_opens: list[str] = []
+
+    def open_(path: str, flags: int, *args: int) -> int:
+        if flags & os.O_DIRECT:
+            direct_opens.append(str(path))
+            if refuse:
+                raise OSError(errno.EINVAL, "O_DIRECT not supported")
+        return real_open(path, flags, *args)
+
+    with mock.patch.object(filesystem.os, "open", open_):
+        yield direct_opens
+
+
+@requires_o_direct
+def test_direct_io_write_falls_back_to_buffered_on_einval(tmp_path: Path) -> None:
+    path = tmp_path / "data.pt"
+    state = {"small": torch.arange(10.0), "large": torch.randn(1 << 20)}
+    storage = LocalFileSystemStorageConfig(use_direct_io=True).create_storage()
+
+    with _rejecting_direct_writes():
+        with storage.stream_write(path) as stream:
+            torch.save(state, stream)
+            assert not _has_o_direct(stream.fileno())
+
+    loaded = torch.load(path)
+    assert loaded.keys() == state.keys()
+    for key, tensor in state.items():
+        assert torch.equal(loaded[key], tensor)
+
+
+@pytest.mark.parametrize("use_direct_io", [True, False])
+def test_write_to_missing_directory_raises_file_not_found(
+    tmp_path: Path, use_direct_io: bool
+) -> None:
+    path = tmp_path / "missing" / "data.bin"
+    config = LocalFileSystemStorageConfig(use_direct_io=use_direct_io)
+    storage = config.create_storage()
+
+    with pytest.raises(FileNotFoundError):
+        storage.write(path, b"data")
+    with pytest.raises(FileNotFoundError):
+        storage.stream_write(path)
+
+
+@requires_o_direct
+def test_direct_io_write_refusal_is_remembered_by_the_storage(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    paths = [tmp_path / f"data_{i}.bin" for i in range(3)]
+    storage = LocalFileSystemStorageConfig(use_direct_io=True).create_storage()
+
+    with (
+        _recording_direct_opens(refuse=False) as direct_opens,
+        _rejecting_direct_writes(),
+        caplog.at_level(logging.WARNING),
+    ):
+        for i, path in enumerate(paths):
+            storage.write(path, bytes([i]) * 1000)
+
+    for i, path in enumerate(paths):
+        assert path.read_bytes() == bytes([i]) * 1000
+    # Only the first file tries O_DIRECT, and the refusal is logged once.
+    assert direct_opens == [str(paths[0])]
+    assert caplog.text.count("O_DIRECT write failed") == 1
+
+
+@requires_o_direct
+@pytest.mark.parametrize("refused_first", ["read", "write"])
+def test_direct_io_refusal_covers_reads_and_writes(
+    tmp_path: Path, refused_first: str
+) -> None:
+    path = tmp_path / "data.bin"
+    path.write_bytes(os.urandom(4096))
+    storage = LocalFileSystemStorageConfig(use_direct_io=True).create_storage()
+
+    def read() -> None:
+        with storage.stream_read(
+            path, ReadArgs(pre_read_full_file=False, direct_io=True)
+        ) as stream:
+            stream.read()
+
+    def write() -> None:
+        storage.write(path, os.urandom(4096))
+
+    operations = [read, write] if refused_first == "read" else [write, read]
+    with _recording_direct_opens(refuse=True) as direct_opens:
+        for operation in operations:
+            operation()
+
+    # The refusal in one direction stops O_DIRECT attempts in the other.
+    assert direct_opens == [str(path)]

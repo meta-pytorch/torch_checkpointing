@@ -150,9 +150,9 @@ optimizer.zero_grad()
 
 ## Warning about `O_DIRECT` / direct I/O
 
-**Cause.** The local filesystem backend attempts `O_DIRECT` (to bypass the page cache during large I/O) and automatically falls back to buffered I/O when the filesystem doesn't support it, logging a warning. This is benign — the checkpoint still works.
+**Cause.** The local filesystem backend tries `O_DIRECT` (to bypass the page cache during large I/O). Some filesystems refuse it: ext4 and XFS reject the unaligned reads and writes that checkpoints make, and some filesystems refuse to open files with `O_DIRECT` at all. On the first refusal the storage switches to buffered I/O for that file and all later ones, and logs one warning. This is benign — the checkpoint still works.
 
-**Fix.** Nothing required. To silence the warning on filesystems without direct-I/O support, disable it on the storage config and pass it to the manager:
+**Fix.** Nothing required. To skip the attempt for writes on filesystems that refuse direct I/O, disable it on the storage config and pass it to the manager (offset reads during loading request `O_DIRECT` through `ReadArgs` regardless of this setting):
 
 ```python
 from torch_checkpointing import CheckpointManager

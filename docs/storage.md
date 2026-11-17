@@ -250,27 +250,30 @@ controls whether writes (and reads that opt in via `ReadArgs`) attempt
 ### O_DIRECT with automatic buffered-I/O fallback
 
 `O_DIRECT` bypasses the OS page cache, which avoids cache churn during large
-checkpoint I/O — but not every filesystem supports it. The backend attempts
-`O_DIRECT` and transparently falls back to buffered I/O when it is not
-available, so the same config works everywhere.
+checkpoint I/O. Filesystems differ in how much of it they support:
 
-**Writes** go through the `WriteStream` file-like object. On entry it first
-verifies the parent directory exists (raising `RuntimeError` otherwise), then,
-when `use_direct_io` is set, opens the file with
-`os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_DIRECT`. If that raises `OSError`
-with `errno == 22` (`EINVAL` — the filesystem does not support `O_DIRECT`), it
-logs a warning and falls through to a regular `open(...)`; any other error is
-re-raised. You can inspect which path was taken via the `using_direct_io`
-property. Both `stream_write` and the whole-file `write` use `WriteStream`:
+- FUSE mounts, btrfs and tmpfs accept `O_DIRECT` reads and writes at any
+  offset, length and buffer address.
+- ext4 and XFS accept the `O_DIRECT` open but reject, with `EINVAL`, reads and
+  writes that are not aligned to the device's logical block size. Serialized
+  checkpoint data is never aligned, so there every `O_DIRECT` write fails.
+- Some filesystems refuse the `O_DIRECT` open itself.
 
-```python
-def stream_write(self, path: Path) -> io.IOBase:
-    return WriteStream(path, "wb", self._use_direct_io)
+Support can only be found by trying, so the backend starts with `O_DIRECT` and
+switches to buffered I/O wherever the filesystem refuses it: at the open, on a
+read or on a write. A refused call transfers no data, so switching costs one
+failed system call. The `LocalFileSystemStorage` instance then stops trying
+`O_DIRECT` for later files, for reads and writes alike, and logs one warning.
 
-def write(self, path: Path, data: Buffer) -> None:
-    with WriteStream(path, "wb", self._use_direct_io) as f:
-        f.write(data)
-```
+**Writes** go through an `io.BufferedWriter`, which `stream_write` returns and
+the whole-file `write` uses. When `use_direct_io` is set, the file is opened
+with `os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_DIRECT`, and the buffered
+writer wraps a raw file that writes with `O_DIRECT`. If a write is refused with
+`EINVAL`, the raw file clears `O_DIRECT` on the open file and retries; the
+failed write left the file offset unchanged, so the retry lands in the right
+place. If the open is refused, or `use_direct_io` is off, the file is opened
+with a plain `open(path, "wb")`. A missing parent directory raises
+`FileNotFoundError`.
 
 **Reads** are governed by `ReadArgs`, *not* by the config's `use_direct_io`.
 When no `read_args` is passed, `stream_read` defaults to
@@ -291,11 +294,10 @@ def stream_read(
     return self._open_for_read(path, use_direct_io)
 ```
 
-Read fallback happens in two places. `_open_for_read` opens with
-`os.O_DIRECT | os.O_RDONLY` and, on `errno == 22`, warns and falls back to a
-buffered `open(path, "rb", buffering=0)`. `_read_full_file` adds a second guard:
-if the `O_DIRECT` *read itself* fails with `errno == 22` (for example, inside
-containers with volume mounts), it retries the whole read with buffered I/O.
+With `direct_io=True`, `_open_for_read` returns a stream that opens the file
+with `os.O_DIRECT | os.O_RDONLY` and reopens it buffered, at the same position,
+if the filesystem refuses the open or a read. `_read_full_file` also retries
+the whole read with buffered I/O if it fails with `EINVAL`.
 
 ### Directory and rename semantics
 
@@ -470,5 +472,5 @@ manager = CheckpointManager(CheckpointManager.Config(
 - Abstract base classes: `storage/base_storage.py`
   (`Storage`, `StorageConfig`, `ReadArgs`).
 - Reference backend: `storage/filesystem.py`
-  (`LocalFileSystemStorage`, `LocalFileSystemStorageConfig`, `WriteStream`).
+  (`LocalFileSystemStorage`, `LocalFileSystemStorageConfig`).
 - Related docs: [./key_concepts.md](./key_concepts.md), [../README.md](../README.md).

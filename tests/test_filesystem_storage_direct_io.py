@@ -12,10 +12,7 @@ from unittest import mock
 import torch_checkpointing.storage.filesystem as filesystem_module
 from torch.testing._internal.common_utils import run_tests, TestCase
 from torch_checkpointing.storage.base_storage import ReadArgs
-from torch_checkpointing.storage.filesystem import (
-    LocalFileSystemStorageConfig,
-    WriteStream,
-)
+from torch_checkpointing.storage.filesystem import LocalFileSystemStorageConfig
 
 
 class TestDirectIOWithoutOSSupport(TestCase):
@@ -30,15 +27,17 @@ class TestDirectIOWithoutOSSupport(TestCase):
         self.addCleanup(patcher.stop)
         self.addCleanup(self._tmp.cleanup)
 
-    def test_write_stream_falls_back_to_buffered_io(self) -> None:
-        with WriteStream(self.path, use_direct_io=True) as stream:
+    def test_stream_write_falls_back_to_buffered_io(self) -> None:
+        storage = LocalFileSystemStorageConfig(use_direct_io=True).create_storage()
+        with storage.stream_write(self.path) as stream:
+            assert isinstance(stream, io.BufferedWriter)
+            self.assertIs(type(stream.raw), io.FileIO)
             stream.write(b"x" * 16)
-            self.assertFalse(stream.using_direct_io)
         self.assertEqual(self.path.read_bytes(), b"x" * 16)
 
     def test_storage_round_trip_never_tries_direct_io(self) -> None:
         storage = LocalFileSystemStorageConfig().create_storage()
-        self.assertFalse(storage._try_direct_io_reads)
+        self.assertFalse(storage._try_direct_io)
         storage.write(self.path, b"z" * 32)
         self.assertEqual(storage.read(self.path), b"z" * 32)
         # Asking for direct I/O still opens a plain buffered file.
