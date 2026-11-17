@@ -45,6 +45,10 @@ Homepage = "https://github.com/meta-pytorch/torch_checkpointing"
 Repository = "https://github.com/meta-pytorch/torch_checkpointing"
 Issues = "https://github.com/meta-pytorch/torch_checkpointing/issues"
 
+[project.optional-dependencies]
+# For FsspecStorage. The driver for a store (gcsfs, ...) is installed separately.
+fsspec = ["fsspec>=2026.9.0"]
+
 [dependency-groups]
 test = [
     "pytest>=8.0",
@@ -56,6 +60,8 @@ test = [
     # not declare as dependencies on every supported Python version.
     "expecttest>=0.2.1",
     "setuptools>=77.0.3",
+    # Imported by tests/test_fsspec_storage.py.
+    "fsspec>=2026.9.0",
 ]
 # Pinned, so that every environment lints with the same rules.
 lint = ["ruff==0.15.4"]

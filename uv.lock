@@ -3,12 +3,12 @@ revision = 5
 requires-python = ">=3.11"
 resolution-markers = [
     "python_full_version >= '3.12' and extra != 'group-19-torch-checkpointing-cpu' and extra == 'group-19-torch-checkpointing-cuda'",
-    "python_full_version < '3.12' and extra != 'group-19-torch-checkpointing-cpu' and extra == 'group-19-torch-checkpointing-cuda'",
     "(python_full_version >= '3.12' and sys_platform == 'linux' and extra == 'group-19-torch-checkpointing-cpu' and extra != 'group-19-torch-checkpointing-cuda') or (python_full_version >= '3.12' and sys_platform == 'win32' and extra == 'group-19-torch-checkpointing-cpu' and extra != 'group-19-torch-checkpointing-cuda')",
     "python_full_version >= '3.12' and sys_platform != 'linux' and sys_platform != 'win32' and extra == 'group-19-torch-checkpointing-cpu' and extra != 'group-19-torch-checkpointing-cuda'",
+    "python_full_version >= '3.12' and extra != 'group-19-torch-checkpointing-cpu' and extra != 'group-19-torch-checkpointing-cuda'",
+    "python_full_version < '3.12' and extra != 'group-19-torch-checkpointing-cpu' and extra == 'group-19-torch-checkpointing-cuda'",
     "(python_full_version < '3.12' and sys_platform == 'linux' and extra == 'group-19-torch-checkpointing-cpu' and extra != 'group-19-torch-checkpointing-cuda') or (python_full_version < '3.12' and sys_platform == 'win32' and extra == 'group-19-torch-checkpointing-cpu' and extra != 'group-19-torch-checkpointing-cuda')",
     "python_full_version < '3.12' and sys_platform != 'linux' and sys_platform != 'win32' and extra == 'group-19-torch-checkpointing-cpu' and extra != 'group-19-torch-checkpointing-cuda'",
-    "python_full_version >= '3.12' and extra != 'group-19-torch-checkpointing-cpu' and extra != 'group-19-torch-checkpointing-cuda'",
     "python_full_version < '3.12' and extra != 'group-19-torch-checkpointing-cpu' and extra != 'group-19-torch-checkpointing-cuda'",
 ]
 required-markers = [
@@ -966,6 +966,11 @@ dependencies = [
     { name = "typing-extensions" },
 ]
 
+[package.optional-dependencies]
+fsspec = [
+    { name = "fsspec" },
+]
+
 [package.dev-dependencies]
 cpu = [
     { name = "torch", version = "2.15.0", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "(sys_platform != 'linux' and sys_platform != 'win32' and extra == 'group-19-torch-checkpointing-cpu') or (extra == 'group-19-torch-checkpointing-cpu' and extra == 'group-19-torch-checkpointing-cuda')" },
@@ -976,6 +981,7 @@ cuda = [
 ]
 dev = [
     { name = "expecttest" },
+    { name = "fsspec" },
     { name = "pytest" },
     { name = "pytest-github-actions-annotate-failures" },
     { name = "pytest-xdist" },
@@ -987,6 +993,7 @@ lint = [
 ]
 test = [
     { name = "expecttest" },
+    { name = "fsspec" },
     { name = "pytest" },
     { name = "pytest-github-actions-annotate-failures" },
     { name = "pytest-xdist" },
@@ -995,17 +1002,20 @@ test = [
 
 [package.metadata]
 requires-dist = [
+    { name = "fsspec", marker = "extra == 'fsspec'", specifier = ">=2026.9.0" },
     { name = "numpy", specifier = ">=1.23.2" },
     { name = "safetensors", specifier = ">=0.4.3" },
     { name = "torch", specifier = ">=2.11.0" },
     { name = "typing-extensions", specifier = ">=4.6.0" },
 ]
+provides-extras = ["fsspec"]
 
 [package.metadata.requires-dev]
 cpu = [{ name = "torch", specifier = ">=2.11.0", index = "https://download.pytorch.org/whl/cpu", conflict = { package = "torch-checkpointing", group = "cpu" } }]
 cuda = [{ name = "torch", specifier = ">=2.11.0" }]
 dev = [
     { name = "expecttest", specifier = ">=0.2.1" },
+    { name = "fsspec", specifier = ">=2026.9.0" },
     { name = "pytest", specifier = ">=8.0" },
     { name = "pytest-github-actions-annotate-failures", specifier = ">=0.3" },
     { name = "pytest-xdist", specifier = ">=3.5" },
@@ -1015,6 +1025,7 @@ dev = [
 lint = [{ name = "ruff", specifier = "==0.15.4" }]
 test = [
     { name = "expecttest", specifier = ">=0.2.1" },
+    { name = "fsspec", specifier = ">=2026.9.0" },
     { name = "pytest", specifier = ">=8.0" },
     { name = "pytest-github-actions-annotate-failures", specifier = ">=0.3" },
     { name = "pytest-xdist", specifier = ">=3.5" },
