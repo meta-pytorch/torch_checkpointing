@@ -6,6 +6,7 @@
 
 import array
 import errno
+import io
 import logging
 import os
 import random
@@ -353,6 +354,21 @@ def _has_o_direct(fd: int) -> bool:
     return bool(fcntl.fcntl(fd, fcntl.F_GETFL) & os.O_DIRECT)
 
 
+@contextmanager
+def _rejecting_direct_reads(file: io.RawIOBase) -> Iterator[None]:
+    """Refuse every read of ``file`` while it has O_DIRECT set, as ext4 and XFS
+    refuse unaligned ones."""
+    real_readinto = file.readinto
+
+    def readinto(buffer: Buffer) -> int | None:
+        if _has_o_direct(file.fileno()):
+            raise OSError(errno.EINVAL, "unaligned O_DIRECT read")
+        return real_readinto(buffer)
+
+    with mock.patch.object(file, "readinto", readinto):
+        yield
+
+
 @requires_o_direct
 def test_direct_io_stream_falls_back_to_buffered_reads_on_einval(
     tmp_path: Path,
@@ -365,16 +381,17 @@ def test_direct_io_stream_falls_back_to_buffered_reads_on_einval(
     with storage.stream_read(
         path, ReadArgs(pre_read_full_file=False, direct_io=True)
     ) as stream:
+        assert isinstance(stream, filesystem._DirectIOReader)
+        direct_file = stream._file
         stream.seek(13)
-        rejected = mock.Mock(
-            side_effect=OSError(errno.EINVAL, "unaligned O_DIRECT read")
-        )
-        with mock.patch.object(stream._file, "readinto", rejected):
+        with _rejecting_direct_reads(direct_file):
             buffer = bytearray(1000)
             assert stream.readinto(buffer) == 1000
-        assert bytes(buffer) == data[13:1013]
-        # Later reads continue from the same position without O_DIRECT.
-        assert stream.read(7) == data[1013:1020]
+            assert bytes(buffer) == data[13:1013]
+            # Later reads continue from the same position without O_DIRECT.
+            assert stream.read(7) == data[1013:1020]
+        assert not _has_o_direct(direct_file.fileno())
+    assert not storage._try_direct_io
 
 
 @requires_o_direct
@@ -407,32 +424,6 @@ def test_direct_io_refusal_is_remembered_by_the_storage(
     # Only the first file tries O_DIRECT, and the refusal is logged once.
     assert direct_opens == [paths[0]]
     assert caplog.text.count("O_DIRECT open failed") == 1
-
-
-@requires_o_direct
-def test_direct_io_fallback_resumes_from_where_the_failed_read_started(
-    tmp_path: Path,
-) -> None:
-    path = tmp_path / "data.bin"
-    data = os.urandom(10_000)
-    path.write_bytes(data)
-    storage = LocalFileSystemStorageConfig().create_storage()
-
-    with storage.stream_read(
-        path, ReadArgs(pre_read_full_file=False, direct_io=True)
-    ) as stream:
-        stream.seek(13)
-        direct_file = stream._file
-
-        def advance_then_reject(buffer):
-            # A failed read that still moves the file offset.
-            direct_file.seek(500, os.SEEK_CUR)
-            raise OSError(errno.EINVAL, "unaligned O_DIRECT read")
-
-        with mock.patch.object(direct_file, "readinto", advance_then_reject):
-            buffer = bytearray(1000)
-            assert stream.readinto(buffer) == 1000
-        assert bytes(buffer) == data[13:1013]
 
 
 @contextmanager

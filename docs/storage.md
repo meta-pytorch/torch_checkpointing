@@ -294,10 +294,11 @@ def stream_read(
     return self._open_for_read(path, use_direct_io)
 ```
 
-With `direct_io=True`, `_open_for_read` returns a stream that opens the file
-with `os.O_DIRECT | os.O_RDONLY` and reopens it buffered, at the same position,
-if the filesystem refuses the open or a read. `_read_full_file` also retries
-the whole read with buffered I/O if it fails with `EINVAL`.
+With `direct_io=True`, `_open_for_read` opens the file with
+`os.O_RDONLY | os.O_DIRECT`, or buffered if the filesystem refuses that open.
+If the filesystem refuses a read, the stream clears `O_DIRECT` on the open file
+and retries, as writes do. `_read_full_file` also retries the whole read with
+buffered I/O if it fails with `EINVAL`.
 
 ### Directory and rename semantics
 

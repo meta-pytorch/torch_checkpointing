@@ -114,33 +114,30 @@ class _DirectIOWriter(io.FileIO):
 
 
 class _DirectIOReader(io.RawIOBase):
-    """Read stream that uses O_DIRECT where the filesystem supports it.
+    """Read stream for a file opened with O_DIRECT, with a buffered fallback.
 
     Offset reads target arbitrary tensor slices, so their reads are unaligned,
     and filesystems differ in whether they allow that. FUSE mounts and btrfs
-    accept O_DIRECT reads at any offset, length and buffer address. XFS and
-    ext4 accept the O_DIRECT open but reject unaligned reads with EINVAL, and
-    some filesystems reject the O_DIRECT open itself. Support can only be found
-    by trying, so this stream starts with O_DIRECT and switches to buffered
-    reads wherever the filesystem refuses: at the open or on a read. Each refusal
-    is reported through ``on_unsupported``, so the owner can stop asking for
-    O_DIRECT on later files.
+    accept O_DIRECT reads at any offset, length and buffer address, while XFS
+    and ext4 accept the O_DIRECT open but reject unaligned reads with EINVAL. On
+    the first rejected read this clears O_DIRECT on the descriptor and retries
+    the read. A failed read(2) leaves the file offset where it was, so the
+    retry continues at the right place. The refusal is reported through
+    ``on_unsupported``, so the owner can stop asking for O_DIRECT on later
+    files.
+
+    This wraps the file rather than subclassing ``io.FileIO``, because
+    ``FileIO.read()`` and ``FileIO.readall()`` do not go through ``readinto``;
+    here every read does.
     """
 
-    def __init__(self, path: Path, on_unsupported: Callable[[Path, str], None]) -> None:
+    def __init__(
+        self, fd: int, path: Path, on_unsupported: Callable[[Path, str], None]
+    ) -> None:
+        self._file: io.RawIOBase = os.fdopen(fd, "rb", buffering=0)
         self._path = path
         self._on_unsupported = on_unsupported
-        self._direct_io = False
-        try:
-            fd = os.open(path, os.O_DIRECT | os.O_RDONLY)
-        except OSError as e:
-            if e.errno != errno.EINVAL:
-                raise
-            on_unsupported(path, "open")
-            self._file: io.RawIOBase = open(path, "rb", buffering=0)
-        else:
-            self._file = os.fdopen(fd, "rb", buffering=0)
-            self._direct_io = True
+        self._direct_io = True
 
     def readable(self) -> bool:
         return True
@@ -155,26 +152,15 @@ class _DirectIOReader(io.RawIOBase):
         return self._file.tell()
 
     def readinto(self, buffer: Buffer) -> int | None:
-        if not self._direct_io:
-            return self._file.readinto(buffer)
-        # Record where this read starts before attempting it, so the buffered
-        # retry below resumes from the right place regardless of what a failed
-        # O_DIRECT read does to the file offset.
-        position = self._file.tell()
-        try:
-            return self._file.readinto(buffer)
-        except OSError as e:
-            if e.errno != errno.EINVAL:
-                raise
-        # The filesystem accepted the O_DIRECT open but rejected this read,
-        # typically because it is not block-aligned. Reopen the file buffered:
-        # page-cache reads accept any offset and length. This and every later
-        # read on the stream go through the new handle.
-        self._on_unsupported(self._path, "read")
-        self._file.close()
-        self._file = open(self._path, "rb", buffering=0)
-        self._file.seek(position)
-        self._direct_io = False
+        if self._direct_io:
+            try:
+                return self._file.readinto(buffer)
+            except OSError as e:
+                if e.errno != errno.EINVAL:
+                    raise
+            _clear_o_direct(self._file.fileno())
+            self._direct_io = False
+            self._on_unsupported(self._path, "read")
         return self._file.readinto(buffer)
 
     def close(self) -> None:
@@ -226,9 +212,17 @@ class LocalFileSystemStorage(Storage):
         return open(path, "wb")
 
     def _open_for_read(self, path: Path, use_direct_io: bool) -> io.RawIOBase:
-        """Open file for reading, with optional O_DIRECT support."""
+        """Open file for reading, with O_DIRECT if requested and the filesystem
+        allows it."""
         if use_direct_io and self._try_direct_io:
-            return _DirectIOReader(path, self._disable_direct_io)
+            try:
+                fd = os.open(path, os.O_RDONLY | os.O_DIRECT)
+            except OSError as e:
+                if e.errno != errno.EINVAL:
+                    raise
+                self._disable_direct_io(path, "open")
+            else:
+                return _DirectIOReader(fd, path, self._disable_direct_io)
         return open(path, "rb", buffering=0)
 
     def _read_full_file(self, path: Path, use_direct_io: bool) -> io.BytesIO:
