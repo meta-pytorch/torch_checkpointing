@@ -8,11 +8,11 @@ This page is the map. Each section covers *what the extension point is for → t
 
 ## Storage backends — target your own filesystem or object store
 
-Implement a backend when you want checkpoints on something other than a local filesystem (an object store, a distributed FS, an in-memory store for tests).
+Implement a backend when the built-in ones do not fit (a store with no fsspec driver, a distributed FS, an in-memory store for tests).
 
 - **Interface:** `StorageConfig` / `Storage` (`torch_checkpointing.storage.base_storage`).
 - **Implement:** `StorageConfig.create_storage()`, returning a `Storage` that implements `stream_read`, `stream_write`, `write`, `delete`, `mkdir`, `rmdir`, `rename`, `ls`, `exists`, `getsize`, `isdir`, and `remap_path`. (`read` and `glob` have working defaults.)
-- **Built-in:** `LocalFileSystemStorage` / `LocalFileSystemStorageConfig` (`.storage.filesystem`).
+- **Built-in:** `LocalFileSystemStorage` / `LocalFileSystemStorageConfig` (`.storage.filesystem`), and `FsspecStorage` / `FsspecStorageConfig` (`.storage.fsspec_storage`) for object stores reachable through fsspec.
 - **Wire it in:** pass the config to the manager via `CheckpointManager.Config(storage_config=YourStorageConfig(...))`. The manager calls `create_storage()` internally.
 - **Deep dive:** [Storage](./storage.md) — full method contracts, the O_DIRECT fallback, and a complete in-memory example.
 

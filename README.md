@@ -35,7 +35,7 @@ currently require CUDA; CPU-only users should use the explicit configuration in
 - One high-level `CheckpointManager` for both save and load, with auto-detected rank, storage, and metadata.
 - Plain-dict payloads: `save(id, {...})` / `load(id, into={...})` — tensors restored in place (identity preserved), scalars and JSON/bytes are first-class top-level items.
 - Resharding on load across different distributed layouts (mesh / placement changes), wired automatically when an item declares a resharder.
-- Pluggable storage behind the `Storage` / `StorageConfig` interface; a local filesystem backend ships in the package.
+- Pluggable storage behind the `Storage` / `StorageConfig` interface; a local filesystem backend and an fsspec backend (for remote stores such as Google Cloud Storage) ship in the package.
 
 ## Documentation
 
