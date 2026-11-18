@@ -116,10 +116,7 @@ class FsspecStorage(Storage):
     @override
     def write(self, path: Path, data: Buffer) -> None:
         with self._fs.open(str(path), "wb") as stream:
-            # A flat byte view, because drivers may truth-test or len() what
-            # they are given: gcsfs' zonal-bucket writer rejects a numpy array,
-            # and len() of a typed buffer counts elements, not bytes.
-            stream.write(memoryview(data).cast("B"))
+            stream.write(data)
 
     @override
     def delete(self, path: Path) -> None:
