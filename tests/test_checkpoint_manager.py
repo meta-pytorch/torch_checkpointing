@@ -35,7 +35,9 @@ from torch_checkpointing.resharding import ReshardingInfo
 from torch_checkpointing.schema import ItemSpec
 from torch_checkpointing.staging import CheckpointStagerConfig
 from torch_checkpointing.storage.filesystem import LocalFileSystemStorageConfig
-from torch_checkpointing.types import STATE_DICT
+from torch_checkpointing.types import RankInfo, STATE_DICT
+
+from .resharding_test_utils import fake_process_group
 
 
 def _payload() -> dict[str, Any]:
@@ -363,6 +365,37 @@ def test_load_subset_then_save_all_items_writes_metadata_for_all(
         manager.close()
     torch.testing.assert_close(loaded["model"]["w"], weights["w"])
     torch.testing.assert_close(loaded["optim"]["exp_avg"], optim["exp_avg"])
+
+
+def test_rank_info_from_config_saves_and_loads_under_fake_process_group(
+    tmp_path: Path,
+) -> None:
+    # A fake group has no peers, so the default rank info fails at the save
+    # barrier.
+    config = CheckpointManager.Config.with_sync_save()
+    config.items = {"model": ItemSpec(resharder=DefaultResharder())}
+    config.storage_config = LocalFileSystemStorageConfig(use_direct_io=False)
+    config.rank_info = RankInfo(
+        global_rank=0, global_world_size=1, role_rank=0, role_world_size=1
+    )
+    weights = {"w": torch.arange(4, dtype=torch.float32)}
+    path = os.path.join(tmp_path, "fake_pg")
+
+    with fake_process_group(rank=3, world_size=8):
+        manager = config.build()
+        try:
+            manager.save(path, {"model": weights})
+            metadata = load_distributed_metadata(
+                path,
+                LocalFileSystemStorageConfig(use_direct_io=False).create_storage(),
+                formats=(TorchDistributedMetadataFormat,),
+            )
+            assert metadata is not None
+            loaded = manager.load(path, into={"model": {"w": torch.zeros(4)}})
+        finally:
+            manager.close()
+
+    torch.testing.assert_close(loaded["model"]["w"], weights["w"])
 
 
 class _AlwaysReshardResharder(DefaultResharder):

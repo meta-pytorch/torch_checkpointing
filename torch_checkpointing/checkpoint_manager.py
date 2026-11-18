@@ -56,7 +56,7 @@ from .metadata_serialization import DistributedMetadataFormat
 from .schema import _CheckpointSchema, ItemSpec
 from .storage.base_storage import StorageConfig
 from .storage.filesystem import LocalFileSystemStorageConfig
-from .types import ItemKey, STATE_DICT
+from .types import ItemKey, RankInfo, STATE_DICT
 from .utils import ensure_future
 
 
@@ -100,6 +100,10 @@ class CheckpointManager:
         subprocess_init_args: tuple[Any, ...] = ()
         pre_finalize_callback: Callable[[CallbackArgs], None] | None = None
         finalize_callback: Callable[[CallbackArgs], None] | None = None
+        # Rank info for the saver, reader and metadata manager. ``None`` reads it
+        # from the default process group. Set it when the process group does not
+        # describe the ranks that write, e.g. a fake process group has no peers.
+        rank_info: RankInfo | None = None
 
         def build(self) -> "CheckpointManager":
             return CheckpointManager(config=self)
@@ -125,7 +129,7 @@ class CheckpointManager:
         self._storage_config = (
             self._config.storage_config or LocalFileSystemStorageConfig()
         )
-        rank_info = _get_default_rank_info()
+        rank_info = self._config.rank_info or _get_default_rank_info()
         self._rank = rank_info.global_rank
 
         # Auto-wire a metadata manager when any item declares a resharder, so a
