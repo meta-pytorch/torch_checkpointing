@@ -441,6 +441,63 @@ def test_disabling_the_listing_cache_explicitly_is_accepted():
     assert isinstance(config.create_storage(), FsspecStorage)
 
 
+class _MarkerListingMemoryFileSystem(MemoryFileSystem):
+    """In-memory filesystem that lists a directory's own marker object.
+
+    An object store has no directories. A console or tool that creates a
+    folder stores an empty object named ``<dir>/``, and drivers list it along
+    with the folder's contents: s3fs as a file named ``<dir>/``, gcsfs as a
+    directory named ``<dir>``.
+    """
+
+    protocol = "markerlistingmemory"
+
+    def __init__(self, *args, marker_suffix, marker_type, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._marker_suffix = marker_suffix
+        self._marker_type = marker_type
+
+    def ls(self, path, detail=True, **kwargs):
+        path = self._strip_protocol(path)
+        entries = super().ls(path, detail=True, **kwargs)
+        if self.isdir(path):
+            marker = {
+                "name": path + self._marker_suffix,
+                "type": self._marker_type,
+                "size": 0,
+            }
+            entries = [marker, *entries]
+        return entries if detail else sorted(entry["name"] for entry in entries)
+
+
+@pytest.mark.parametrize(
+    "marker_suffix, marker_type",
+    [("/", "file"), ("", "directory")],
+    ids=["as_s3fs_lists_it", "as_gcsfs_lists_it"],
+)
+def test_ls_leaves_out_the_marker_of_the_directory(marker_suffix, marker_type):
+    fsspec.register_implementation(
+        "markerlistingmemory", _MarkerListingMemoryFileSystem, clobber=True
+    )
+    storage = FsspecStorageConfig(
+        protocol="markerlistingmemory",
+        storage_options={"marker_suffix": marker_suffix, "marker_type": marker_type},
+    ).create_storage()
+    root = Path(f"test-{uuid.uuid4().hex}")
+    try:
+        storage.mkdir(root / "empty")
+        storage.write(root / "full" / "a.bin", b"payload")
+
+        # An empty folder holds only its marker; it is still a directory.
+        assert storage.ls(root / "empty") == []
+        assert storage.ls(root / "full") == ["a.bin"]
+        with pytest.raises(NotADirectoryError):
+            storage.ls(root / "full" / "a.bin")
+    finally:
+        _MarkerListingMemoryFileSystem.clear_instance_cache()
+        fsspec.filesystem("memory").rm(f"/{root}", recursive=True)
+
+
 def _payload() -> dict:
     return {"model": torch.arange(4), "step": 10}
 

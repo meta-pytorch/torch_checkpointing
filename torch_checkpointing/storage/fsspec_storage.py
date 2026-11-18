@@ -199,11 +199,14 @@ class FsspecStorage(Storage):
     def ls(self, path: Path) -> list[str]:
         target = str(path)
         # Object stores may list a marker entry for the directory itself, which
-        # a directory listing must not contain. A file lists as only itself.
+        # a directory listing must not contain. A file lists as only itself,
+        # under its exact name; s3fs lists a marker as a file named "<dir>/".
         self_entry = self._fs._strip_protocol(target).rstrip("/")
         entries = self._fs.ls(target, detail=True)
         names = [entry["name"].rstrip("/") for entry in entries]
-        if names == [self_entry] and entries[0]["type"] == "file":
+        if [entry["name"] for entry in entries] == [self_entry] and (
+            entries[0]["type"] == "file"
+        ):
             raise NotADirectoryError(errno.ENOTDIR, os.strerror(errno.ENOTDIR), target)
         return [posixpath.basename(name) for name in names if name != self_entry]
 
