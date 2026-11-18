@@ -70,6 +70,7 @@ than the manager exposes (for example, driving a load-only eval job by hand).
 | Symbol | Module | Purpose |
 | --- | --- | --- |
 | `LocalFileSystemStorageConfig`, `LocalFileSystemStorage` | `.storage.filesystem` | Shipped local-filesystem backend (the default). |
+| `FsspecStorageConfig`, `FsspecStorage` | `.storage.fsspec_storage` | Shipped fsspec backend for remote stores such as Google Cloud Storage. |
 | `Storage`, `StorageConfig`, `ReadArgs` | `.storage.base_storage` | Base classes for a custom backend. |
 
 ## Distributed & resharding (advanced)

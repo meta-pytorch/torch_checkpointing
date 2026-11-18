@@ -15,7 +15,12 @@ from pathlib import Path
 
 from typing_extensions import Buffer, override
 
-from .base_storage import ReadArgs, Storage, StorageConfig
+from .base_storage import (
+    _occupied_destination_error,
+    ReadArgs,
+    Storage,
+    StorageConfig,
+)
 
 try:
     import fcntl
@@ -28,23 +33,6 @@ logger = logging.getLogger(__name__)
 # buffered I/O path, the same fallback used when a filesystem refuses O_DIRECT.
 # It is only used where fcntl can clear it again.
 _O_DIRECT: int | None = getattr(os, "O_DIRECT", None) if fcntl is not None else None
-
-
-def _occupied_destination_error(
-    src_path: Path, dst_path: Path, error_number: int = errno.ENOTEMPTY
-) -> FileExistsError:
-    """The error for a destination a rename is not allowed to consume.
-
-    ``error_number`` is carried over from the syscall that refused, so the errno
-    still says which way it was occupied (``ENOTEMPTY`` a populated directory,
-    ``EISDIR`` a directory where a file was going, ``ENOTDIR`` the reverse).
-    """
-    return FileExistsError(
-        error_number,
-        f"Refusing to rename {src_path} onto {dst_path}: the destination is "
-        "occupied, and a rename commits onto unoccupied space rather than "
-        "overwriting it. Delete it explicitly if it is meant to be replaced.",
-    )
 
 
 @dataclass

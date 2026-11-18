@@ -6,8 +6,9 @@ existence checks — flows through a small `Storage` interface, so the same
 checkpointing logic can target a local filesystem, a networked filesystem, or a
 remote object store without changes to the rest of the stack.
 
-Only the local filesystem backend ships with the package. Networked filesystems
-can be used through a local mount; a native remote or object-store integration
+Two backends ship with the package: the local filesystem, and an fsspec backend
+for remote stores that have an fsspec driver, such as Google Cloud Storage.
+Networked filesystems can also be used through a local mount. Anything else
 requires a custom `StorageConfig` / `Storage` implementation.
 
 > **Power-user / extensibility track.** This guide is for building a bespoke
@@ -22,6 +23,7 @@ This document covers:
 - The shipped `LocalFileSystemStorage` / `LocalFileSystemStorageConfig`,
   including `use_direct_io` (`O_DIRECT`) with automatic buffered-I/O fallback,
   and `ReadArgs`.
+- The shipped `FsspecStorage` / `FsspecStorageConfig`.
 - A sketch of implementing your own backend.
 
 See also the [tutorial](./tutorials.md) and
@@ -226,7 +228,7 @@ Because the config owns construction, each backend decides exactly what its
 `Storage` needs. This keeps configs serializable and lets code that only needs
 to *describe* a backend stay decoupled from code that instantiates it.
 
-## The shipped backend: LocalFileSystemStorage
+## The local filesystem backend: LocalFileSystemStorage
 
 `storage/filesystem.py` provides the reference backend for a local (or
 locally-mounted) filesystem.
@@ -325,6 +327,62 @@ library:
 - `ls` → `os.listdir`, `delete` → `os.remove`, `exists` → `os.path.exists`,
   `getsize` → `os.path.getsize`, `isdir` → `os.path.isdir`.
 - `remap_path` returns `str(path)` — a local path is already its own URL.
+
+## The fsspec backend: FsspecStorage
+
+`storage/fsspec_storage.py` reaches remote stores through
+[fsspec](https://filesystem-spec.readthedocs.io). Install the extra and the
+driver for your store:
+
+```bash
+pip install "torch_checkpointing[fsspec]" gcsfs   # the driver for gs://
+```
+
+The extra holds fsspec below 2026.6 for now. From that release, fsspec's own
+directory move raises on object stores
+([fsspec#2447](https://github.com/fsspec/filesystem_spec/issues/2447)), which
+fails the commit with drivers that rely on it, such as s3fs. gcsfs moves
+directories itself and is not affected.
+
+```python
+from torch_checkpointing import CheckpointManager
+from torch_checkpointing.storage.fsspec_storage import FsspecStorageConfig
+
+manager = CheckpointManager(CheckpointManager.Config(
+    storage_config=FsspecStorageConfig(protocol="gs"),
+))
+manager.save("my-bucket/run-1/step-100", payload)   # no gs:// prefix
+```
+
+**Paths carry no scheme.** The checkpoint stack moves paths around as
+`pathlib.Path`, which would collapse the double slash of `gs://bucket`. The
+protocol lives in the config, checkpoint ids are written as `bucket/prefix/...`,
+and `remap_path` returns the full URI.
+
+**`storage_options`** are passed to the driver's filesystem class, for
+credentials or endpoints. The config must stay picklable, because the async
+save subprocess rebuilds the storage from it.
+
+**Commit is only as atomic as the driver's move.** `rename` checks the
+destination and then calls the driver's move. Where that move is a single
+directory rename, it is atomic. On a flat object store each object is copied
+and then deleted, so a crash midway can leave the final checkpoint directory
+partly written.
+
+**The listing cache is turned off.** Some drivers cache directory listings per
+client and trust them when looking a path up, but other ranks and the save
+subprocess write through their own clients. The backend always passes
+`use_listings_cache=False` to the driver, which keeps fsspec's listing cache
+empty, and raises if `storage_options` turn it on.
+
+**Paths with glob characters cannot be removed or renamed.** fsspec expands
+`*`, `?` and `[` in the path of a recursive delete or a move, so `rmdir` and
+`rename` raise `ValueError` for such a path rather than reach everything it
+matches. A checkpoint is committed with a rename, so keep these characters out
+of checkpoint paths.
+
+`ReadArgs.direct_io` and `ReadArgs.timeout_us` are ignored, and the backend
+does not implement the optional `Storage.mmap_fill`.
 
 ## Writing your own backend
 
@@ -457,7 +515,7 @@ A few contracts matter more when the backend is a remote object store than a loc
 - **`isdir` / `ls` on a flat store.** Object stores have no real directories. Implement `isdir(path)` as "does any object exist under this prefix?" and `ls(path)` as a single-level prefix listing (again, as above).
 - **`rename` and atomicity.** For barrier-coordinated multi-rank saves the writer stages files under a temporary directory and renames it into place, so readers never observe a half-written checkpoint. If your store has no cheap rename, implement it as copy-then-delete — optionally passing `background_cleanup=True` to defer the source deletes off the critical path.
 
-Once defined, your backend plugs in exactly like the shipped one — pass the
+Once defined, your backend plugs in exactly like the shipped ones — pass the
 config to the manager and every save and load goes through it:
 
 ```python
