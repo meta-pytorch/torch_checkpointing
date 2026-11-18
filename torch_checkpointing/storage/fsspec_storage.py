@@ -36,11 +36,12 @@ class FsspecStorageConfig(StorageConfig):
     paths around as ``pathlib.Path``, which would collapse the double slash of
     a URI, so the protocol lives here and ``remap_path`` restores the URI.
 
-    ``use_listings_cache=False`` is always passed to the driver, overriding
-    ``storage_options``, to keep fsspec's directory-listing cache empty: other
-    ranks and the async-save subprocess write through their own clients, so a
-    client's cached listing goes stale, and a driver that trusts it (gcsfs
-    does) fails to find paths written since.
+    ``use_listings_cache=False`` is always passed to the driver, to keep
+    fsspec's directory-listing cache empty: other ranks and the async-save
+    subprocess write through their own clients, so a client's cached listing
+    goes stale, and a driver that trusts it (gcsfs does) fails to find paths
+    written since. ``storage_options`` that turn the cache on are rejected
+    when the storage is created.
     """
 
     protocol: str
@@ -55,6 +56,12 @@ class FsspecStorage(Storage):
     """fsspec implementation of the Storage ABC."""
 
     def __init__(self, config: FsspecStorageConfig) -> None:
+        if config.storage_options.get("use_listings_cache"):
+            raise ValueError(
+                "FsspecStorage needs fsspec's listing cache off, because other "
+                "ranks and the async-save subprocess write through their own "
+                "clients. Remove use_listings_cache from storage_options."
+            )
         # Imported here so this module imports without fsspec installed. The
         # client is built here rather than held by the config, so every process
         # that receives the pickled config builds its own.

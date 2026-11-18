@@ -363,8 +363,8 @@ partly written.
 **The listing cache is turned off.** Some drivers cache directory listings per
 client and trust them when looking a path up, but other ranks and the save
 subprocess write through their own clients. The backend always passes
-`use_listings_cache=False` to the driver, overriding `storage_options`, which
-keeps fsspec's listing cache empty.
+`use_listings_cache=False` to the driver, which keeps fsspec's listing cache
+empty, and raises if `storage_options` turn it on.
 
 `ReadArgs.direct_io` and `ReadArgs.timeout_us` are ignored, and the backend
 does not implement the optional `Storage.mmap_fill`.

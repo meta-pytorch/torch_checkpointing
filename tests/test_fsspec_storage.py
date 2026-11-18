@@ -363,21 +363,14 @@ class _ListingCachingMemoryFileSystem(MemoryFileSystem):
             path = parent
 
 
-@pytest.mark.parametrize(
-    "storage_options",
-    [{}, {"use_listings_cache": True}],
-    ids=["default", "caching_requested"],
-)
-def test_sees_a_checkpoint_written_through_another_client(storage_options):
+def test_sees_a_checkpoint_written_through_another_client():
     # A long-lived reader lists the folder; another rank or the async-save
     # subprocess then writes a checkpoint through its own client, and the
     # reader loads it with ranged reads.
     fsspec.register_implementation(
         "listingcachingmemory", _ListingCachingMemoryFileSystem, clobber=True
     )
-    storage = FsspecStorageConfig(
-        protocol="listingcachingmemory", storage_options=storage_options
-    ).create_storage()
+    storage = FsspecStorageConfig(protocol="listingcachingmemory").create_storage()
     root = Path(f"test-{uuid.uuid4().hex}")
     other_client = fsspec.filesystem("memory")
     try:
@@ -396,6 +389,23 @@ def test_sees_a_checkpoint_written_through_another_client(storage_options):
         _ListingCachingMemoryFileSystem.clear_instance_cache()
         if other_client.exists(f"/{root}"):
             other_client.rm(f"/{root}", recursive=True)
+
+
+def test_enabling_the_listing_cache_is_rejected():
+    config = FsspecStorageConfig(
+        protocol="memory", storage_options={"use_listings_cache": True}
+    )
+
+    with pytest.raises(ValueError, match="use_listings_cache"):
+        config.create_storage()
+
+
+def test_disabling_the_listing_cache_explicitly_is_accepted():
+    config = FsspecStorageConfig(
+        protocol="memory", storage_options={"use_listings_cache": False}
+    )
+
+    assert isinstance(config.create_storage(), FsspecStorage)
 
 
 def _payload() -> dict:
