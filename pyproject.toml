@@ -53,7 +53,7 @@ Issues = "https://github.com/meta-pytorch/torch_checkpointing/issues"
 # is fixed: from that release, moving a directory raises on object stores whose
 # driver uses fsspec's own mv, such as s3fs, and a checkpoint is committed with
 # such a move.
-fsspec = ["fsspec>=2023.9.0,<2026.6.0"]
+fsspec = ["fsspec>=2023.9.0,<2026.7.0"]
 
 [dependency-groups]
 test = [
@@ -67,7 +67,7 @@ test = [
     "expecttest>=0.2.1",
     "setuptools>=77.0.3",
     # Imported by tests/test_fsspec_storage.py. The range of the fsspec extra.
-    "fsspec>=2023.9.0,<2026.6.0",
+    "fsspec>=2023.9.0,<2026.7.0",
 ]
 # Pinned, so that every environment lints with the same rules.
 lint = ["ruff==0.15.4"]
