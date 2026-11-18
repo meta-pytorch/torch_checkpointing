@@ -335,6 +335,12 @@ driver for your store:
 pip install "torch_checkpointing[fsspec]" gcsfs   # the driver for gs://
 ```
 
+The extra holds fsspec below 2026.6 for now. From that release, fsspec's own
+directory move raises on object stores
+([fsspec#2447](https://github.com/fsspec/filesystem_spec/issues/2447)), which
+fails the commit with drivers that rely on it, such as s3fs. gcsfs moves
+directories itself and is not affected.
+
 ```python
 from torch_checkpointing import CheckpointManager
 from torch_checkpointing.storage.fsspec_storage import FsspecStorageConfig
