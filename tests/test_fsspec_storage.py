@@ -304,6 +304,42 @@ def test_directory_operations_reject_a_file(storage, root):
     assert storage.read(path) == b"one"
 
 
+# fsspec expands a glob in the path of a recursive delete, a copy or a move, so
+# a name with one of these characters would take every path it matches with it.
+_GLOB_NAMES = ["step-*", "step-?", "step-[12]"]
+
+
+@pytest.mark.parametrize("name", _GLOB_NAMES)
+def test_rmdir_rejects_glob_characters_and_spares_what_they_match(storage, root, name):
+    _put(storage, root / name / "a.bin", b"literal")
+    _put(storage, root / "step-1" / "a.bin", b"keep")
+
+    with pytest.raises(ValueError, match="glob"):
+        storage.rmdir(root / name)
+
+    assert storage.read(root / name / "a.bin") == b"literal"
+    assert storage.read(root / "step-1" / "a.bin") == b"keep"
+
+
+@pytest.mark.parametrize("name", _GLOB_NAMES)
+def test_rename_rejects_glob_characters_and_spares_what_they_match(storage, root, name):
+    _put(storage, root / name / "a.bin", b"literal")
+    _put(storage, root / "src" / "a.bin", b"src")
+    _put(storage, root / "step-1" / "a.bin", b"keep")
+
+    with pytest.raises(ValueError, match="glob"):
+        storage.rename(root / name, root / "dst", is_directory=True)
+    with pytest.raises(ValueError, match="glob"):
+        storage.rename(root / "src", root / name, is_directory=True)
+    with pytest.raises(ValueError, match="glob"):
+        storage.rename(root / name / "a.bin", root / "b.bin")
+
+    assert sorted(storage.ls(root)) == sorted([name, "src", "step-1"])
+    assert storage.read(root / name / "a.bin") == b"literal"
+    assert storage.read(root / "src" / "a.bin") == b"src"
+    assert storage.read(root / "step-1" / "a.bin") == b"keep"
+
+
 def test_ranged_reads_have_independent_positions(storage, root):
     # Parallel loads give each worker its own stream of the same file.
     path = _put(storage, root / "a.bin", b"0123456789")

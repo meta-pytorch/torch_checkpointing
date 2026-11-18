@@ -366,6 +366,12 @@ subprocess write through their own clients. The backend always passes
 `use_listings_cache=False` to the driver, which keeps fsspec's listing cache
 empty, and raises if `storage_options` turn it on.
 
+**Paths with glob characters cannot be removed or renamed.** fsspec expands
+`*`, `?` and `[` in the path of a recursive delete or a move, so `rmdir` and
+`rename` raise `ValueError` for such a path rather than reach everything it
+matches. A checkpoint is committed with a rename, so keep these characters out
+of checkpoint paths.
+
 `ReadArgs.direct_io` and `ReadArgs.timeout_us` are ignored, and the backend
 does not implement the optional `Storage.mmap_fill`.
 

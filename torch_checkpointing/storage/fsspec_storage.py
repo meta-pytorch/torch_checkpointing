@@ -52,6 +52,25 @@ class FsspecStorageConfig(StorageConfig):
         return FsspecStorage(config=self)
 
 
+# The characters fsspec treats as a glob pattern.
+_GLOB_CHARACTERS = "*?["
+
+
+def _reject_glob_characters(path: Path) -> None:
+    """Raise if fsspec would read ``path`` as a glob pattern.
+
+    fsspec expands a glob in the path of a recursive delete, a copy or a move,
+    so the operation would reach every path the pattern matches rather than
+    the one path named.
+    """
+    if any(character in str(path) for character in _GLOB_CHARACTERS):
+        raise ValueError(
+            f"Refusing to remove or rename {path}: it contains a glob character "
+            f"(one of {' '.join(_GLOB_CHARACTERS)}), and fsspec would apply the "
+            "operation to every path the pattern matches."
+        )
+
+
 class FsspecStorage(Storage):
     """fsspec implementation of the Storage ABC."""
 
@@ -117,6 +136,7 @@ class FsspecStorage(Storage):
 
     @override
     def rmdir(self, path: Path) -> None:
+        _reject_glob_characters(path)
         # A recursive rm deletes a file too; rmdir must not.
         if not self.isdir(path):
             if self.exists(path):
@@ -136,7 +156,8 @@ class FsspecStorage(Storage):
     ) -> None:
         # background_cleanup is ignored: it only takes cleanup off the caller's
         # path, and here the source is removed before this returns.
-        #
+        _reject_glob_characters(src_path)
+        _reject_glob_characters(dst_path)
         # Look the source up before touching the destination: an empty
         # destination directory is removed below, which must not happen for a
         # source that is missing or is the destination itself. Its type, not
