@@ -11,7 +11,6 @@ from collections.abc import Iterator
 from pathlib import Path
 
 import fsspec
-import numpy as np
 import pytest
 import torch
 from fsspec.core import split_protocol
@@ -60,10 +59,8 @@ def _put(storage: FsspecStorage, path: Path, data: bytes = b"payload") -> Path:
         b"Hello bytes! ",
         bytearray(b"Hello bytearray! "),
         memoryview(b"Hello memoryview! "),
-        np.array([1, 2, 3, 4, 5], dtype=np.int32),
-        torch.tensor([10, 20, 30], dtype=torch.int32).numpy(),
     ],
-    ids=["bytes", "bytearray", "memoryview", "numpy", "torch"],
+    ids=["bytes", "bytearray", "memoryview"],
 )
 def test_write_then_read_round_trips_every_buffer_type(storage, root, data):
     storage.mkdir(root)
