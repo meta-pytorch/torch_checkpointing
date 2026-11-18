@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import errno
 import fnmatch
 import io
 import os
@@ -14,6 +15,23 @@ from pathlib import Path
 from typing import Protocol
 
 from typing_extensions import Buffer
+
+
+def _occupied_destination_error(
+    src_path: Path, dst_path: Path, error_number: int = errno.ENOTEMPTY
+) -> FileExistsError:
+    """The error for a destination a rename is not allowed to consume.
+
+    ``error_number`` is carried over from the syscall that refused, so the errno
+    still says which way it was occupied (``ENOTEMPTY`` a populated directory,
+    ``EISDIR`` a directory where a file was going, ``ENOTDIR`` the reverse).
+    """
+    return FileExistsError(
+        error_number,
+        f"Refusing to rename {src_path} onto {dst_path}: the destination is "
+        "occupied, and a rename commits onto unoccupied space rather than "
+        "overwriting it. Delete it explicitly if it is meant to be replaced.",
+    )
 
 
 class MmapLike(Protocol):

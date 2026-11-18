@@ -14,8 +14,12 @@ from typing import Any, cast
 
 from typing_extensions import Buffer, override
 
-from .base_storage import ReadArgs, Storage, StorageConfig
-from .filesystem import _occupied_destination_error
+from .base_storage import (
+    _occupied_destination_error,
+    ReadArgs,
+    Storage,
+    StorageConfig,
+)
 
 
 @dataclass
