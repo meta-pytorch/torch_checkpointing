@@ -661,6 +661,8 @@ class TestDefaultStager(TestCase):
         """Test that non-blocking correctly captures state of tensors that are being
         updated on the default stream. Necessary because use_non_blocking_copy=True
         runs staging on an alternate stream and we need to manage synchronisation.
+        This includes a pinned CPU tensor written by the default stream, which
+        staging copies on the CPU.
         """
         options = CheckpointStagerConfig(
             use_async_staging=True,
@@ -678,15 +680,18 @@ class TestDefaultStager(TestCase):
         b = torch.randn(size, size).cuda()
         for _ in range(100):
             a = (b @ a).clamp_(-1, 1)
+        host = torch.zeros(size, size).pin_memory()
+        host.copy_(a, non_blocking=True)
 
-        fut = stager.stage({"model": {"tensor": a}})
+        fut = stager.stage({"model": {"tensor": a, "host": host}})
 
-        staged_tensor = ensure_future(fut).result()["model"]["tensor"]
-        self.assertEqual(staged_tensor.device, torch.device("cpu"))
+        staged = ensure_future(fut).result()["model"]
+        self.assertEqual(staged["tensor"].device, torch.device("cpu"))
 
-        # staged_tensor should reflect the tensor's final value.  If we see an
+        # The staged tensors should reflect the final values.  If we see an
         # intermediate value then we have hit the race condition.
-        torch.testing.assert_close(staged_tensor, a.cpu())
+        torch.testing.assert_close(staged["tensor"], a.cpu())
+        torch.testing.assert_close(staged["host"], a.cpu(), rtol=0, atol=0)
         stager.close()
 
     @requires_cuda

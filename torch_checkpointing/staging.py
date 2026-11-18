@@ -340,9 +340,12 @@ class DefaultStager(CheckpointStager):
                 torch.cuda.device(self._cuda_device),
                 self._staging_stream or nullcontext(),
             ):
-                # Block GPU until the main stream is done with all operations.
-                # This does NOT block CPU.
-                current_stream_ready.wait()
+                # Block this thread until the main stream is done with all
+                # operations. This also orders the copies on the staging stream.
+                # A stream wait alone is not enough: CPU tensors are copied on
+                # the CPU, and the main stream may still write them (e.g. a GPU
+                # optimizer step that updates pinned host memory).
+                current_stream_ready.synchronize()
                 staged_state_dict = self._state_dict_stager.stage(state_dict_to_stage)
                 staging_stream_end = torch.Event(enable_timing=True)
                 staging_stream_end.record()
