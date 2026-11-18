@@ -368,6 +368,7 @@ class _ListingCachingMemoryFileSystem(MemoryFileSystem):
         except KeyError:
             entries = super().ls(path, detail=True, **kwargs)
             self.dircache[path] = entries
+        # pyrefly: ignore[bad-index]
         return entries if detail else sorted(entry["name"] for entry in entries)
 
     def info(self, path, **kwargs):
@@ -377,7 +378,7 @@ class _ListingCachingMemoryFileSystem(MemoryFileSystem):
         self._ls_from_cache(path)
         return super().info(path, **kwargs)
 
-    def _open(self, path, mode="rb", **kwargs):
+    def _open(self, path, mode="rb", **kwargs):  # pyrefly: ignore[bad-override]
         if "r" in mode:
             self.info(path)
         return super()._open(path, mode, **kwargs)
@@ -467,6 +468,7 @@ class _MarkerListingMemoryFileSystem(MemoryFileSystem):
                 "size": 0,
             }
             entries = [marker, *entries]
+        # pyrefly: ignore[bad-index]
         return entries if detail else sorted(entry["name"] for entry in entries)
 
 
