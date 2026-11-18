@@ -47,11 +47,13 @@ Issues = "https://github.com/meta-pytorch/torch_checkpointing/issues"
 
 [project.optional-dependencies]
 # For FsspecStorage. The driver for a store (gcsfs, ...) is installed separately.
+# From 2023.9.0: the gcsfs releases that go with an older fsspec remove step-10
+# along with step-1 when a directory is deleted.
 # Held below 2026.6 until https://github.com/fsspec/filesystem_spec/issues/2447
 # is fixed: from that release, moving a directory raises on object stores whose
 # driver uses fsspec's own mv, such as s3fs, and a checkpoint is committed with
 # such a move.
-fsspec = ["fsspec>=2026.4.0,<2026.6.0"]
+fsspec = ["fsspec>=2023.9.0,<2026.6.0"]
 
 [dependency-groups]
 test = [
@@ -65,7 +67,7 @@ test = [
     "expecttest>=0.2.1",
     "setuptools>=77.0.3",
     # Imported by tests/test_fsspec_storage.py. The range of the fsspec extra.
-    "fsspec>=2026.4.0,<2026.6.0",
+    "fsspec>=2023.9.0,<2026.6.0",
 ]
 # Pinned, so that every environment lints with the same rules.
 lint = ["ruff==0.15.4"]

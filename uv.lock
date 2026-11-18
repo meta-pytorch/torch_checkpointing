@@ -1002,7 +1002,7 @@ test = [
 
 [package.metadata]
 requires-dist = [
-    { name = "fsspec", marker = "extra == 'fsspec'", specifier = ">=2026.4.0,<2026.6.0" },
+    { name = "fsspec", marker = "extra == 'fsspec'", specifier = ">=2023.9.0,<2026.6.0" },
     { name = "numpy", specifier = ">=1.23.2" },
     { name = "safetensors", specifier = ">=0.4.3" },
     { name = "torch", specifier = ">=2.11.0" },
@@ -1015,7 +1015,7 @@ cpu = [{ name = "torch", specifier = ">=2.11.0", index = "https://download.pytor
 cuda = [{ name = "torch", specifier = ">=2.11.0" }]
 dev = [
     { name = "expecttest", specifier = ">=0.2.1" },
-    { name = "fsspec", specifier = ">=2026.4.0,<2026.6.0" },
+    { name = "fsspec", specifier = ">=2023.9.0,<2026.6.0" },
     { name = "pytest", specifier = ">=8.0" },
     { name = "pytest-github-actions-annotate-failures", specifier = ">=0.3" },
     { name = "pytest-xdist", specifier = ">=3.5" },
@@ -1025,7 +1025,7 @@ dev = [
 lint = [{ name = "ruff", specifier = "==0.15.4" }]
 test = [
     { name = "expecttest", specifier = ">=0.2.1" },
-    { name = "fsspec", specifier = ">=2026.4.0,<2026.6.0" },
+    { name = "fsspec", specifier = ">=2023.9.0,<2026.6.0" },
     { name = "pytest", specifier = ">=8.0" },
     { name = "pytest-github-actions-annotate-failures", specifier = ">=0.3" },
     { name = "pytest-xdist", specifier = ">=3.5" },
