@@ -186,6 +186,29 @@ def test_closing_the_stager_releases_the_staged_state_dict() -> None:
     assert staged_weight() is None
 
 
+@pytest.mark.skipif(
+    not torch.accelerator.is_available() or torch.cuda.is_available(),
+    reason="needs an accelerator other than CUDA, such as MPS",
+)
+@pytest.mark.parametrize("use_async_staging", [False, True])
+def test_default_stager_stages_on_a_non_cuda_accelerator(
+    use_async_staging: bool,
+) -> None:
+    stager = DefaultStager(
+        CheckpointStagerConfig(
+            use_async_staging=use_async_staging,
+            use_pinned_memory=False,
+            use_non_blocking_copy=False,
+        )
+    )
+    try:
+        value = torch.arange(4.0)
+        staged = ensure_future(stager.stage({"value": value})).result()
+        torch.testing.assert_close(staged["value"], value, rtol=0, atol=0)
+    finally:
+        stager.close()
+
+
 class TestDefaultStager(TestCase):
     def setUp(self) -> None:
         # Create a test state dictionary with various data types
