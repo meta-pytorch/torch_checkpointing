@@ -42,6 +42,7 @@ currently require CUDA; CPU-only users should use the explicit configuration in
 **Getting started**
 
 - [Tutorial](./docs/tutorials.md) — checkpoint and resume a complete training loop.
+- [Examples](./examples/) — runnable training scripts to start from, such as distributed training with FSDP2.
 - [Overview](./docs/index.md) — what the library does and how the pieces fit together.
 - [Key concepts](./docs/key_concepts.md) — the `CheckpointManager`, the payload/`into=` model, and how async save and load work.
 - [Configuring checkpoints](./docs/configuring_checkpoints.md) — per-item `layout`, `requires_copy`, and `resharder` via `ItemSpec`.
