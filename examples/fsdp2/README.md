@@ -180,8 +180,9 @@ them. An optimizer creates its state in its first step, so a freshly built one
 has none to load into; `init_optimizer_state()` takes a step with zero
 gradients to create it. Without that step, `load()` would load no optimizer
 state, and report no error. `optimizer_transform_post()` converts the names
-back to positions, and `optimizer.load_state_dict()` applies the rest of the
-optimizer state, its `param_groups`:
+back to the positions of the parameters in the optimizer it is given, and
+`optimizer.load_state_dict()` applies the rest of the optimizer state, its
+`param_groups`:
 
 ```python
 init_optimizer_state(optimizer)
@@ -194,7 +195,7 @@ restored = manager.load(
     },
     strict=True,
 )
-optimizer.load_state_dict(optimizer_transform_post(restored["optimizer"]))
+optimizer.load_state_dict(optimizer_transform_post(restored["optimizer"], optimizer))
 ```
 
 ## Differences from the PyTorch example
@@ -214,11 +215,6 @@ see whether a resumed run continued where the previous run stopped.
   stay as the optimizer was constructed. The hyperparameters in this example
   never change, so it is not affected. If yours change during training, save
   them as tensors, as this example does with the step count.
-- When a checkpoint is loaded onto the same number of ranks, the optimizer
-  state is attached to the parameters by their position in the optimizer, as
-  it was when the checkpoint was saved. If the order of the parameters changed
-  in between, for example because the model defines its layers in a different
-  order, the state is attached to the wrong parameters.
 - An item without a resharder is loaded from the loading rank's own file. A
   rank that was added since the checkpoint was saved has no file, and fails to
   load the item. That is why `train_state` declares a resharder: the step count

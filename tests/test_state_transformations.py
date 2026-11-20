@@ -354,6 +354,17 @@ def test_optimizer_transform_pre_invalid_state_dict_raises_error():
         optimizer_transform_pre(state2)
 
 
+def test_optimizer_transform_pre_does_not_share_param_names_with_optimizer():
+    """Tests that writing to the result's param_names leaves the optimizer's alone."""
+    model = nn.Linear(4, 2)
+    optimizer = torch.optim.Adam(model.named_parameters())
+
+    result = optimizer_transform_pre(optimizer.state_dict())
+    result["param_groups"][0]["param_names"][:] = ["renamed.weight", "renamed.bias"]
+
+    assert optimizer.param_groups[0]["param_names"] == ["weight", "bias"]
+
+
 def test_optimizer_transform_pre_preserves_state_values(simple_optimizer_state):
     """Tests that state values are preserved through transformation."""
     original_state_0 = simple_optimizer_state["state"][0]
@@ -460,6 +471,152 @@ def test_optimizer_transform_post_invalid_state_dict_v0_format_unchanged():
     state = {"state": {}, "extra_key": "ignored"}
     result = optimizer_transform_post(state)
     assert result is state
+
+
+def _adam(
+    group_names: list[list[str]],
+    *,
+    lrs: list[float] | None = None,
+    shapes: dict[str, tuple[int, ...]] | None = None,
+    step: bool = True,
+) -> tuple[torch.optim.Adam, dict[str, nn.Parameter]]:
+    """Create an Adam optimizer over new named parameters, one param group per list.
+
+    With ``step``, takes one step with a different gradient for each parameter,
+    so that each parameter's state is distinct.
+    """
+    shapes = shapes or {}
+    params = {
+        name: nn.Parameter(torch.zeros(shapes.get(name, (2,))))
+        for names in group_names
+        for name in names
+    }
+    lrs = lrs or [1e-3] * len(group_names)
+    optimizer = torch.optim.Adam(
+        [
+            {"params": [(name, params[name]) for name in names], "lr": lr}
+            for names, lr in zip(group_names, lrs, strict=True)
+        ]
+    )
+    if step:
+        for i, param in enumerate(params.values()):
+            param.grad = torch.full_like(param, float(i + 1))
+        optimizer.step()
+    return optimizer, params
+
+
+def _assert_same_state_by_name(
+    expected: torch.optim.Optimizer,
+    expected_params: dict[str, nn.Parameter],
+    actual: torch.optim.Optimizer,
+    actual_params: dict[str, nn.Parameter],
+) -> None:
+    for name, expected_param in expected_params.items():
+        expected_state = expected.state[expected_param]
+        actual_state = actual.state[actual_params[name]]
+        assert expected_state.keys() == actual_state.keys()
+        for key, value in expected_state.items():
+            torch.testing.assert_close(actual_state[key], value)
+
+
+@pytest.mark.parametrize(
+    "second_shape", [(3,), (2, 2)], ids=["same_shape", "different_shape"]
+)
+def test_optimizer_transform_post_follows_the_order_of_the_optimizer(
+    second_shape: tuple[int, ...],
+):
+    """Tests that state is attached by name when the parameters were reordered."""
+    shapes = {"first": (3,), "second": second_shape}
+    saved, saved_params = _adam([["first", "second"]], shapes=shapes)
+    loaded, loaded_params = _adam([["second", "first"]], shapes=shapes, step=False)
+
+    loaded.load_state_dict(
+        optimizer_transform_post(optimizer_transform_pre(saved.state_dict()), loaded)
+    )
+
+    _assert_same_state_by_name(saved, saved_params, loaded, loaded_params)
+    assert loaded.param_groups[0]["param_names"] == ["second", "first"]
+
+
+def test_optimizer_transform_post_follows_the_order_of_each_param_group():
+    """Tests reordering within several param groups, keeping their saved hyperparameters."""
+    saved, saved_params = _adam([["a", "b"], ["c", "d"]], lrs=[0.1, 0.2])
+    loaded, loaded_params = _adam([["b", "a"], ["d", "c"]], lrs=[1.0, 2.0], step=False)
+
+    loaded.load_state_dict(
+        optimizer_transform_post(optimizer_transform_pre(saved.state_dict()), loaded)
+    )
+
+    _assert_same_state_by_name(saved, saved_params, loaded, loaded_params)
+    assert [g["param_names"] for g in loaded.param_groups] == [["b", "a"], ["d", "c"]]
+    assert [g["lr"] for g in loaded.param_groups] == [0.1, 0.2]
+
+
+def test_optimizer_transform_post_with_optimizer_allows_params_without_state():
+    """Tests that a parameter that had no state when saved still has none."""
+    saved, saved_params = _adam([["first", "second"]], step=False)
+    saved_params["first"].grad = torch.ones(2)
+    saved.step()
+    loaded, loaded_params = _adam([["second", "first"]], step=False)
+
+    loaded.load_state_dict(
+        optimizer_transform_post(optimizer_transform_pre(saved.state_dict()), loaded)
+    )
+
+    assert loaded_params["second"] not in loaded.state
+    torch.testing.assert_close(
+        loaded.state[loaded_params["first"]]["exp_avg"],
+        saved.state[saved_params["first"]]["exp_avg"],
+    )
+
+
+@pytest.mark.parametrize(
+    "loaded_groups, match",
+    [
+        ([["first"]], r"Only in the optimizer state: \['second'\]"),
+        ([["first", "second", "third"]], r"Only in the optimizer: \['third'\]"),
+        ([["first"], ["second"]], "has 1 param groups, but the optimizer has 2"),
+    ],
+    ids=["missing_from_optimizer", "missing_from_state", "different_groups"],
+)
+def test_optimizer_transform_post_with_optimizer_raises_on_different_params(
+    loaded_groups: list[list[str]], match: str
+):
+    """Tests that the optimizer must hold the saved parameters, grouped as saved."""
+    saved, _ = _adam([["first", "second"]])
+    loaded, _ = _adam(loaded_groups, step=False)
+
+    with pytest.raises(ValueError, match=match):
+        optimizer_transform_post(optimizer_transform_pre(saved.state_dict()), loaded)
+
+
+def test_optimizer_transform_post_with_optimizer_raises_on_param_moved_between_groups():
+    """Tests that a parameter must stay in the param group it was saved in."""
+    saved, _ = _adam([["a", "b"], ["c"]])
+    loaded, _ = _adam([["a"], ["b", "c"]], step=False)
+
+    with pytest.raises(ValueError, match="Param group 0 of the optimizer state"):
+        optimizer_transform_post(optimizer_transform_pre(saved.state_dict()), loaded)
+
+
+def test_optimizer_transform_post_raises_for_optimizer_without_param_names():
+    """Tests that the optimizer must name its parameters to be matched by name."""
+    saved, _ = _adam([["first"]])
+    loaded = torch.optim.Adam([nn.Parameter(torch.zeros(2))])
+
+    with pytest.raises(ValueError, match="no parameter names"):
+        optimizer_transform_post(optimizer_transform_pre(saved.state_dict()), loaded)
+
+
+def test_optimizer_transform_post_v0_format_unchanged_with_optimizer(
+    simple_optimizer_state,
+):
+    """Tests that old format (v0, int keys) is returned unchanged with an optimizer."""
+    loaded, _ = _adam([["weight", "bias"]], step=False)
+
+    assert optimizer_transform_post(simple_optimizer_state, loaded) is (
+        simple_optimizer_state
+    )
 
 
 # =============================================================================

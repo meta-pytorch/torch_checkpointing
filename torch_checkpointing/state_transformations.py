@@ -21,12 +21,16 @@ Example:
     # Before checkpointing sees the data: convert int keys to string keys
     transformed_state = optimizer_transform_pre(optimizer_state_dict)
 
-    # After checkpointing is done: convert string keys back to int keys
-    restored_state = optimizer_transform_post(loaded_state_dict)
+    # After checkpointing is done: convert string keys back to int keys, in the
+    # order of the optimizer that the state is loaded into
+    restored_state = optimizer_transform_post(loaded_state_dict, optimizer)
+    optimizer.load_state_dict(restored_state)
 """
 
 from dataclasses import dataclass, field, fields
 from typing import Any, cast
+
+import torch
 
 # Format version for new optimizer state format
 _CURRENT_FORMAT_VERSION = 1
@@ -177,6 +181,10 @@ def optimizer_transform_pre(optimizer_state: dict[str, Any]) -> dict[str, Any]:
     # Remove 'params' from each param_group (it flows through extra)
     for pg in opt_state.param_groups:
         pg.extra.pop("params", None)
+        # Optimizer.state_dict() returns the optimizer's own list of names. A
+        # load into the result in place must not rename the optimizer's
+        # parameters, so copy it.
+        pg.param_names = list(pg.param_names)
 
     return OptimizerStateDict(
         state=new_state,
@@ -185,13 +193,25 @@ def optimizer_transform_pre(optimizer_state: dict[str, Any]) -> dict[str, Any]:
     ).to_dict()
 
 
-def optimizer_transform_post(optimizer_state: dict[str, Any]) -> dict[str, Any]:
+def optimizer_transform_post(
+    optimizer_state: dict[str, Any],
+    optimizer: torch.optim.Optimizer | None = None,
+) -> dict[str, Any]:
     """Post-checkpoint transform for optimizer state_dict.
 
     Applied after the checkpointing layer has processed the optimizer state.
     Converts string keys back to integer keys for PyTorch optimizer compatibility.
 
     The string keys are fully qualified names (FQNs) from model.named_parameters().
+
+    ``Optimizer.load_state_dict`` attaches state to parameters by position, so
+    the integer keys must follow the order of the parameters in the optimizer
+    that loads the result. Pass that optimizer as ``optimizer``: the keys then
+    follow its order, and each parameter gets the state saved under its name
+    even if the parameters were created in a different order when the state
+    was saved. Without ``optimizer``, the keys follow the order of
+    ``param_names`` in ``optimizer_state``, which is correct only if the
+    optimizer holds its parameters in that same order.
 
     Example:
         >>> state = {
@@ -213,9 +233,21 @@ def optimizer_transform_post(optimizer_state: dict[str, Any]) -> dict[str, Any]:
 
     Args:
         optimizer_state: The state_dict loaded from checkpoint.
+        optimizer: The optimizer that will load the result. It must have been
+            built from named parameters, for example
+            ``model.named_parameters()``, and each of its param groups must
+            hold the parameters named in the corresponding param group of
+            ``optimizer_state``, in any order.
 
     Returns:
-        A new state_dict with integer keys suitable for PyTorch optimizer.
+        A new state_dict with integer keys suitable for PyTorch optimizer. Its
+        ``param_names`` are in the order of the integer keys. A state_dict in
+        the old integer-keyed format is returned unchanged.
+
+    Raises:
+        ValueError: If ``optimizer`` has a param group without parameter
+            names, or if its param groups do not hold the same parameters as
+            those of ``optimizer_state``.
     """
     # Check format version (default to 0 for old format)
     format_version = optimizer_state.get("_optimizer_state_format_version", 0)
@@ -226,6 +258,12 @@ def optimizer_transform_post(optimizer_state: dict[str, Any]) -> dict[str, Any]:
 
     # Parse input using typed wrapper
     opt_state = OptimizerStateDict.from_dict(optimizer_state)
+
+    if optimizer is not None:
+        live_names = _param_names_by_group(optimizer)
+        _check_same_param_groups(opt_state.param_groups, live_names)
+        for pg, names in zip(opt_state.param_groups, live_names, strict=True):
+            pg.param_names = names
 
     # Build param_name → idx mapping from param_groups
     # The indices are sequential starting from 0, matching the order in param_names
@@ -262,3 +300,39 @@ def optimizer_transform_post(optimizer_state: dict[str, Any]) -> dict[str, Any]:
         state=new_state,
         param_groups=opt_state.param_groups,
     ).to_dict()
+
+
+def _param_names_by_group(optimizer: torch.optim.Optimizer) -> list[list[str]]:
+    """Return the names of the parameters of each param group of ``optimizer``, in order."""
+    names_by_group = []
+    for group_idx, group in enumerate(optimizer.param_groups):
+        if "param_names" not in group:
+            raise ValueError(
+                f"Param group {group_idx} of the optimizer has no parameter names. "
+                "Build the optimizer from named parameters, for example "
+                "model.named_parameters(), so that its state can be matched by name."
+            )
+        names_by_group.append(list(group["param_names"]))
+    return names_by_group
+
+
+def _check_same_param_groups(
+    saved_groups: list[ParamGroup], live_names: list[list[str]]
+) -> None:
+    """Raise unless each saved param group names the same parameters as the live one."""
+    if len(saved_groups) != len(live_names):
+        raise ValueError(
+            f"The optimizer state has {len(saved_groups)} param groups, but the "
+            f"optimizer has {len(live_names)}."
+        )
+    for group_idx, (saved, live) in enumerate(
+        zip(saved_groups, live_names, strict=True)
+    ):
+        saved_set, live_set = set(saved.param_names), set(live)
+        if saved_set != live_set:
+            raise ValueError(
+                f"Param group {group_idx} of the optimizer state does not hold the "
+                f"same parameters as that of the optimizer. Only in the optimizer "
+                f"state: {sorted(saved_set - live_set)}. Only in the optimizer: "
+                f"{sorted(live_set - saved_set)}."
+            )

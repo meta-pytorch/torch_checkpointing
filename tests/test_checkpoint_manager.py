@@ -13,6 +13,7 @@ from unittest import mock
 
 import pytest
 import torch
+import torch.nn as nn
 from torch_checkpointing.checkpoint_base import CheckpointBase, CheckpointItem
 from torch_checkpointing.checkpoint_manager import CheckpointManager
 from torch_checkpointing.checkpoint_writer import CallbackArgs
@@ -34,6 +35,10 @@ from torch_checkpointing.metadata_serialization import (
 from torch_checkpointing.resharding import ReshardingInfo
 from torch_checkpointing.schema import ItemSpec
 from torch_checkpointing.staging import CheckpointStagerConfig
+from torch_checkpointing.state_transformations import (
+    optimizer_transform_post,
+    optimizer_transform_pre,
+)
 from torch_checkpointing.storage.filesystem import LocalFileSystemStorageConfig
 from torch_checkpointing.types import RankInfo, STATE_DICT
 
@@ -437,6 +442,55 @@ def test_load_reads_resharded_items_with_the_configured_executor(
 
     assert executor.batches == [["model"]]
     torch.testing.assert_close(target["w"], weights["w"])
+
+
+def _module_with_params(names: tuple[str, ...]) -> nn.Module:
+    """Return a module whose parameters are created in the order of ``names``."""
+    module = nn.Module()
+    for name in names:
+        module.register_parameter(name, nn.Parameter(torch.zeros(2)))
+    return module
+
+
+def test_load_matches_optimizer_state_by_name_when_params_are_reordered(
+    tmp_path: Path,
+) -> None:
+    # The usual flow: save the transformed optimizer state, load it in place into
+    # the transformed state of a live optimizer, then transform it back. The
+    # live model creates its parameters in the opposite order.
+    config = CheckpointManager.Config.with_sync_save()
+    config.storage_config = LocalFileSystemStorageConfig(use_direct_io=False)
+    saved_model = _module_with_params(("wq", "wk"))
+    saved = torch.optim.Adam(saved_model.named_parameters())
+    for i, param in enumerate(saved_model.parameters()):
+        param.grad = torch.full_like(param, float(i + 1))
+    saved.step()
+
+    loaded_model = _module_with_params(("wk", "wq"))
+    loaded = torch.optim.Adam(loaded_model.named_parameters())
+    # Take a step to create the state that the load fills in place.
+    for param in loaded_model.parameters():
+        param.grad = torch.zeros_like(param)
+    loaded.step()
+
+    path = str(tmp_path / "checkpoint")
+    manager = CheckpointManager(config)
+    try:
+        manager.save(path, {"optimizer": optimizer_transform_pre(saved.state_dict())})
+        restored = manager.load(
+            path,
+            into={"optimizer": optimizer_transform_pre(loaded.state_dict())},
+            strict=True,
+        )
+    finally:
+        manager.close()
+    loaded.load_state_dict(optimizer_transform_post(restored["optimizer"], loaded))
+
+    for name in ("wq", "wk"):
+        torch.testing.assert_close(
+            loaded.state[loaded_model.get_parameter(name)]["exp_avg"],
+            saved.state[saved_model.get_parameter(name)]["exp_avg"],
+        )
 
 
 def test_save_strict_schema_rejects_unknown_key(tmp_path: Path) -> None:

@@ -241,8 +241,11 @@ def load_checkpoint(
         strict=True,
     )
     # The tensors were loaded in place. This applies the rest of the optimizer
-    # state, its param_groups, which hold the hyperparameters.
-    optimizer.load_state_dict(optimizer_transform_post(restored["optimizer"]))
+    # state, its param_groups, which hold the hyperparameters. Passing the
+    # optimizer attaches the state to its parameters by name.
+    optimizer.load_state_dict(
+        optimizer_transform_post(restored["optimizer"], optimizer)
+    )
     return int(restored["train_state"]["step"])
 
 
