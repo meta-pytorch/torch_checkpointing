@@ -211,7 +211,22 @@ class DeviceMeshSpec:
         )
 
     def __hash__(self) -> int:
+        # Memoized: resharding looks each rank's coordinate up by the spec once
+        # per path and source rank, and hashing mesh_data costs O(mesh size).
+        # __reduce__ keeps the memo out of pickles.
         return self._hash
+
+    def __reduce__(self) -> tuple[Any, tuple[Any, ...]]:
+        """Pickle the fields only, and unpickle to the interned spec.
+
+        A pickled ``_hash`` memo would be stale in a process whose string
+        hashes differ, and the cached ``_dict`` is derived. Unpickling through
+        ``get_device_mesh_spec`` shares one spec per mesh, as building one does.
+        """
+        return (
+            get_device_mesh_spec,
+            (self.device_type, self.mesh_shape, self.mesh_data, self.mesh_dim_names),
+        )
 
     @classmethod
     def from_mesh(
@@ -299,7 +314,6 @@ class DeviceMeshSpec:
         return _rank_coordinates(self).get(rank)
 
 
-@lru_cache(maxsize=None)
 def get_device_mesh_spec(
     device_type: str,
     mesh_shape: tuple[int, ...],
@@ -309,9 +323,9 @@ def get_device_mesh_spec(
     """
     Get or create a DeviceMeshSpec with reference deduplication.
 
-    Uses lru_cache (unbounded) to return the same instance for identical
-    parameters. This enables pickle's memo mechanism to automatically
-    deduplicate DeviceMeshSpec references during serialization.
+    Returns the same instance for identical parameters, however they are
+    passed. This enables pickle's memo mechanism to automatically deduplicate
+    DeviceMeshSpec references during serialization.
 
     Args:
         device_type: Type of device ("cuda", "cpu", etc.)
@@ -322,6 +336,20 @@ def get_device_mesh_spec(
     Returns:
         A cached DeviceMeshSpec instance for the given parameters.
     """
+    # Positional, so that keyword and positional calls share cache entries.
+    return _interned_device_mesh_spec(
+        device_type, mesh_shape, mesh_data, mesh_dim_names
+    )
+
+
+@lru_cache(maxsize=None)
+def _interned_device_mesh_spec(
+    device_type: str,
+    mesh_shape: tuple[int, ...],
+    mesh_data: tuple[int, ...],
+    mesh_dim_names: tuple[str, ...] | None,
+) -> DeviceMeshSpec:
+    """The one DeviceMeshSpec for these parameters (unbounded cache)."""
     return DeviceMeshSpec(
         device_type=device_type,
         mesh_shape=mesh_shape,
@@ -370,21 +398,6 @@ class DTensorShardingMetadata(ShardingMetadata):
     stride: tuple[int, ...]
     mesh_spec: DeviceMeshSpec
     placements: tuple[_PlacementSpec, ...]
-
-    @cached_property
-    def _hash(self) -> int:
-        return hash(
-            (
-                self.global_shape,
-                self.dtype,
-                self.stride,
-                self.mesh_spec,
-                self.placements,
-            )
-        )
-
-    def __hash__(self) -> int:
-        return self._hash
 
     @classmethod
     def from_dtensor(

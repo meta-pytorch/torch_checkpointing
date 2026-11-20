@@ -4,7 +4,9 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import pickle
 from collections.abc import Iterator
+from typing import Any
 
 import pytest
 import torch
@@ -21,6 +23,7 @@ from torch_checkpointing.distributed_metadata import (
     DistributedItemMetadata,
     DistributedMetadata,
     GlobalObjectMetadata,
+    ShardingMetadata,
 )
 from torch_checkpointing.dtensor_metadata import (
     DeviceMeshSpec,
@@ -34,6 +37,55 @@ from torch_checkpointing.metadata_manager import DefaultMetadataManager
 from torch_checkpointing.types import CheckpointPath, NestedPath, RankInfo
 
 from .resharding_test_utils import CustomTensorObject, make_checkpoint_item
+
+
+class _PlainMetadata(ShardingMetadata, type_name="_plain_test_v1"):
+    """A subclass that is not a dataclass and defines no ``__eq__``/``__hash__``."""
+
+    def __init__(self, shape: tuple[int, ...]) -> None:
+        self.shape = shape
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"shape": list(self.shape)}
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "_PlainMetadata":
+        return cls(tuple(d["shape"]))
+
+    @property
+    def equivalent_ranks(self) -> tuple[int, ...] | None:
+        return None
+
+
+def test_plain_subclass_gets_value_equality_and_hash_from_pack() -> None:
+    first, second, other = (
+        _PlainMetadata((2, 3)),
+        _PlainMetadata((2, 3)),
+        _PlainMetadata((3, 2)),
+    )
+
+    assert first == second and hash(first) == hash(second)
+    assert first != other
+    assert len({first: 0, second: 1, other: 2}) == 2
+
+
+def test_unpickled_device_mesh_spec_is_the_interned_spec() -> None:
+    spec = get_device_mesh_spec("cpu", (2, 2), (0, 2, 1, 3), ("dp", "tp"))
+    hash(spec)
+
+    blob = pickle.dumps(spec)
+
+    assert b"_hash" not in blob
+    assert pickle.loads(blob) is spec
+    assert (
+        get_device_mesh_spec(
+            device_type="cpu",
+            mesh_shape=(2, 2),
+            mesh_data=(0, 2, 1, 3),
+            mesh_dim_names=("dp", "tp"),
+        )
+        is spec
+    )
 
 
 def test_missing_rank_layout_uses_default_torch_rank_path() -> None:

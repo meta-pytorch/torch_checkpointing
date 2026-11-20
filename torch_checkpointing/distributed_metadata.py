@@ -23,7 +23,6 @@ import json
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from functools import cached_property
 from pathlib import Path
 from typing import Any, ClassVar
 
@@ -46,6 +45,9 @@ class ShardingMetadata(ABC):
     This class provides a registry mechanism for subclasses to automatically
     register themselves, enabling polymorphic serialization and deserialization
     of different sharding metadata types.
+
+    Subclasses compare and hash by value: by default through ``_pack()``, or
+    with the methods a frozen dataclass generates. See ``__hash__``.
     """
 
     _registry: ClassVar[dict[str, type["ShardingMetadata"]]] = {}
@@ -78,6 +80,19 @@ class ShardingMetadata(ABC):
             A ShardingMetadata object constructed from the dictionary.
         """
         pass
+
+    def __eq__(self, other: object) -> bool:
+        """Value equality through ``_pack()``; frozen dataclasses replace it with
+        their generated ``__eq__``."""
+        return isinstance(other, ShardingMetadata) and str(other._pack()) == str(
+            self._pack()
+        )
+
+    def __hash__(self) -> int:
+        """Hash of ``_pack()``, consistent with ``__eq__``; frozen dataclasses
+        replace it with their generated ``__hash__``. Never memoize a hash in the
+        instance: metadata is pickled across processes."""
+        return hash(str(self._pack()))
 
     @property
     @abstractmethod
@@ -159,13 +174,6 @@ class GlobalObjectMetadata:
 
     sharding_metadata: ShardingMetadata
     ranks: tuple[int, ...]
-
-    @cached_property
-    def _hash(self) -> int:
-        return hash((self.sharding_metadata, self.ranks))
-
-    def __hash__(self) -> int:
-        return self._hash
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary for serialization."""

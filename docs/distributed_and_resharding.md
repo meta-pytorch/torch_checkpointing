@@ -682,7 +682,13 @@ Walk `item_value` and return a `ShardingMetadata` for each sharded object,
 keyed by its `NestedPath` within the item. Return an empty dict if the item
 holds no sharded objects. Your `ShardingMetadata` subclass must implement
 `to_dict` / `from_dict` (it auto-registers by type name for polymorphic
-deserialization) and the `equivalent_ranks` property.
+deserialization) and the `equivalent_ranks` property. The metadata manager
+groups ranks by the hash and equality of their metadata, so equal metadata must
+mean the same layout. `ShardingMetadata` provides value `__eq__` and `__hash__`
+through `_pack()` (the serialized form), and a frozen dataclass replaces them
+with its generated ones. If you write your own, never memoize the hash in the
+instance (e.g. with `functools.cached_property`): metadata is pickled to other
+ranks, whose string hashes differ.
 
 ### Required: `generate_load_plans`
 
