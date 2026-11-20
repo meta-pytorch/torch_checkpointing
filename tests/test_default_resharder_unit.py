@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import logging
+import os
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -14,6 +15,7 @@ from unittest.mock import patch
 
 import pytest
 import torch
+import torch_checkpointing
 from safetensors.torch import save_file
 from torch_checkpointing.checkpoint_layout import (
     LayoutInfo,
@@ -45,6 +47,13 @@ from .resharding_test_utils import plan_and_execute
 
 
 def test_import_does_not_require_safetensors() -> None:
+    # The child must see the same package as this process, which pytest may
+    # have put on `sys.path` without exporting it in `PYTHONPATH`.
+    package_root = str(Path(torch_checkpointing.__file__).resolve().parents[1])
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join(
+        p for p in (package_root, env.get("PYTHONPATH", "")) if p
+    )
     subprocess.run(
         [
             sys.executable,
@@ -56,6 +65,7 @@ def test_import_does_not_require_safetensors() -> None:
             "import torch_checkpointing.default_resharder",
         ],
         check=True,
+        env=env,
     )
 
 
