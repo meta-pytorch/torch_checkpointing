@@ -153,3 +153,10 @@ combine-as-imports = true
 order-by-type = false
 
 [tool.test-selector.extra-deps]
+
+# BEGIN GENERATED buck-manual-deps -- do not edit by hand
+# Regenerate: export_buck_manual_deps.py
+"torch_checkpointing/state_transformations.py" = [
+    "tests/test_state_transformations.py",
+]
+# END GENERATED buck-manual-deps
