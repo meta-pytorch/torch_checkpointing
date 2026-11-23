@@ -578,34 +578,41 @@ class DefaultMetadataManager(MetadataManager):
         all_ranks_metadata: dict[int, dict[str, dict[NestedPath, ShardingMetadata]]],
     ) -> dict[str, dict[NestedPath, list[GlobalObjectMetadata]]]:
         """
-        Merge per-path metadata from all ranks, grouping by ShardingMetadata hash.
+        Merge per-path metadata from all ranks, grouping ranks by equal metadata.
 
-        Optimized for large-scale scenarios (300k+ ranks) by using ShardingMetadata's
-        cached hash for efficient deduplication. This is more efficient than
-        per-item grouping because:
-        1. ShardingMetadata subclasses can implement __hash__ with caching
-        2. Direct hash comparison avoids serialization overhead
-        3. Per-path granularity is simpler and easier to reason about
+        Walks the ranks in order, and each rank's entries once, grouping the
+        ranks of each path by their metadata, which ``ShardingMetadata``
+        requires to hash and compare by value.
 
         Args:
             all_ranks_metadata: Dict mapping rank_id to dict[item_key, dict[NestedPath, ShardingMetadata]]
 
         Returns:
-            Dict mapping item_key to dict of NestedPath to list of GlobalObjectMetadata.
-            In the common case (FSDP/DP), each path has a single entry with all ranks.
+            Dict mapping item_key to dict of NestedPath to list of GlobalObjectMetadata,
+            with items and paths in the order they are first seen. Each group's
+            ranks are in the order of ``all_ranks_metadata``, ascending as
+            gathered. In the common case (FSDP/DP), each path has a single entry
+            with all ranks.
         """
         event_logger = EventLogger()
 
-        # Collect all item_keys and their nested paths
-        all_items: dict[str, set[NestedPath]] = {}
-        for rank_metadata in all_ranks_metadata.values():
-            for item_key, nested_paths in rank_metadata.items():
-                if item_key not in all_items:
-                    all_items[item_key] = set()
-                all_items[item_key].update(nested_paths.keys())
-
-        # For each item and nested path, group ranks by their ShardingMetadata
-        result: dict[str, dict[NestedPath, list[GlobalObjectMetadata]]] = {}
+        # item_key -> nested_path -> metadata -> ranks that sent it
+        groups: dict[str, dict[NestedPath, dict[ShardingMetadata, list[int]]]] = {}
+        for rank, rank_metadata in all_ranks_metadata.items():
+            for item_key, item_metadata in rank_metadata.items():
+                item_groups = groups.get(item_key)
+                if item_groups is None:
+                    item_groups = groups[item_key] = {}
+                for nested_path, sharding_meta in item_metadata.items():
+                    path_groups = item_groups.get(nested_path)
+                    if path_groups is None:
+                        item_groups[nested_path] = {sharding_meta: [rank]}
+                        continue
+                    ranks = path_groups.get(sharding_meta)
+                    if ranks is None:
+                        path_groups[sharding_meta] = [rank]
+                    else:
+                        ranks.append(rank)
 
         # Share equal rank tuples so pickle memoizes them across tensors instead
         # of serializing the same rank list for every tensor.
@@ -613,53 +620,33 @@ class DefaultMetadataManager(MetadataManager):
         def canonical_ranks(x: tuple[int, ...]) -> tuple[int, ...]:
             return x
 
-        for item_key, nested_paths in all_items.items():
-            result[item_key] = {}
+        def group_ranks(
+            sharding_meta: ShardingMetadata, ranks_list: list[int]
+        ) -> tuple[int, ...]:
+            # If equivalent_ranks is set (e.g. DTensor), compaction means only
+            # the representative rank sent metadata, so ranks_list is
+            # incomplete: use equivalent_ranks for the full set. If None, every
+            # rank sent its own metadata, so ranks_list is already complete.
+            equiv_ranks = sharding_meta.equivalent_ranks
+            return canonical_ranks(
+                tuple(sorted(equiv_ranks))
+                if equiv_ranks is not None
+                else tuple(ranks_list)
+            )
 
-            for nested_path in nested_paths:
-                # Group ranks by their ShardingMetadata for this path
-                # Use ShardingMetadata._pack() string as key since ShardingMetadata may not be hashable
-                metadata_to_ranks: dict[str, tuple[ShardingMetadata, list[int]]] = {}
-
-                for rank, rank_metadata in all_ranks_metadata.items():
-                    if item_key not in rank_metadata:
-                        continue
-                    item_metadata = rank_metadata[item_key]
-                    if nested_path not in item_metadata:
-                        continue
-
-                    sharding_meta = item_metadata[nested_path]
-
-                    # Create hashable key from ShardingMetadata
-                    meta_key = str(sharding_meta._pack())
-
-                    if meta_key in metadata_to_ranks:
-                        metadata_to_ranks[meta_key][1].append(rank)
-                    else:
-                        metadata_to_ranks[meta_key] = (sharding_meta, [rank])
-
-                # Build GlobalObjectMetadata list for this path
-                result[item_key][nested_path] = []
-                for _meta_key, (sharding_meta, ranks_list) in metadata_to_ranks.items():
-                    # Determine which ranks hold this data.
-                    # If equivalent_ranks is set (e.g. DTensor), compaction means
-                    # only the representative rank sent metadata, so ranks_list
-                    # is incomplete — use equivalent_ranks for the full set.
-                    # If None, every rank sent its own metadata, so
-                    # ranks_list is already complete.
-                    equiv_ranks = sharding_meta.equivalent_ranks
-                    final_ranks = canonical_ranks(
-                        tuple(sorted(equiv_ranks))
-                        if equiv_ranks is not None
-                        else tuple(ranks_list)
+        result: dict[str, dict[NestedPath, list[GlobalObjectMetadata]]] = {
+            item_key: {
+                nested_path: [
+                    GlobalObjectMetadata(
+                        sharding_metadata=sharding_meta,
+                        ranks=group_ranks(sharding_meta, ranks_list),
                     )
-
-                    result[item_key][nested_path].append(
-                        GlobalObjectMetadata(
-                            sharding_metadata=sharding_meta,
-                            ranks=final_ranks,
-                        )
-                    )
+                    for sharding_meta, ranks_list in path_groups.items()
+                ]
+                for nested_path, path_groups in item_groups.items()
+            }
+            for item_key, item_groups in groups.items()
+        }
 
         total_paths = sum(len(nested_paths) for nested_paths in result.values())
         logger.info(

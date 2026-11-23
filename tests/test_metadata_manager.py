@@ -102,6 +102,41 @@ def test_merge_reuses_rank_tuples(use_equivalent_ranks: bool) -> None:
         manager.close()
 
 
+def test_merge_groups_ranks_that_disagree_on_a_path() -> None:
+    def metadata(name: str) -> ShardingMetadata:
+        return CustomObject(name).__pt_sharding_metadata__()
+
+    # Ranks 0 and 2 share one object across paths, as an unpickled payload
+    # does when a factory interns its metadata; ranks 1 and 3 send distinct
+    # but equal objects.
+    shared = {rank: metadata("a") for rank in (0, 2)}
+    all_ranks_metadata = {
+        rank: {
+            "optimizer": {
+                ("step",): shared[rank] if rank in shared else metadata("b"),
+                ("other_step",): shared[rank] if rank in shared else metadata("b"),
+            }
+        }
+        for rank in range(4)
+    }
+    all_ranks_metadata[3]["optimizer"][("rank3_only",)] = metadata("c")
+    manager = DefaultMetadataManager(RankInfo(0, 4, 0, 4))
+    try:
+        merged = manager._merge_object_metadata_from_ranks(all_ranks_metadata)
+    finally:
+        manager.close()
+
+    def grouped(path: tuple[str, ...]) -> dict[tuple[int, ...], ShardingMetadata]:
+        return {
+            group.ranks: group.sharding_metadata for group in merged["optimizer"][path]
+        }
+
+    expected = {(0, 2): metadata("a"), (1, 3): metadata("b")}
+    assert grouped(("step",)) == expected
+    assert grouped(("other_step",)) == expected
+    assert grouped(("rank3_only",)) == {(3,): metadata("c")}
+
+
 class TestMetadataManager(DTensorTestBase):
     """
     Test suite for metadata manager functionality.
