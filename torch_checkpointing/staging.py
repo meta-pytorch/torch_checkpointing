@@ -26,7 +26,7 @@ import contextvars
 import logging
 from collections.abc import Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
-from contextlib import nullcontext
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field
 from typing import Any, TypeVar
 
@@ -249,6 +249,17 @@ class DefaultStager(CheckpointStager):
                 "Non-blocking copy requires that the current accelerator is available."
             )
 
+    def _cuda_device_context(self) -> AbstractContextManager[object]:
+        """Select the captured CUDA device, or do nothing without CUDA.
+
+        `torch.accelerator` can be available without CUDA (MPS, XPU). There,
+        `torch.cuda.device(None)` is not a no-op: it looks up the current
+        device of that accelerator, which `torch.mps` does not provide.
+        """
+        if self._cuda_device is None:
+            return nullcontext()
+        return torch.cuda.device(self._cuda_device)
+
     def _init_worker_thread(self) -> None:
         """Make the worker's thread-local CUDA current device match the main
         thread's. Required so `cudaHostRegister` calls from pin_memory
@@ -281,7 +292,7 @@ class DefaultStager(CheckpointStager):
             # for all operations on the current stream (e.g. optimiser step) to finish.
             # Both sync and async staging use the device selected at construction,
             # including when submitted from a thread with a different current device.
-            with torch.cuda.device(self._cuda_device):
+            with self._cuda_device_context():
                 current_stream_ready = torch.Event(enable_timing=True)
                 current_stream_ready.record(torch.accelerator.current_stream())
         else:
@@ -337,7 +348,7 @@ class DefaultStager(CheckpointStager):
         if self._accelerator_available:
             assert current_stream_ready is not None
             with (
-                torch.cuda.device(self._cuda_device),
+                self._cuda_device_context(),
                 self._staging_stream or nullcontext(),
             ):
                 # Block this thread until the main stream is done with all
