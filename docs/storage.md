@@ -363,11 +363,15 @@ and `remap_path` returns the full URI.
 credentials or endpoints. The config must stay picklable, because the async
 save subprocess rebuilds the storage from it.
 
-**Commit is only as atomic as the driver's move.** `rename` checks the
-destination and then calls the driver's move. Where that move is a single
-directory rename, it is atomic. On a flat object store each object is copied
-and then deleted, so a crash midway can leave the final checkpoint directory
-partly written.
+**Commit is only as atomic as the driver's move.** On the staged-write path the
+sequence is: pre-write callback -> `role_rank == 0` removes any leftover staging
+directory from an interrupted save -> pre-write barrier -> every rank writes its
+shards -> pre-finalize callback -> write barrier -> `role_rank == 0` renames the
+staging directory onto the final path -> finalize callback.
+`rename` checks the destination and then calls the driver's move. Where that
+move is a single directory rename, it is atomic. On a flat object store each
+object is copied and then deleted, so a crash midway can leave the final
+checkpoint directory partly written.
 
 **The listing cache is turned off.** Some drivers cache directory listings per
 client and trust them when looking a path up, but other ranks and the save

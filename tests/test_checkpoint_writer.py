@@ -476,6 +476,7 @@ class TestCheckpointWriter(TestCase):
             pre_finalize_callback=mock_pre_finalize_callback,
             finalize_callback=mock_finalize_callback,
         )
+        writer._barrier = mock.Mock()
         writer.write(str(final_path), self._raw_checkpoint_info())
         self.assertEqual(mock_pre_finalize_callback.call_count, 1)
         self.assertEqual(
@@ -483,10 +484,46 @@ class TestCheckpointWriter(TestCase):
         )
         self.assertEqual(mock_finalize_callback.call_count, 1)
         self.assertEqual(mock_finalize_callback.call_args.args[0].path, str(final_path))
+        # Once before writing so rank 0 can clear any leftover staging dir,
+        # and once before rank 0 commits.
+        self.assertEqual(writer._barrier.execute_barrier.call_count, 2)
 
         # Not renamed -- temp dir still exists
         self.assertFalse(final_path.exists())
         self.assertTrue(expected_tmp_path.exists())
+
+    def test_write_clears_a_leftover_staging_dir_before_writing(self):
+        final_path = Path(self.temp_dir) / "checkpoint_0006000"
+        leftover = Path(self.temp_dir) / "tmp_checkpoint_0006000"
+        leftover.mkdir()
+        (leftover / "model_99.pt").write_bytes(b"orphan")
+        writer = self._writer(_ConcurrencyProbe(1), barrier_config=_NoopBarrierConfig())
+        seen = []
+        writer._barrier = mock.Mock()
+        writer._barrier.execute_barrier.side_effect = lambda _t: seen.append(
+            (leftover / "model_99.pt").exists()
+        )
+        writer.write(str(final_path), self._raw_checkpoint_info())
+        self.assertEqual(seen[0], False)  # cleared before B0
+        self.assertEqual(
+            sorted(p.name for p in final_path.iterdir()),
+            ["first.bin", "metadata.bin", "second.bin"],
+        )
+        self.assertFalse(leftover.exists())
+
+    def test_only_role_rank_0_clears_a_leftover_staging_dir(self):
+        self.rank_info = RankInfo(
+            global_rank=1, global_world_size=2, role_rank=1, role_world_size=2
+        )
+        final_path = Path(self.temp_dir) / "checkpoint_0007000"
+        leftover = Path(self.temp_dir) / "tmp_checkpoint_0007000"
+        leftover.mkdir()
+        (leftover / "model_99.pt").write_bytes(b"orphan")
+        writer = self._writer(_ConcurrencyProbe(1), barrier_config=_NoopBarrierConfig())
+        writer._barrier = mock.Mock()
+        writer.write(str(final_path), self._raw_checkpoint_info())
+        self.assertEqual(writer._barrier.execute_barrier.call_count, 2)
+        self.assertTrue((leftover / "model_99.pt").exists())
 
     def test_write_with_barrier_rejects_preexisting_final_dir(self):
         """Test that committing onto a non-empty final path fails loudly."""
@@ -563,8 +600,11 @@ class TestCheckpointWriter(TestCase):
             )
         )
         self.assertIsInstance(writer._barrier, _NoopBarrier)
+        writer._barrier = mock.Mock()
 
         writer.write(str(final_path), self._raw_checkpoint_info())
+
+        self.assertEqual(writer._barrier.execute_barrier.call_count, 1)
 
         self.assertEqual(storage_config.rename_calls, [])
         self.assertFalse(tmp_path.exists())
@@ -665,9 +705,11 @@ class TestCheckpointWriter(TestCase):
             CheckpointWriteInfo(checkpoint_items=items),
         )
 
+        # The pre-write barrier holds every rank until rank 0 has cleared any
+        # leftover staging dir.
         self.assertEqual(
             events,
-            ["pre_write", "pre_finalize", "barrier", "finalize"],
+            ["pre_write", "barrier", "pre_finalize", "barrier", "finalize"],
         )
         self.assertFalse(temporary_path.exists())
 

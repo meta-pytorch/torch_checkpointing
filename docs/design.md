@@ -399,10 +399,13 @@ default, so a load without resharding can find a rank's file without reading
 metadata. An explicit `LayoutInfo.file_path` remains exact. A fixed shared path
 is safe only when the caller selects one rank to write it.
 
-Metadata is written by `role_rank == 0` only. When a barrier is configured, the
-writer stages files under a `tmp_` directory, waits for all ranks at the barrier,
-then renames to the final path for atomicity; `pre_finalize_callback` runs before
-the barrier and `finalize_callback` after. All write hooks accept a
+Metadata is written by `role_rank == 0` only. When a barrier is configured and
+`write_to_temp_dir=True` (the default), the writer stages files under a `tmp_`
+directory (`role_rank == 0` first clears any leftover staging directory behind a
+barrier), waits for all ranks at a barrier, and then `role_rank == 0` renames
+the directory onto the final path.
+`pre_finalize_callback` runs before the write barrier and `finalize_callback`
+after it. All write hooks accept a
 `CallbackArgs` object containing the phase path, writer storage, and event logger.
 `pre_write_callback` runs with the final destination before any files are written.
 With no barrier configured, the writer

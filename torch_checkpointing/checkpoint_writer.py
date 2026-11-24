@@ -49,7 +49,7 @@ class CheckpointWriterConfig:
 
     Attributes:
         checkpoint_write_barrier_timeout_sec: Maximum time in seconds to wait for all ranks
-            to reach the checkpoint barrier before timing out. Default is 600 seconds.
+            at each of the writer's barriers before timing out. Default is 600 seconds.
         barrier_config: Complete configuration for the synchronization barrier that
             commits the write. Defaults to ``DefaultStoreBarrierConfig``, which
             coordinates on the store the process group already has and costs a
@@ -219,6 +219,32 @@ class CheckpointWriter:
         final_path = Path(path)
         if self._args.config.write_to_temp_dir:
             tmp_dir_path = _temp_dir_path(final_path, self._args.config.temp_dir_prefix)
+            if self._args.rank_info.role_rank == 0 and self._storage.isdir(
+                tmp_dir_path
+            ):
+                logger.warning(
+                    "Removing leftover staging directory %s before writing.",
+                    tmp_dir_path,
+                )
+                self._storage.rmdir(tmp_dir_path)
+            # Every rank waits here even when rank 0 found nothing: other ranks
+            # cannot know whether a leftover existed, and must not write into
+            # tmp_dir_path until rank 0 has cleared it.
+            assert self._barrier is not None
+            logger.info(
+                f"Waiting for all ranks at staging barrier with timeout {self._args.config.checkpoint_write_barrier_timeout_sec}s",
+                extra=event_logger(EventType.CHECKPOINT_BARRIER_START),
+            )
+            self._barrier.execute_barrier(
+                self._args.config.checkpoint_write_barrier_timeout_sec,
+            )
+            logger.info(
+                "All ranks passed staging barrier",
+                extra=event_logger(
+                    EventType.CHECKPOINT_BARRIER_END,
+                    metric_name=f"{self._metric_prefix}.execute.staging_barrier.latency_ms",
+                ),
+            )
         else:
             tmp_dir_path = final_path
 
