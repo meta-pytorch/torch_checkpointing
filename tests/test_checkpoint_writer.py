@@ -41,6 +41,7 @@ from torch_checkpointing.checkpoint_writer import (
     DEFAULT_TEMP_DIR_PREFIX,
 )
 from torch_checkpointing.logging_utils import EventLogger
+from torch_checkpointing.metadata_serialization import METADATA_FILE_NAME
 from torch_checkpointing.storage.filesystem import (
     LocalFileSystemStorage,
     LocalFileSystemStorageConfig,
@@ -555,6 +556,75 @@ class TestCheckpointWriter(TestCase):
             ["first.bin", "metadata.bin", "second.bin"],
         )
         self.assertEqual((final_path / "first.bin").read_bytes(), b"first")
+
+    def test_write_with_barrier_publishes_metadata_after_the_rename(self):
+        """The completeness marker must not travel inside the directory rename.
+
+        A store without a real directory rename moves objects individually,
+        so the metadata file can finish ahead of shards; a crash then leaves a
+        directory that looks complete. The pre-finalize callback still sees it
+        staged.
+        """
+        final_path = Path(self.temp_dir) / "checkpoint_0006000"
+        tmp_path = Path(self.temp_dir) / f"{DEFAULT_TEMP_DIR_PREFIX}checkpoint_0006000"
+        staged_for_callback: list[bool] = []
+        staged_at_rename: list[bool] = []
+        original_rename = LocalFileSystemStorage.rename
+
+        def rename(storage, src_path, dst_path, *args, **kwargs):
+            if Path(src_path).is_dir():
+                staged_at_rename.append((Path(src_path) / METADATA_FILE_NAME).exists())
+            original_rename(storage, src_path, dst_path, *args, **kwargs)
+
+        writer = self._writer(
+            _ConcurrencyProbe(1),
+            barrier_config=_NoopBarrierConfig(),
+            pre_finalize_callback=lambda args: staged_for_callback.append(
+                (Path(args.path) / METADATA_FILE_NAME).exists()
+            ),
+        )
+        info = self._raw_checkpoint_info()
+        info.serialized_distributed_metadata = b"distributed-metadata"
+        with mock.patch.object(LocalFileSystemStorage, "rename", rename):
+            writer.write(str(final_path), info)
+
+        self.assertEqual(staged_for_callback, [True])
+        self.assertEqual(staged_at_rename, [False])
+        self.assertEqual(
+            (final_path / METADATA_FILE_NAME).read_bytes(), b"distributed-metadata"
+        )
+        self.assertEqual(
+            sorted(p.name for p in final_path.iterdir()),
+            ["first.bin", "metadata.bin", METADATA_FILE_NAME, "second.bin"],
+        )
+        self.assertFalse(tmp_path.exists())
+
+    def test_interrupted_metadata_publish_leaves_no_marker(self):
+        """A crash while the completeness marker is written must not publish it.
+
+        metadata.pkl marks the directory complete, so a reader trusts it as
+        soon as it exists. Written in place at the final path, a process killed
+        mid-write leaves a truncated marker that a reader selects and then
+        fails to unpickle.
+        """
+        final_path = Path(self.temp_dir) / "checkpoint_0006500"
+        original_write = LocalFileSystemStorage.write
+
+        def write(storage, path, data):
+            if Path(path).parent == final_path:
+                # Land part of the bytes and die, as a killed process would.
+                Path(path).write_bytes(bytes(memoryview(data))[:1])
+                raise OSError("killed while writing")
+            original_write(storage, path, data)
+
+        writer = self._writer(_ConcurrencyProbe(1), barrier_config=_NoopBarrierConfig())
+        info = self._raw_checkpoint_info()
+        info.serialized_distributed_metadata = b"distributed-metadata"
+        with mock.patch.object(LocalFileSystemStorage, "write", write):
+            with pytest.raises(OSError, match="killed while writing"):
+                writer.write(str(final_path), info)
+
+        self.assertFalse((final_path / METADATA_FILE_NAME).exists())
 
     def test_default_barrier_commits_through_a_temp_dir(self):
         """Test that a writer left at its defaults commits atomically."""

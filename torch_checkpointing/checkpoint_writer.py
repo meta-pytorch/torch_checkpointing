@@ -263,15 +263,19 @@ class CheckpointWriter:
 
         self._write_keys(save_items, state_dict)
 
-        # Write metadata directly from serialized string if available (rank0 only)
-        if self._args.rank_info.role_rank == 0:
+        metadata = checkpoint_info.serialized_distributed_metadata
+        # On the commit path metadata.pkl is published at final_path after the
+        # rename, so the temp dir holds a copy only for a pre-finalize callback
+        # to read (deleted before the rename).
+        stage_metadata = bool(metadata) and (
+            not self._args.config.write_to_temp_dir
+            or self._args.pre_finalize_callback is not None
+        )
+        if self._args.rank_info.role_rank == 0 and stage_metadata:
             logger.info(
                 "Writing metadata to checkpoint directory",
             )
-            self._write_metadata(
-                tmp_dir_path,
-                checkpoint_info.serialized_distributed_metadata,
-            )
+            self._write_metadata(tmp_dir_path, metadata)
             logger.info(
                 "Done writing metadata to checkpoint directory",
                 extra=event_logger(
@@ -339,8 +343,16 @@ class CheckpointWriter:
             and self._storage.exists(tmp_dir_path)
             and self._args.rank_info.role_rank == 0
         ):
+            # The metadata file marks a checkpoint directory complete, so it
+            # lands last. On a store without a real directory rename, the move
+            # operates per object and metadata.pkl can finish ahead of shards:
+            # a crash midway would leave it next to missing shards.
+            if stage_metadata:
+                self._storage.delete(tmp_dir_path / METADATA_FILE_NAME)
             logger.info("Moving checkpoint to final directory")
             self._storage.rename(tmp_dir_path, final_path, is_directory=True)
+            if metadata:
+                self._publish_metadata(final_path, metadata)
             logger.info(
                 "Finished moving checkpoint to final directory",
                 extra=event_logger(
@@ -513,3 +525,18 @@ class CheckpointWriter:
         if serialized_distributed_metadata:
             metadata_path = dir_path / METADATA_FILE_NAME
             self._storage.write(metadata_path, serialized_distributed_metadata)
+
+    def _publish_metadata(self, dir_path: Path, serialized_metadata: bytes) -> None:
+        """Make ``dir_path/metadata.pkl`` appear whole or not at all.
+
+        The metadata file marks a checkpoint directory complete, so readers
+        trust it as soon as it exists. Written in place, it is visible while
+        partly written: a POSIX file from its creat(), an unfinalized object on
+        a zonal bucket. It is staged under another name and renamed onto the
+        marker so every backend publishes the destination file whole atomically
+        (even when a flat object store implements file moves as copy then
+        delete).
+        """
+        staged_path = dir_path / f".{METADATA_FILE_NAME}.tmp"
+        self._storage.write(staged_path, serialized_metadata)
+        self._storage.rename(staged_path, dir_path / METADATA_FILE_NAME)

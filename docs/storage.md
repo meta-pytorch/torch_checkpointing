@@ -361,17 +361,30 @@ and `remap_path` returns the full URI.
 
 **`storage_options`** are passed to the driver's filesystem class, for
 credentials or endpoints. The config must stay picklable, because the async
-save subprocess rebuilds the storage from it.
+save subprocess rebuilds the storage from it. On GCS zonal buckets, `gcsfs`
+leaves objects unfinalized (appendable) on close by default; pass
+`storage_options={"finalize_on_close": True}` if downstream consumers require
+finalized objects.
 
 **Commit is only as atomic as the driver's move.** On the staged-write path the
 sequence is: pre-write callback -> `role_rank == 0` removes any leftover staging
 directory from an interrupted save -> pre-write barrier -> every rank writes its
-shards -> pre-finalize callback -> write barrier -> `role_rank == 0` renames the
-staging directory onto the final path -> finalize callback.
+shards (plus a temporary `metadata.pkl` on `role_rank == 0` if a pre-finalize
+callback is set) -> pre-finalize callback -> write barrier -> `role_rank == 0`
+deletes any temporary `metadata.pkl`, renames the staging directory onto the
+final path, and publishes `metadata.pkl` -> finalize callback.
 `rename` checks the destination and then calls the driver's move. Where that
-move is a single directory rename, it is atomic. On a flat object store each
-object is copied and then deleted, so a crash midway can leave the final
-checkpoint directory partly written.
+move is a single directory rename, it is atomic: on GCS, a bucket with
+hierarchical namespace (including zonal buckets) renames the folder in one
+request. On a flat object store each object is moved individually (for example
+copy-then-delete on S3, or per-object `moveTo` on flat GCS), so a crash midway
+can leave the final checkpoint directory partly written. Because `metadata.pkl`
+is added only after the directory rename, a partly written directory has no
+metadata, so callers that check for `metadata.pkl` (such as resume discovery or
+metadata-requiring readers) treat it as incomplete; and because it is written as
+`.metadata.pkl.tmp` and renamed into place, `metadata.pkl` is never visible
+half-written, not even on a zonal bucket, whose objects can be read before they
+are finalized.
 
 **The listing cache is turned off.** Some drivers cache directory listings per
 client and trust them when looking a path up, but other ranks and the save
