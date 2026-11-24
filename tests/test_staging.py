@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import contextlib
 import io
 import json
 import weakref
@@ -835,6 +836,26 @@ def test_default_stager_waits_for_its_device_when_called_from_another_thread(
 
 
 class TestStorageManager(TestCase):
+    def test_allocation_context_wraps_only_new_storages(self):
+        entered = []
+
+        @contextlib.contextmanager
+        def record(size: int) -> Iterator[None]:
+            entered.append(size)
+            yield
+
+        manager = StorageManager(
+            pin_memory=False,
+            share_memory=True,
+            pin_memory_min_bytes=0,
+            allocation_context=record,
+        )
+        manager.get(10)
+        manager.get(20)
+        manager.reset()
+        manager.get(10)
+        assert entered == [10, 20]
+
     def test_reuse(self):
         storages_seen = []
         manager = StorageManager(

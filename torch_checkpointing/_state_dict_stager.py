@@ -5,11 +5,14 @@
 # LICENSE file in the root directory of this source tree.
 
 # mypy: allow-untyped-defs
+import contextlib
 import logging
 import types
 import warnings
 import weakref
 from collections import Counter, defaultdict
+from collections.abc import Callable
+from contextlib import AbstractContextManager
 from copyreg import dispatch_table
 from typing import Any
 
@@ -36,12 +39,21 @@ class StorageManager:
         pin_memory (bool): Whether to pin CPU memory for faster CPU-GPU transfers
         share_memory (bool): Whether to share memory across processes
         pin_memory_min_bytes (int): Minimum tensor size in bytes to pin memory
+        allocation_context: Entered around each new storage's allocation with its
+            size in bytes, for example to choose the NUMA node its pages land on.
     """
 
-    def __init__(self, pin_memory: bool, share_memory: bool, pin_memory_min_bytes: int):
+    def __init__(
+        self,
+        pin_memory: bool,
+        share_memory: bool,
+        pin_memory_min_bytes: int,
+        allocation_context: Callable[[int], AbstractContextManager[None]] | None = None,
+    ):
         self._pin_memory = pin_memory
         self._share_memory = share_memory
         self._pin_memory_min_bytes = pin_memory_min_bytes
+        self._allocation_context = allocation_context
         # Size in bytes -> list of storages currently allocated
         self._size_to_storages: defaultdict[int, list[UntypedStorage]] = defaultdict(
             list
@@ -51,11 +63,19 @@ class StorageManager:
 
     def _new_storage(self, size: int) -> UntypedStorage:
         """Create a new UntypedStorage of the given size."""
-        if self._share_memory:
-            # type: ignore
-            storage: UntypedStorage = UntypedStorage._new_shared(size, device="cpu")
-        else:
-            storage = UntypedStorage(size, device="cpu")
+        # A shared-memory storage faults in every page when it is created, so
+        # its placement is decided here; a private one is placed later, when it
+        # is pinned or first written.
+        with (
+            self._allocation_context(size)
+            if self._allocation_context is not None
+            else contextlib.nullcontext()
+        ):
+            if self._share_memory:
+                # type: ignore
+                storage: UntypedStorage = UntypedStorage._new_shared(size, device="cpu")
+            else:
+                storage = UntypedStorage(size, device="cpu")
 
         # Skip pinning for tensors below the minimum size threshold
         # Small tensors (e.g., optimizer step counters, scalars) have negligible
@@ -160,6 +180,8 @@ class StateDictStager:
         share_memory: bool = False,
         pin_memory_min_bytes: int = 5,
         use_non_blocking_copy: bool = False,
+        storage_allocation_context: Callable[[int], AbstractContextManager[None]]
+        | None = None,
     ):
         if pin_memory and not torch.cuda.is_available():
             warnings.warn(
@@ -172,6 +194,7 @@ class StateDictStager:
             pin_memory=pin_memory,
             share_memory=share_memory,
             pin_memory_min_bytes=pin_memory_min_bytes,
+            allocation_context=storage_allocation_context,
         )
         self._use_non_blocking_copy = use_non_blocking_copy
 

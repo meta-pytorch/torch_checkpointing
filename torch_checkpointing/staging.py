@@ -24,9 +24,9 @@ Classes:
 import abc
 import contextvars
 import logging
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
-from contextlib import nullcontext
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field
 from typing import Any, TypeVar
 
@@ -115,6 +115,9 @@ class CheckpointStagerConfig:
             allowing CPU work to continue during GPU transfers. Only effective
             on pinned_memory tensors (non-pinned tensors are always a blocking
             copy). Default: True if CUDA is available, False otherwise
+        storage_allocation_context: Entered around each new staging storage's
+            allocation with its size in bytes, for example to choose the NUMA
+            node its pages land on. Default: None
 
     Note:
         CUDA-dependent features will raise exception if CUDA is not available.
@@ -126,6 +129,9 @@ class CheckpointStagerConfig:
     use_non_blocking_copy: bool = field(default_factory=can_pin_memory)
     thread_name: str = "ckpt-staging"
     metric_prefix: str = "train.checkpoint_write"
+    storage_allocation_context: Callable[[int], AbstractContextManager[None]] | None = (
+        None
+    )
 
 
 class DefaultStager(CheckpointStager):
@@ -202,6 +208,7 @@ class DefaultStager(CheckpointStager):
             pin_memory=config.use_pinned_memory,
             share_memory=config.use_shared_memory,
             use_non_blocking_copy=config.use_non_blocking_copy,
+            storage_allocation_context=config.storage_allocation_context,
         )
         self._staged_state_dict: object | None = None
         self._staging_executor: ThreadPoolExecutor | None = None
