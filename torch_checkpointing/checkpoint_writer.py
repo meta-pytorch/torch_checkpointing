@@ -338,11 +338,7 @@ class CheckpointWriter:
 
         # rename back to original path for atomicity. It's important this is done
         # immediately after the barrier to ensure all ranks have finished writing
-        if (
-            self._args.config.write_to_temp_dir
-            and self._storage.exists(tmp_dir_path)
-            and self._args.rank_info.role_rank == 0
-        ):
+        if self._args.config.write_to_temp_dir and self._args.rank_info.role_rank == 0:
             # The metadata file marks a checkpoint directory complete, so it
             # lands last. On a store without a real directory rename, the move
             # operates per object and metadata.pkl can finish ahead of shards:

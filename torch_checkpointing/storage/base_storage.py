@@ -198,6 +198,10 @@ class Storage(ABC):
         file          directory             raise ``OSError`` (empty or not)
         ============  ====================  =========================================
 
+        A missing ``src_path`` raises ``FileNotFoundError`` and leaves
+        ``dst_path`` alone; the checkpoint writer relies on this and on the
+        refusals above to call ``rename`` without probing either path first.
+
         Two rules generate that table, and both exist because getting them
         wrong is silent data corruption rather than a visible failure.
 

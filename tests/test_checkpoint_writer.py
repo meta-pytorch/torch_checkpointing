@@ -526,6 +526,40 @@ class TestCheckpointWriter(TestCase):
         self.assertEqual(writer._barrier.execute_barrier.call_count, 2)
         self.assertTrue((leftover / "model_99.pt").exists())
 
+    def test_a_fresh_commit_probes_storage_only_for_a_leftover_staging_dir(self):
+        """rename refuses a missing source and an occupied destination itself.
+
+        Each probe is an uncached round trip on an object store.
+        """
+        final_path = Path(self.temp_dir) / "checkpoint_0010700"
+        tmp_path = Path(self.temp_dir) / f"{DEFAULT_TEMP_DIR_PREFIX}{final_path.name}"
+        writer = self._writer(_ConcurrencyProbe(1), barrier_config=_NoopBarrierConfig())
+        probes: list[tuple[str, Path]] = []
+        original_exists = LocalFileSystemStorage.exists
+        original_isdir = LocalFileSystemStorage.isdir
+
+        def exists(storage, path):
+            probes.append(("exists", Path(path)))
+            return original_exists(storage, path)
+
+        def isdir(storage, path):
+            probes.append(("isdir", Path(path)))
+            return original_isdir(storage, path)
+
+        info = self._raw_checkpoint_info()
+        info.serialized_distributed_metadata = b"distributed-metadata"
+        with (
+            mock.patch.object(LocalFileSystemStorage, "exists", exists),
+            mock.patch.object(LocalFileSystemStorage, "isdir", isdir),
+        ):
+            writer.write(str(final_path), info)
+
+        self.assertEqual(probes, [("isdir", tmp_path)])
+        self.assertEqual(
+            sorted(p.name for p in final_path.iterdir()),
+            ["first.bin", "metadata.bin", METADATA_FILE_NAME, "second.bin"],
+        )
+
     def test_write_with_barrier_rejects_preexisting_final_dir(self):
         """Test that committing onto a non-empty final path fails loudly."""
         final_path = Path(self.temp_dir) / "checkpoint_0004000"
@@ -1042,7 +1076,16 @@ def test_generic_pre_write_receives_active_storage_and_final_path_before_creatio
         )
     )
     writer = CheckpointWriter(args)
-    writer.write(str(path), CheckpointWriteInfo(checkpoint_items={}))
+    writer.write(
+        str(path),
+        CheckpointWriteInfo(
+            checkpoint_items={
+                "shard": CheckpointItem(
+                    value=b"shard", layout=LayoutInfo("shard.bin", RawSerialization())
+                )
+            }
+        ),
+    )
     assert received == [(str(path), writer._storage, False, False)]
 
 

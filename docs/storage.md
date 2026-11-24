@@ -134,6 +134,10 @@ exact. Every backend must implement this table:
 | file | existing file | replace it |
 | file | directory | raise `OSError` |
 
+A missing `src_path` raises `FileNotFoundError` and leaves `dst_path` alone. The
+writer relies on these refusals to call `rename` without probing either path
+first.
+
 Two rules generate the table: the contents of `src_path` land *directly* at
 `dst_path` and never nested inside it, and an occupied destination raises instead
 of being merged into or deleted. Only file-onto-file is a replace, because the
