@@ -9,6 +9,7 @@ import os
 import shutil
 import tempfile
 import threading
+import time
 from dataclasses import dataclass, replace
 from pathlib import Path
 from unittest import mock
@@ -690,6 +691,65 @@ class TestCheckpointWriter(TestCase):
             sorted(p.name for p in final_path.iterdir()),
             ["first.bin", "metadata.bin", METADATA_FILE_NAME, "second.bin"],
         )
+
+    def _metric_values(self, write) -> dict[str, list[int]]:
+        """Run ``write`` and return the latency metrics it logged, by name."""
+        with mock.patch.object(checkpoint_writer_module.logger, "info") as info:
+            write()
+        values: dict[str, list[int]] = {}
+        for call in info.call_args_list:
+            extra = call.kwargs.get("extra") or {}
+            if extra.get("metric_name"):
+                name = extra["metric_name"].removeprefix("train.checkpoint_write.")
+                values.setdefault(name, []).append(extra["value"])
+        return values
+
+    def test_filesystem_save_metric_excludes_waiting_for_other_ranks(self):
+        final_path = Path(self.temp_dir) / "checkpoint_0010800"
+        writer = self._writer(_ConcurrencyProbe(1), barrier_config=_NoopBarrierConfig())
+        barrier_waits = iter([0.5])  # Only the staging barrier waits.
+        writer._barrier = mock.Mock()
+        writer._barrier.execute_barrier.side_effect = lambda _timeout: time.sleep(
+            next(barrier_waits, 0)
+        )
+
+        values = self._metric_values(
+            lambda: writer.write(str(final_path), self._raw_checkpoint_info())
+        )
+
+        self.assertGreaterEqual(values["execute.staging_barrier.latency_ms"][0], 500)
+        self.assertLess(values["execute.filesystem.save.latency_ms"][0], 500)
+
+    def test_metadata_write_metric_is_logged_when_metadata_is_published(self):
+        final_path = Path(self.temp_dir) / "checkpoint_0010900"
+        writer = self._writer(_ConcurrencyProbe(1), barrier_config=_NoopBarrierConfig())
+        info = self._raw_checkpoint_info()
+        info.serialized_distributed_metadata = b"distributed-metadata"
+
+        values = self._metric_values(lambda: writer.write(str(final_path), info))
+
+        self.assertEqual(len(values["execute.filesystem.metadata.write.latency_ms"]), 1)
+
+    def test_rename_metric_excludes_removing_the_replaced_checkpoint(self):
+        final_path = self._populated_final("checkpoint_0011100")
+        writer = self._writer(
+            _ConcurrencyProbe(1),
+            barrier_config=_NoopBarrierConfig(),
+            replace_existing=True,
+        )
+        original_rmdir = LocalFileSystemStorage.rmdir
+
+        def slow_rmdir(storage, path):
+            time.sleep(0.5)
+            original_rmdir(storage, path)
+
+        with mock.patch.object(LocalFileSystemStorage, "rmdir", slow_rmdir):
+            values = self._metric_values(
+                lambda: writer.write(str(final_path), self._raw_checkpoint_info())
+            )
+
+        self.assertGreaterEqual(values["execute.replace_existing.latency_ms"][0], 500)
+        self.assertLess(values["execute.rename.latency_ms"][0], 500)
 
     def test_replace_existing_handles_marker_only_dir_on_flat_store(self):
         class _FlatPrefixStorage(LocalFileSystemStorage):
