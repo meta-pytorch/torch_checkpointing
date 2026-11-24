@@ -203,6 +203,7 @@ class CheckpointWriterConfig:
     file_write_max_threads: int = 1
     temp_dir_prefix: str = DEFAULT_TEMP_DIR_PREFIX  # "tmp_"
     write_to_temp_dir: bool = True
+    replace_existing: bool = False
 ```
 
 `DefaultStoreBarrierConfig` is the default because it costs nothing to hold: it
@@ -223,8 +224,10 @@ By default, inside `CheckpointWriter.write()` the ordering is:
 4. Run `pre_finalize_callback` (see below).
 5. Wait for every rank at the barrier, so every shard is written.
 6. On `role_rank == 0`, commit: delete any staged `metadata.pkl` copy; rename
-   the temporary directory onto the final path; then publish `metadata.pkl`
-   there, staged as `.metadata.pkl.tmp` and renamed into place.
+   the temporary directory onto the final path (with `replace_existing=True`, if
+   `rename` raises `FileExistsError`, delete the existing destination
+   directory—its `metadata.pkl` first—and rename again); then publish
+   `metadata.pkl` there, staged as `.metadata.pkl.tmp` and renamed into place.
 7. Run `finalize_callback`.
 
 `metadata.pkl` marks a checkpoint directory complete, so it lands last: on a

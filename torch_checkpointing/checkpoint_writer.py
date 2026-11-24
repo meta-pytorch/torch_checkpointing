@@ -65,6 +65,18 @@ class CheckpointWriterConfig:
             directory and rename it onto the final path once every rank has finished.
             Defaults to True. If false, writer will write directly to the final path.
             Requires a barrier to be configured when True.
+        replace_existing: Replace an existing checkpoint directory at the
+            destination when committing. After every rank has written and passed
+            the write barrier, role rank 0 attempts the commit rename first;
+            only if ``rename`` raises ``FileExistsError`` does it delete the
+            existing destination directory (removing ``metadata.pkl`` first) and
+            rename again. A regular file at the destination is not deleted and
+            raises ``NotADirectoryError``. A failure before that delete leaves
+            the existing destination untouched. Deleting the old checkpoint,
+            renaming, and publishing the new ``metadata.pkl`` are separate
+            steps, so a crash anywhere after deleting the old ``metadata.pkl``
+            until the new ``metadata.pkl`` is published leaves no complete
+            checkpoint at the destination. Requires ``write_to_temp_dir=True``.
     """
 
     checkpoint_write_barrier_timeout_sec: int = 600
@@ -74,6 +86,7 @@ class CheckpointWriterConfig:
     file_write_max_threads: int = 1
     temp_dir_prefix: str = DEFAULT_TEMP_DIR_PREFIX
     write_to_temp_dir: bool = True
+    replace_existing: bool = False
 
     def __post_init__(self) -> None:
         if self.file_write_max_threads < 1:
@@ -83,6 +96,8 @@ class CheckpointWriterConfig:
             logger.warning(msg)
             warnings.warn(msg, stacklevel=2)
             self.write_to_temp_dir = False
+        if self.replace_existing and not self.write_to_temp_dir:
+            raise ValueError("replace_existing requires write_to_temp_dir=True")
         if self.write_to_temp_dir and not self.temp_dir_prefix:
             raise ValueError(
                 "temp_dir_prefix must be non-empty when writing to a temp dir"
@@ -346,7 +361,7 @@ class CheckpointWriter:
             if stage_metadata:
                 self._storage.delete(tmp_dir_path / METADATA_FILE_NAME)
             logger.info("Moving checkpoint to final directory")
-            self._storage.rename(tmp_dir_path, final_path, is_directory=True)
+            self._commit(tmp_dir_path, final_path)
             if metadata:
                 self._publish_metadata(final_path, metadata)
             logger.info(
@@ -506,6 +521,39 @@ class CheckpointWriter:
         by subclasses that need to perform cleanup.
         """
         logger.debug("Closing checkpoint writer")
+
+    def _commit(self, tmp_dir_path: Path, final_path: Path) -> None:
+        """Rename the staging directory onto ``final_path``.
+
+        ``rename`` refuses a missing source and an occupied destination on its
+        own, so on a fresh path, the common case, the writer probes nothing
+        before calling ``rename``: on an object store every probe is an uncached
+        round trip. Only a ``FileExistsError`` refusal looks further: with
+        ``replace_existing``, it removes the existing destination directory and
+        renames again.
+        """
+        try:
+            self._storage.rename(tmp_dir_path, final_path, is_directory=True)
+            return
+        except FileExistsError:
+            # Only a refusal of the occupied destination is replaced. Any other
+            # error, such as a timeout midway through a move on a flat object
+            # store, may have left part of this checkpoint at final_path, and a
+            # delete would throw it away.
+            if not self._args.config.replace_existing:
+                raise
+
+        logger.warning("Replacing existing checkpoint directory %s.", final_path)
+        # The completeness marker leaves first, so an interrupted recursive
+        # delete never leaves metadata.pkl next to missing shards. On flat object
+        # stores the prefix vanishes with its last object, so re-check existence
+        # before rmdir.
+        existing_marker = final_path / METADATA_FILE_NAME
+        if self._storage.exists(existing_marker):
+            self._storage.delete(existing_marker)
+        if self._storage.exists(final_path):
+            self._storage.rmdir(final_path)
+        self._storage.rename(tmp_dir_path, final_path, is_directory=True)
 
     def _write_metadata(
         self, dir_path: Path, serialized_distributed_metadata: bytes | None = None

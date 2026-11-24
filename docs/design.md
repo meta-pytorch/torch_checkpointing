@@ -404,7 +404,10 @@ Metadata is written by `role_rank == 0` only. When a barrier is configured and
 directory (`role_rank == 0` first clears any leftover staging directory behind a
 barrier), waits for all ranks at a barrier, and then `role_rank == 0` renames
 the directory onto the final path and publishes `metadata.pkl` there last, so a
-rename cut short lacks the completeness marker.
+rename cut short lacks the completeness marker. With `replace_existing=True`, if
+`rename` raises `FileExistsError` because a checkpoint directory already exists
+at the final path, `role_rank == 0` deletes that directory and retries the
+rename.
 `pre_finalize_callback` runs before the write barrier and `finalize_callback`
 after it. All write hooks accept a
 `CallbackArgs` object containing the phase path, writer storage, and event logger.
