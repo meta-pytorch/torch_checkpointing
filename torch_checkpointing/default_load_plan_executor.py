@@ -451,7 +451,7 @@ class DefaultLoadPlanExecutor(LoadPlanExecutor):
     """Reads each item's source files and copies the planned chunks into its targets.
 
     Items are loaded one after another, in the order given. Within an item,
-    source files are read concurrently.
+    source ranks are read concurrently, and one rank's part files in turn.
 
     Each load plan must be a plain copy: ``transpose_dims`` empty or the
     identity, and source and target chunks of the same shape, inside a local,
@@ -628,7 +628,8 @@ class DefaultLoadPlanExecutor(LoadPlanExecutor):
             """Return False if the files must be read in full instead."""
             layout_info = source_layouts_by_rank[src_rank]
             read_fqns: set[str] = set()
-            # A worker reads one file at a time and holds one chunk for it.
+            # A worker reads one source rank's files, one at a time, and holds one
+            # chunk for them.
             chunk = chunks.get()
             try:
                 # An item split into parts has its tensors spread over several files.
@@ -667,8 +668,8 @@ class DefaultLoadPlanExecutor(LoadPlanExecutor):
 
         full_file_ranks = list(plans_by_rank)
         if read_strategy is not ReshardingReadStrategy.FULL_FILE:
-            # A worker reads one file at a time, so more workers than files
-            # would only pin chunks that no worker can use.
+            # A worker reads one source rank's files, one at a time, so more workers
+            # than source ranks would only pin chunks that no worker can use.
             max_workers = min(file_read_workers, len(plans_by_rank))
             # One chunk per worker, so no worker waits for one. The pool exits
             # after the workers, so no chunk is unpinned while one is in use.
