@@ -374,8 +374,8 @@ def split_into_parts(value: Any, num_parts: int) -> list[dict[Any, Any]]:
     """Split a nested dict into ``num_parts`` dicts of about equal tensor bytes.
 
     A leaf is any value that is not a non-empty dict. Largest storage first, each
-    storage's leaves go to the part with the fewest bytes so far. Leaves without
-    tensor data (non-tensors, empty or meta tensors) count as 0 bytes.
+    storage's leaves go to the part with the fewest bytes so far. Non-tensor leaves
+    and meta tensors count as 0 bytes.
 
     Example:
 
@@ -423,7 +423,14 @@ def split_into_parts(value: Any, num_parts: int) -> list[dict[Any, Any]]:
             group_bytes[group] = storage.nbytes()
         else:
             group = ("leaf", leaf_index)
-            group_bytes[group] = 0
+            # A wrapper subclass or sparse tensor has no storage of its own: weigh
+            # it by its dense size. Meta tensors write no data.
+            is_tensor_with_data = (
+                isinstance(tensor, torch.Tensor) and tensor.device.type != "meta"
+            )
+            group_bytes[group] = (
+                tensor.numel() * tensor.element_size() if is_tensor_with_data else 0
+            )
         leaves_of_group.setdefault(group, []).append(leaf_index)
 
     # Place the largest groups first, each on the part with the fewest bytes.

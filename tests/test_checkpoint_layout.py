@@ -160,6 +160,34 @@ def test_split_into_parts_keeps_leaves_that_share_a_storage_in_one_part() -> Non
     assert parts[2] == parts[3] == {}
 
 
+class _WrapperTensor(torch.Tensor):
+    """A wrapper subclass: its own storage is an empty placeholder."""
+
+    @staticmethod
+    def __new__(cls, inner: torch.Tensor) -> "_WrapperTensor":
+        return torch.Tensor._make_wrapper_subclass(cls, inner.shape, dtype=inner.dtype)
+
+    def __init__(self, inner: torch.Tensor) -> None:
+        self.inner = inner
+
+    @classmethod
+    def __torch_dispatch__(cls, func, types, args=(), kwargs=None):
+        raise NotImplementedError(f"{func} is not supported by this test tensor")
+
+
+def test_split_into_parts_weighs_a_wrapper_subclass_by_its_size() -> None:
+    value = {
+        "a": _WrapperTensor(torch.zeros(1024)),
+        "b": _WrapperTensor(torch.zeros(1024)),
+        "step": torch.zeros(1),
+    }
+
+    parts = split_into_parts(value, num_parts=2)
+
+    # 4 KiB each, so one per part; the 4-byte step joins the first.
+    assert parts == [{"a": value["a"], "step": value["step"]}, {"b": value["b"]}]
+
+
 def test_split_into_parts_rejects_a_value_that_is_not_a_dict() -> None:
     with pytest.raises(ValueError, match="Only a dict can be split"):
         split_into_parts(torch.zeros(4), num_parts=2)
