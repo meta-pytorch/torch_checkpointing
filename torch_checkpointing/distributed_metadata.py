@@ -228,8 +228,18 @@ class DistributedItemMetadata:
 
         Returns:
             Full path to the checkpoint file for this rank and item.
+
+        Raises:
+            ValueError: If the item is split into parts; use
+                ``LayoutInfo.part_file_paths()`` instead.
         """
-        return checkpoint_path / self.get_layout_info(rank, item_key).file_path
+        layout_info = self.get_layout_info(rank, item_key)
+        if layout_info.num_parts > 1:
+            raise ValueError(
+                f"Item {item_key!r} on rank {rank} is split into "
+                f"{layout_info.part_file_paths()}; use LayoutInfo.part_file_paths()"
+            )
+        return checkpoint_path / layout_info.file_path
 
     def get_metadata_for_path_and_rank(
         self, nested_path: NestedPath, rank: int
