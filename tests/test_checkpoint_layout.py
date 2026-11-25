@@ -142,6 +142,24 @@ def test_split_into_parts_balances_tensor_bytes_and_merge_restores_the_dict() ->
     assert merged["empty"] == {}
 
 
+def test_split_into_parts_keeps_leaves_that_share_a_storage_in_one_part() -> None:
+    # torch.save writes a view's whole storage, so a split storage would be written
+    # once per part.
+    buffer = torch.zeros(16)
+    weight = torch.zeros(2)
+    value = {
+        "views": {str(index): view for index, view in enumerate(buffer.chunk(4))},
+        "weight": weight,
+        "tied_weight": weight,
+    }
+
+    parts = split_into_parts(value, num_parts=4)
+
+    assert parts[0] == {"views": value["views"]}
+    assert parts[1] == {"weight": weight, "tied_weight": weight}
+    assert parts[2] == parts[3] == {}
+
+
 def test_split_into_parts_rejects_a_value_that_is_not_a_dict() -> None:
     with pytest.raises(ValueError, match="Only a dict can be split"):
         split_into_parts(torch.zeros(4), num_parts=2)

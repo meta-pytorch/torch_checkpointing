@@ -373,8 +373,9 @@ class LayoutInfo:
 def split_into_parts(value: Any, num_parts: int) -> list[dict[Any, Any]]:
     """Split a nested dict into ``num_parts`` dicts of about equal tensor bytes.
 
-    A leaf is any value that is not a non-empty dict. Largest first, each leaf goes
-    to the part with the fewest bytes so far; non-tensor leaves count as 0 bytes.
+    A leaf is any value that is not a non-empty dict. Largest storage first, each
+    storage's leaves go to the part with the fewest bytes so far. Leaves without
+    tensor data (non-tensors, empty or meta tensors) count as 0 bytes.
 
     Example:
 
@@ -383,10 +384,16 @@ def split_into_parts(value: Any, num_parts: int) -> list[dict[Any, Any]]:
         )
         # -> [{"exp_avg": {"w": tensor_8mb}}, {"exp_avg": {"b": tensor_1mb}, "step": 3}]
 
+        # Views of one storage stay in one part: torch.save writes the whole storage.
+        split_into_parts({"a": buffer[:4], "b": buffer[4:]}, num_parts=2)
+        # -> [{"a": buffer[:4], "b": buffer[4:]}, {}]
+
     ``merge_parts`` reverses it.
     """
     import torch
     from torch.distributed.tensor import DTensor
+
+    from ._tensor_utils import has_storage_data
 
     if not isinstance(value, Mapping):
         raise ValueError(
@@ -402,25 +409,31 @@ def split_into_parts(value: Any, num_parts: int) -> list[dict[Any, Any]]:
             else:
                 leaves.append(((*prefix, key), child))
 
-    def nbytes(leaf: Any) -> int:
-        if isinstance(leaf, DTensor):
-            leaf = leaf._local_tensor
-        return leaf.nbytes if isinstance(leaf, torch.Tensor) else 0
-
     collect((), value)
 
-    # Place the largest leaves first, each on the part with the fewest bytes.
+    # Group the leaves by storage, weighed by the storage's bytes. Views of one
+    # storage in two parts would write it twice. Other leaves are groups of one.
+    leaves_of_group: dict[Any, list[int]] = {}
+    group_bytes: dict[Any, int] = {}
+    for leaf_index, (_, leaf) in enumerate(leaves):
+        tensor = leaf._local_tensor if isinstance(leaf, DTensor) else leaf
+        if isinstance(tensor, torch.Tensor) and has_storage_data(tensor):
+            storage = tensor.untyped_storage()
+            group = (tensor.device, storage.data_ptr())
+            group_bytes[group] = storage.nbytes()
+        else:
+            group = ("leaf", leaf_index)
+            group_bytes[group] = 0
+        leaves_of_group.setdefault(group, []).append(leaf_index)
+
+    # Place the largest groups first, each on the part with the fewest bytes.
     part_bytes = [0] * num_parts
     part_of_leaf: list[int] = [0] * len(leaves)
-    largest_first = sorted(
-        range(len(leaves)),
-        key=lambda leaf_index: nbytes(leaves[leaf_index][1]),
-        reverse=True,
-    )
-    for leaf_index in largest_first:
+    for group in sorted(leaves_of_group, key=group_bytes.__getitem__, reverse=True):
         part_index = min(range(num_parts), key=part_bytes.__getitem__)
-        part_of_leaf[leaf_index] = part_index
-        part_bytes[part_index] += nbytes(leaves[leaf_index][1])
+        for leaf_index in leaves_of_group[group]:
+            part_of_leaf[leaf_index] = part_index
+        part_bytes[part_index] += group_bytes[group]
 
     # Rebuild each part in the original key order.
     parts: list[dict[Any, Any]] = [{} for _ in range(num_parts)]

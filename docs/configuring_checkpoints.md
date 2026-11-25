@@ -199,9 +199,9 @@ manager = CheckpointManager(CheckpointManager.Config(
 
 The item must be a dict serialized with `TorchSerialization`. Its leaves are
 spread over the parts by tensor bytes, keeping the nesting (`split_into_parts`).
-Direct loads read every part and merge them; resharded loads look up each tensor
-in the parts. `num_parts` is recorded in the checkpoint metadata with the rest of
-the layout.
+Tensors that share a storage stay in one part. Direct loads read every part and
+merge them; resharded loads look up each tensor in the parts. `num_parts` is
+recorded in the checkpoint metadata with the rest of the layout.
 
 ### The canonical FLAT layout
 
