@@ -201,7 +201,9 @@ The item must be a dict serialized with `TorchSerialization`. Its leaves are
 spread over the parts by tensor bytes, keeping the nesting (`split_into_parts`).
 Tensors that share a storage stay in one part. Direct loads read every part and
 merge them; resharded loads look up each tensor in the parts. `num_parts` is
-recorded in the checkpoint metadata with the rest of the layout.
+recorded in the checkpoint metadata with the rest of the layout. Readers from
+before `num_parts` existed ignore it and fail to find the item's file, so split
+an item only when newer readers will load it.
 
 ### The canonical FLAT layout
 
