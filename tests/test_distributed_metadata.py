@@ -440,7 +440,24 @@ def test_pickle_deduplication():
     )
 
 
-def test_distributed_metadata_rejects_duplicate_file_paths():
+@pytest.mark.parametrize(
+    "rank_0_layout, rank_1_layout",
+    [
+        (
+            LayoutInfo("shared_file.pt", TorchSerialization()),
+            LayoutInfo("shared_file.pt", TorchSerialization()),
+        ),
+        # Rank 0's second part file is rank 1's file.
+        (
+            LayoutInfo("shared_file.pt", TorchSerialization(), num_parts=2),
+            LayoutInfo("shared_file.part1.pt", TorchSerialization()),
+        ),
+    ],
+    ids=["same_file", "part_file"],
+)
+def test_distributed_metadata_rejects_duplicate_file_paths(
+    rank_0_layout: LayoutInfo, rank_1_layout: LayoutInfo
+):
     """Test that DistributedMetadata raises error when two ranks write to the same file."""
     mesh_spec = DeviceMeshSpec.from_mesh(
         device_type="cpu",
@@ -463,16 +480,7 @@ def test_distributed_metadata_rejects_duplicate_file_paths():
     )
     model_item_metadata = DistributedItemMetadata(
         nested_path_to_metadata={nested_path: [object_metadata]},
-        rank_to_layout_info={
-            0: LayoutInfo(
-                file_path="shared_file.pt",  # Same file as rank 1
-                serialization_format=TorchSerialization(),
-            ),
-            1: LayoutInfo(
-                file_path="shared_file.pt",  # Same file as rank 0 - should fail
-                serialization_format=TorchSerialization(),
-            ),
-        },
+        rank_to_layout_info={0: rank_0_layout, 1: rank_1_layout},
     )
 
     # Validation should reject this
