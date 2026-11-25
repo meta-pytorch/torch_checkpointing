@@ -9,13 +9,14 @@ The default ``LoadPlanExecutor``: reads source checkpoint files and copies the
 planned chunks into their target tensors.
 """
 
+import contextlib
 import io
 import logging
 import os
+import queue
 import zipfile
-from collections.abc import Generator, Iterable, Mapping
+from collections.abc import Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import closing
 from enum import auto, Enum
 from pathlib import Path
 from typing import Any
@@ -24,6 +25,7 @@ import torch
 from torch.distributed.tensor import DTensor
 from typing_extensions import override
 
+from . import _pin_memory_utils as pin_memory_utils
 from .checkpoint_layout import (
     LayoutInfo,
     SafetensorsSerialization,
@@ -57,6 +59,12 @@ DEFAULT_READS_IN_FLIGHT_PER_HOST: int = 24
 # Source files each rank reads concurrently when ``LOCAL_WORLD_SIZE`` is unset or
 # not a positive integer, so the number of ranks sharing the host is unknown.
 DEFAULT_FILE_READ_WORKERS: int = 8
+# Size of each host buffer that offset reads stream contiguous slices through,
+# when the executor does not set ``read_chunk_bytes``.
+DEFAULT_READ_CHUNK_BYTES: int = 64 << 20
+# Bytes in a complex128 element, the widest torch dtype, so a chunk this large
+# holds one element of any source.
+_MIN_READ_CHUNK_BYTES: int = 16
 
 __all__ = ["DefaultLoadPlanExecutor", "ReshardingReadStrategy"]
 
@@ -156,15 +164,10 @@ def _unwrap_dtensor(value: torch.Tensor) -> torch.Tensor:
     return value._local_tensor if isinstance(value, DTensor) else value
 
 
-def _slice_source_tensor(source: torch.Tensor, load_plan: LoadPlan) -> torch.Tensor:
-    # The full-file fallback does not pass through the offset-read validation.
-    # Validate here because Python slicing silently clamps out-of-bounds ranges.
-    _validate_source_slice_bounds(tuple(source.shape), load_plan)
-    source_slice = tuple(
-        slice(offset, offset + size)
-        for offset, size in zip(load_plan.src_offsets, load_plan.src_sizes)
-    )
-    return source[source_slice]
+def _slice_tensor(
+    tensor: torch.Tensor, offsets: Sequence[int], sizes: Sequence[int]
+) -> torch.Tensor:
+    return tensor[tuple(slice(o, o + s) for o, s in zip(offsets, sizes, strict=True))]
 
 
 def _validate_source_slice_bounds(
@@ -240,12 +243,7 @@ def _validate_load_plan(
             )
 
 
-def _read_source_tensor_slice(
-    stream: io.RawIOBase,
-    source: torch.Tensor,
-    load_plan: LoadPlan,
-) -> torch.Tensor:
-    source = _unwrap_dtensor(source)
+def _validate_offset_read_source(source: torch.Tensor, load_plan: LoadPlan) -> None:
     if type(source) not in (torch.Tensor, torch.nn.Parameter) or not source.is_meta:
         raise NotImplementedError(f"Source {load_plan.src_fqn!r} is not a plain tensor")
     if source.layout is not torch.strided:
@@ -255,45 +253,184 @@ def _read_source_tensor_slice(
     if source.is_quantized:
         raise NotImplementedError(f"Source {load_plan.src_fqn!r} is quantized")
     _validate_source_slice_bounds(tuple(source.shape), load_plan)
-    strides = tuple(source.stride())
 
-    if any(size == 0 for size in load_plan.src_sizes):
-        result = torch.empty(load_plan.src_sizes, dtype=source.dtype)
-    else:
-        checkpoint_offset = getattr(
-            source.untyped_storage(), "_checkpoint_offset", None
+
+def _source_slice_byte_range(
+    source: torch.Tensor, load_plan: LoadPlan
+) -> tuple[int, int]:
+    """Return the half-open byte range of a non-empty slice within the file."""
+    checkpoint_offset = getattr(source.untyped_storage(), "_checkpoint_offset", None)
+    if checkpoint_offset is None:
+        raise NotImplementedError(
+            f"Source {load_plan.src_fqn!r} has no checkpoint offset"
         )
-        if checkpoint_offset is None:
-            raise NotImplementedError(
-                f"Source {load_plan.src_fqn!r} has no checkpoint offset"
+
+    strides = source.stride()
+    first_element = source.storage_offset() + sum(
+        offset * stride for offset, stride in zip(load_plan.src_offsets, strides)
+    )
+    # Span from the first wanted element through the last, read in one go.
+    # For a contiguous source this never exceeds the tensor itself, so the
+    # worst case matches reading the whole tensor.
+    span = 1 + sum(
+        (size - 1) * stride for size, stride in zip(load_plan.src_sizes, strides)
+    )
+    start = checkpoint_offset + first_element * source.element_size()
+    return start, start + span * source.element_size()
+
+
+def _copy_strided(
+    stream: io.RawIOBase,
+    start: int,
+    strides: Sequence[int],
+    source: torch.Tensor,
+    target: torch.Tensor,
+    chunk: torch.Tensor,
+) -> None:
+    """Copy the region of ``source`` at file byte ``start`` into ``target``.
+
+    The region has ``target``'s shape and ``source``'s element ``strides``. It is
+    read through ``chunk`` a block of whole rows at a time.
+    """
+    element_size = source.element_size()
+    rows = target.shape[0]
+    # Bytes from the start of one row to the start of the next.
+    row_stride = strides[0] * element_size
+    # Bytes from a row's first element to its last. In a 2-D slice of a
+    # row-major tensor that is just the row's own elements, but with more
+    # dimensions a row is a block, and skipping columns leaves gaps inside it.
+    #
+    # For example, take columns 1-2 of a (2, 3, 4) float32 tensor src, stored
+    # as a to x. Each row of the slice is one (3, 4) block, src[0] or src[1],
+    # with the wanted columns in brackets:
+    #
+    #   src[0, 0]:  a [b  c] d        src[1, 0]:  m [n  o] p
+    #   src[0, 1]:  e [f  g] h        src[1, 1]:  q [r  s] t
+    #   src[0, 2]:  i [j  k] l        src[1, 2]:  u [v  w] x
+    #
+    # Row 0 is src[0]. Each of src[0, 0], src[0, 1] and src[0, 2] has a run of
+    # two wanted floats (b c, f g, j k), so there are three 8-byte runs. Each
+    # src[0, i] is 4 floats long, so the runs start 16 bytes apart in the file.
+    # row_span covers two of those 16-byte steps plus the last 8-byte run,
+    # 2 * 16 + 8 = 40 bytes:
+    #
+    #   file:   a  b  c  d  e  f  g  h  i  j  k  l  m  ...
+    #              b  c        f  g        j  k
+    #             [--- row_span = 40 bytes ----]
+    row_span = element_size * (
+        1
+        + sum(
+            (size - 1) * stride for size, stride in zip(target.shape[1:], strides[1:])
+        )
+    )
+    # If even one row does not fit in the chunk, copy each row on its own, one
+    # dimension down: target[row] and strides[1:] drop the first dimension, and
+    # each row starts row_stride bytes after the previous one. This bottoms out
+    # at single elements, which always fit.
+    if row_span > chunk.numel():
+        for row in range(rows):
+            _copy_strided(
+                stream=stream,
+                start=start + row * row_stride,
+                strides=strides[1:],
+                source=source,
+                target=target[row],
+                chunk=chunk,
             )
+        return
 
-        element_size = source.element_size()
-        first_element = source.storage_offset() + sum(
-            offset * stride for offset, stride in zip(load_plan.src_offsets, strides)
+    # Picture the chunk as one large buffer that we want to fit as many whole
+    # rows of the slice into as possible, so each read covers as much of the
+    # slice as it can. Reads hold whole rows because as_strided can only
+    # describe a regular grid, with every row the same length and the same
+    # distance apart. A read that stopped partway through a row would end in a
+    # partial row, which no single shape and strides can describe.
+    #
+    # To count the rows, set aside row_span for the last row, which needs no
+    # gap after it. Split what is left of the chunk into row_stride pieces,
+    # each a row plus its gap, and count them. Then add the last row back.
+    #
+    # For example, columns 1-2 of a (4, 3) tensor have a row_span of 2 elements
+    # (b c) and a row_stride of 3 (b to e). An 8-element chunk sets aside 2 for
+    # the last row and fits (8 - 2) // 3 = 2 row_strides in the other 6, so it
+    # holds 3 rows. * marks the slice's elements; d and g are gaps:
+    #
+    #   file:   a   b   c   d   e   f   g   h   i   j   k   l
+    #               *   *       *   *       *   *       *   *
+    #
+    #   chunk:  [ b   c   d | e   f   g | h   i ]
+    #             *   *       *   *       *   *
+    #           |___________|___________|_______|
+    #            row_stride  row_stride  row_span
+    rows_per_chunk = (
+        rows
+        if row_stride == 0
+        else min(rows, (chunk.numel() - row_span) // row_stride + 1)
+    )
+    for first_row in range(0, rows, rows_per_chunk):
+        end_row = min(first_row + rows_per_chunk, rows)
+        piece = chunk[: (end_row - first_row - 1) * row_stride + row_span]
+        _read_exact(stream, start + first_row * row_stride, memoryview(piece.numpy()))
+        view = piece.view(source.dtype).as_strided(
+            (end_row - first_row, *target.shape[1:]), strides
         )
-        # Span from the first wanted element through the last, read in one go.
-        # For a contiguous source this never exceeds the tensor itself, so the
-        # worst case matches reading the whole tensor.
-        span = 1 + sum(
-            (size - 1) * stride for size, stride in zip(load_plan.src_sizes, strides)
-        )
-        # Uninitialized, unlike a bytearray, which would zero-fill memory that
-        # the read overwrites anyway.
-        packed = torch.empty(span * element_size, dtype=torch.uint8)
-        _read_exact(
-            stream,
-            checkpoint_offset + first_element * element_size,
-            memoryview(packed.numpy()),
-        )
-        result = packed.view(source.dtype).as_strided(load_plan.src_sizes, strides)
+        if source.is_conj():
+            view = view.conj()
+        if source.is_neg():
+            view = view._neg_view()
+        # Blocking, so the chunk can be refilled or unpinned once it returns.
+        target[first_row:end_row].copy_(view)
 
-    if source.is_conj():
-        result = result.conj()
-    if source.is_neg():
-        result = result._neg_view()
 
-    return result
+def _copy_source_tensor_slice(
+    stream: io.RawIOBase,
+    source: torch.Tensor,
+    load_plan: LoadPlan,
+    target: torch.Tensor,
+    chunk: torch.Tensor,
+) -> None:
+    """Copy one slice of ``source`` into ``target`` through ``chunk``."""
+    source = _unwrap_dtensor(source)
+    _validate_offset_read_source(source, load_plan)
+    if target.numel() == 0:
+        return
+
+    start, _ = _source_slice_byte_range(source, load_plan)
+    strides = source.stride()
+    if target.dim() == 0:
+        target, strides = target.view(1), (1,)
+    # Walk the source in file order, largest stride first, so a source saved
+    # transposed or permuted is read in whole runs instead of re-reading the
+    # interleaved rows. The permuted target is a view, so each element still
+    # lands in its own place.
+    order = sorted(range(len(strides)), key=lambda dim: -strides[dim])
+    target = target.permute(order)
+    strides = tuple(strides[dim] for dim in order)
+    _copy_strided(stream, start, strides, source, target, chunk)
+
+
+@contextlib.contextmanager
+def _chunk_pool(
+    count: int, chunk_bytes: int, pin: bool
+) -> Iterator[queue.SimpleQueue[torch.Tensor]]:
+    """A queue of ``count`` buffers of ``chunk_bytes``, pinned until exit if ``pin``.
+
+    Call it on the caller's thread, not in a worker: pinning on a thread whose
+    device was never set creates a context on device 0.
+    """
+    chunks: queue.SimpleQueue[torch.Tensor] = queue.SimpleQueue()
+    pinned: list[torch.Tensor] = []
+    try:
+        for _ in range(count):
+            chunk = torch.empty(chunk_bytes, dtype=torch.uint8)
+            if pin:
+                pin_memory_utils.pin_memory(chunk.data_ptr(), chunk.nbytes)
+                pinned.append(chunk)
+            chunks.put(chunk)
+        yield chunks
+    finally:
+        for chunk in pinned:
+            pin_memory_utils.unpin_memory(chunk.data_ptr())
 
 
 class DefaultLoadPlanExecutor(LoadPlanExecutor):
@@ -316,6 +453,12 @@ class DefaultLoadPlanExecutor(LoadPlanExecutor):
             splits a per-host default across ``LOCAL_WORLD_SIZE`` ranks, or uses
             ``DEFAULT_FILE_READ_WORKERS`` if it is unset or invalid. Set 1 to read one file
             at a time.
+        read_chunk_bytes: Size of each host buffer that offset reads go
+            through; each file read concurrently holds one. Larger chunks mean
+            fewer, larger reads, at the cost of more host memory, pinned when
+            the targets are on an accelerator. It must be at least 16 bytes, the
+            size of a ``complex128`` element, to hold one element of any source
+            tensor.
     """
 
     def __init__(
@@ -323,11 +466,18 @@ class DefaultLoadPlanExecutor(LoadPlanExecutor):
         *,
         read_strategy: ReshardingReadStrategy = ReshardingReadStrategy.AUTO,
         file_read_workers: int | None = None,
+        read_chunk_bytes: int = DEFAULT_READ_CHUNK_BYTES,
     ) -> None:
         if file_read_workers is not None and file_read_workers < 1:
             raise ValueError(
                 f"file_read_workers must be at least 1, got {file_read_workers}"
             )
+        if read_chunk_bytes < _MIN_READ_CHUNK_BYTES:
+            raise ValueError(
+                f"read_chunk_bytes must be at least {_MIN_READ_CHUNK_BYTES}, "
+                f"got {read_chunk_bytes}"
+            )
+        self._read_chunk_bytes = read_chunk_bytes
         self._read_strategy = read_strategy
         self._file_read_workers = (
             _default_file_read_workers()
@@ -413,6 +563,8 @@ class DefaultLoadPlanExecutor(LoadPlanExecutor):
                 if lp.src_rank not in plans_by_rank:
                     plans_by_rank[lp.src_rank] = []
                 plans_by_rank[lp.src_rank].append((nested_path, lp))
+        if not plans_by_rank:
+            return
 
         source_layouts_by_rank = {
             src_rank: source_metadata.get_layout_info(src_rank, item_key)
@@ -458,35 +610,28 @@ class DefaultLoadPlanExecutor(LoadPlanExecutor):
         )
         caller_stream = torch.accelerator.current_stream() if on_accelerator else None
 
-        def copy(staged: Iterable[tuple[NestedPath, LoadPlan, torch.Tensor]]) -> None:
-            if caller_stream is not None:
-                torch.accelerator.set_stream(caller_stream)
-            for nested_path, load_plan, src_data in staged:
-                target_tensor = target_tensors[nested_path]
-                tgt_slice = tuple(
-                    slice(o, o + s) for o, s in zip(load_plan.offsets, load_plan.sizes)
-                )
-                target_tensor[tgt_slice].copy_(src_data)
-
         def read_with_offsets(src_rank: int) -> bool:
             """Return False if the file must be read in full instead."""
             layout_info = source_layouts_by_rank[src_rank]
             file_path = source_path / layout_info.file_path
             try:
-                # Close the generator even if copy() raises, so its stream is
-                # closed then rather than whenever the generator is collected.
-                with closing(
-                    self._read_source_slices_with_offset_reads(
+                # A worker reads one file at a time and holds one chunk for it.
+                chunk = chunks.get()
+                try:
+                    self._copy_source_slices_with_offset_reads(
                         file_path,
                         layout_info,
                         src_rank,
                         item_key,
                         plans_by_rank[src_rank],
+                        target_tensors,
                         storage,
+                        chunk,
+                        caller_stream,
                         shard_headers.get(src_rank),
                     )
-                ) as staged:
-                    copy(staged)
+                finally:
+                    chunks.put(chunk)
                 return True
             except NotImplementedError as error:
                 if read_strategy is ReshardingReadStrategy.OFFSET:
@@ -504,10 +649,19 @@ class DefaultLoadPlanExecutor(LoadPlanExecutor):
 
         full_file_ranks = list(plans_by_rank)
         if read_strategy is not ReshardingReadStrategy.FULL_FILE:
-            with ThreadPoolExecutor(
-                max_workers=file_read_workers,
-                thread_name_prefix="ckpt-read",
-            ) as pool:
+            # A worker reads one file at a time, so more workers than files
+            # would only pin chunks that no worker can use.
+            max_workers = min(file_read_workers, len(plans_by_rank))
+            # One chunk per worker, so no worker waits for one. The pool exits
+            # after the workers, so no chunk is unpinned while one is in use.
+            with (
+                _chunk_pool(
+                    max_workers, self._read_chunk_bytes, pin=caller_stream is not None
+                ) as chunks,
+                ThreadPoolExecutor(
+                    max_workers=max_workers, thread_name_prefix="ckpt-read"
+                ) as pool,
+            ):
                 try:
                     read = list(pool.map(read_with_offsets, plans_by_rank))
                 except BaseException:
@@ -522,31 +676,34 @@ class DefaultLoadPlanExecutor(LoadPlanExecutor):
         # time to bound memory regardless of file_read_workers.
         for src_rank in full_file_ranks:
             layout_info = source_layouts_by_rank[src_rank]
-            copy(
-                self._read_source_slices_with_full_file_read(
-                    source_path / layout_info.file_path,
-                    layout_info,
-                    item_key,
-                    plans_by_rank[src_rank],
-                    storage,
-                )
+            source_slices = self._read_source_slices_with_full_file_read(
+                source_path / layout_info.file_path,
+                layout_info,
+                item_key,
+                plans_by_rank[src_rank],
+                storage,
             )
+            for nested_path, load_plan, src_data in source_slices:
+                _slice_tensor(
+                    target_tensors[nested_path], load_plan.offsets, load_plan.sizes
+                ).copy_(src_data)
 
-    def _read_source_slices_with_offset_reads(
+    def _copy_source_slices_with_offset_reads(
         self,
         file_path: Path,
         layout_info: LayoutInfo,
         source_rank: int,
         item_key: str,
         rank_plans: list[tuple[NestedPath, LoadPlan]],
+        target_tensors: dict[NestedPath, torch.Tensor],
         storage: Storage,
+        chunk: torch.Tensor,
+        caller_stream: torch.Stream | None,
         safetensors_header: SafetensorsFileMetadata | None = None,
-    ) -> Generator[tuple[NestedPath, LoadPlan, torch.Tensor], None, None]:
-        """Yield the source data each plan needs, one slice at a time.
-
-        Each slice's buffer is released after the caller copies it, rather
-        than every slice in the file being held until the last one is read.
-        """
+    ) -> None:
+        """Read the source data each plan needs into its target through ``chunk``."""
+        if caller_stream is not None:
+            torch.accelerator.set_stream(caller_stream)
         # O_DIRECT bypasses the page cache. On FUSE mounts, page-cache reads
         # share a small per-mount limit on in-flight requests, which caps how
         # fast concurrent readers on one host can go.
@@ -582,14 +739,12 @@ class DefaultLoadPlanExecutor(LoadPlanExecutor):
                     f"{type(serialization_format).__name__}"
                 )
             for path, plan in rank_plans:
-                yield (
-                    path,
+                _copy_source_tensor_slice(
+                    stream,
+                    source_tensors[plan.src_fqn],
                     plan,
-                    _read_source_tensor_slice(
-                        stream,
-                        source_tensors[plan.src_fqn],
-                        plan,
-                    ),
+                    _slice_tensor(target_tensors[path], plan.offsets, plan.sizes),
+                    chunk,
                 )
 
     def _read_source_slices_with_full_file_read(
@@ -621,11 +776,13 @@ class DefaultLoadPlanExecutor(LoadPlanExecutor):
             )
 
         flattened = _flatten_state_dict(item_key, loaded_data)
-        return [
-            (
-                path,
-                plan,
-                _slice_source_tensor(_unwrap_dtensor(flattened[plan.src_fqn]), plan),
+        source_slices = []
+        for path, plan in rank_plans:
+            source = _unwrap_dtensor(flattened[plan.src_fqn])
+            # Offset reads validate this before reading. Validate here too because
+            # slicing silently clamps out-of-bounds ranges.
+            _validate_source_slice_bounds(tuple(source.shape), plan)
+            source_slices.append(
+                (path, plan, _slice_tensor(source, plan.src_offsets, plan.src_sizes))
             )
-            for path, plan in rank_plans
-        ]
+        return source_slices

@@ -20,6 +20,10 @@ import torch.distributed as dist
 from safetensors.torch import save as serialize_safetensors, save_file
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 from torch.distributed.tensor import distribute_tensor, Replicate
+from torch_checkpointing import (
+    _pin_memory_utils,
+    default_load_plan_executor as executor_module,
+)
 from torch_checkpointing.checkpoint_layout import (
     LayoutInfo,
     SafetensorsSerialization,
@@ -27,7 +31,6 @@ from torch_checkpointing.checkpoint_layout import (
 )
 from torch_checkpointing.default_load_plan_executor import (
     _default_file_read_workers,
-    _slice_source_tensor,
     _validate_source_slice_bounds,
     DefaultLoadPlanExecutor,
     ReshardingReadStrategy,
@@ -281,11 +284,23 @@ def test_validate_source_slice_bounds_accepts_boundary_geometry(
     )
 
 
-def test_full_file_slice_rejects_out_of_bounds_plan() -> None:
+def test_full_file_read_rejects_out_of_bounds_plan() -> None:
+    checkpoint = io.BytesIO()
+    torch.save({"model": {"weight": torch.arange(8)}}, checkpoint)
+    path = Path("checkpoint.pt")
+
     with pytest.raises(ValueError, match="out of bounds in dimension 0"):
-        _slice_source_tensor(
-            torch.arange(8),
-            _source_load_plan(src_offsets=(7,), src_sizes=(2,)),
+        DefaultLoadPlanExecutor()._read_source_slices_with_full_file_read(
+            path,
+            LayoutInfo(str(path), TorchSerialization()),
+            "model",
+            [
+                (
+                    ("model", "weight"),
+                    _source_load_plan(src_offsets=(7,), src_sizes=(2,)),
+                )
+            ],
+            _TrackingStorage(path, checkpoint.getvalue()),  # type: ignore[arg-type]
         )
 
 
@@ -772,9 +787,32 @@ def test_default_file_read_workers_split_host_reads_across_local_ranks(
     assert _default_file_read_workers() == workers
 
 
-def test_file_read_workers_must_be_positive() -> None:
-    with pytest.raises(ValueError, match="file_read_workers must be at least 1"):
-        DefaultLoadPlanExecutor(file_read_workers=0)
+@pytest.mark.parametrize(
+    ("setting", "minimum"), [("file_read_workers", 1), ("read_chunk_bytes", 16)]
+)
+def test_read_settings_have_a_minimum(setting: str, minimum: int) -> None:
+    with pytest.raises(ValueError, match=f"{setting} must be at least {minimum}"):
+        DefaultLoadPlanExecutor(**{setting: minimum - 1})
+    DefaultLoadPlanExecutor(**{setting: minimum})
+
+
+@pytest.mark.parametrize("read_strategy", list(ReshardingReadStrategy))
+def test_a_path_with_no_load_plans_reads_nothing(
+    read_strategy: ReshardingReadStrategy,
+) -> None:
+    storage = _TrackingStorage(Path("model.safetensors"), b"")
+    target = torch.zeros(4)
+
+    _execute_load_plans(
+        {("weight",): []},
+        {"weight": target},
+        {},
+        storage,
+        read_strategy=read_strategy,
+    )
+
+    assert storage.read_args == []
+    torch.testing.assert_close(target, torch.zeros(4))
 
 
 def test_reads_source_files_concurrently() -> None:
@@ -1068,6 +1106,211 @@ def test_aliased_targets_disable_concurrent_reads() -> None:
     torch.testing.assert_close(other, torch.full((4,), 3.0))
     assert len(read_threads) == 2
     assert len(set(read_threads)) == 1
+
+
+_DEVICES = [
+    "cpu",
+    pytest.param(
+        "cuda",
+        marks=[
+            pytest.mark.gpus_needed_1,
+            pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA"),
+        ],
+    ),
+]
+
+
+def _whole_source_plan(source: torch.Tensor) -> LoadPlan:
+    return LoadPlan(
+        offsets=(0,) * source.dim(),
+        sizes=tuple(source.shape),
+        src_rank=0,
+        src_fqn="weight",
+        src_offsets=(0,) * source.dim(),
+        src_sizes=tuple(source.shape),
+    )
+
+
+@pytest.mark.parametrize("device", _DEVICES)
+def test_contiguous_slice_streams_through_chunks_in_whole_elements(
+    device: str,
+) -> None:
+    source = torch.randn(1000, generator=torch.Generator().manual_seed(0)).to(
+        torch.bfloat16
+    )
+    path = Path("model.safetensors")
+    target = torch.zeros(source.shape, device=device)
+
+    # 301 bytes holds 150 whole bf16 elements, so every piece is 300 bytes
+    # except the 200-byte remainder.
+    with patch.object(
+        executor_module, "_read_exact", wraps=executor_module._read_exact
+    ) as read_exact:
+        _execute_load_plans(
+            {("weight",): [_whole_source_plan(source)]},
+            {"weight": target},
+            {0: LayoutInfo(str(path), SafetensorsSerialization())},
+            _TrackingStorage(path, serialize_safetensors({"weight": source})),
+            read_chunk_bytes=301,
+        )
+
+    torch.testing.assert_close(target.cpu(), source.float())
+    assert [len(call.args[2]) for call in read_exact.call_args_list] == [300] * 6 + [
+        200
+    ]
+
+
+@pytest.mark.parametrize("device", _DEVICES)
+@pytest.mark.parametrize(
+    (
+        "source_shape",
+        "src_offsets",
+        "sizes",
+        "target_shape",
+        "offsets",
+        "chunk_bytes",
+        "read_sizes",
+    ),
+    [
+        # Columns 1-2 of a (4, 3) float32 source: 20 bytes holds two 8-byte rows
+        # and the 4-byte gap between them.
+        pytest.param(
+            (4, 3), (0, 1), (4, 2), (4, 2), (0, 0), 20, [20, 20], id="rows_per_chunk"
+        ),
+        # The same reads, copied into columns 1-2 of a wider target.
+        pytest.param(
+            (4, 3), (0, 1), (4, 2), (4, 4), (0, 1), 20, [20, 20], id="strided_target"
+        ),
+        # A 48-byte row does not fit in 16 bytes, so each row is read four
+        # elements at a time.
+        pytest.param(
+            (2, 12),
+            (0, 0),
+            (2, 12),
+            (2, 12),
+            (0, 0),
+            16,
+            [16] * 6,
+            id="row_exceeds_chunk",
+        ),
+    ],
+)
+def test_strided_slice_streams_through_chunks_in_whole_rows(
+    device: str,
+    source_shape: tuple[int, int],
+    src_offsets: tuple[int, int],
+    sizes: tuple[int, int],
+    target_shape: tuple[int, int],
+    offsets: tuple[int, int],
+    chunk_bytes: int,
+    read_sizes: list[int],
+) -> None:
+    source = torch.arange(
+        source_shape[0] * source_shape[1], dtype=torch.float32
+    ).reshape(source_shape)
+    path = Path("model.safetensors")
+    plan = LoadPlan(
+        offsets=offsets,
+        sizes=sizes,
+        src_rank=0,
+        src_fqn="weight",
+        src_offsets=src_offsets,
+        src_sizes=sizes,
+    )
+    target = torch.zeros(target_shape, device=device)
+
+    with patch.object(
+        executor_module, "_read_exact", wraps=executor_module._read_exact
+    ) as read_exact:
+        _execute_load_plans(
+            {("weight",): [plan]},
+            {"weight": target},
+            {0: LayoutInfo(str(path), SafetensorsSerialization())},
+            _TrackingStorage(path, serialize_safetensors({"weight": source})),
+            read_chunk_bytes=chunk_bytes,
+        )
+
+    expected = torch.zeros(target_shape)
+    expected[offsets[0] : offsets[0] + sizes[0], offsets[1] : offsets[1] + sizes[1]] = (
+        source[
+            src_offsets[0] : src_offsets[0] + sizes[0],
+            src_offsets[1] : src_offsets[1] + sizes[1],
+        ]
+    )
+    torch.testing.assert_close(target.cpu(), expected)
+    assert [len(call.args[2]) for call in read_exact.call_args_list] == read_sizes
+
+
+def test_transposed_source_is_read_once_in_file_order() -> None:
+    """A source saved column-major streams through chunks without re-reading.
+
+    Its rows interleave in the file, so reading row by row would re-read most of
+    the tensor once per chunk-sized group of rows.
+    """
+    source = torch.arange(64 * 64, dtype=torch.float32).reshape(64, 64).t()
+    checkpoint = io.BytesIO()
+    torch.save({"weight": source}, checkpoint)
+    path = Path("checkpoint.pt")
+    target = torch.zeros(source.shape)
+
+    with patch.object(
+        executor_module, "_read_exact", wraps=executor_module._read_exact
+    ) as read_exact:
+        _execute_load_plans(
+            {("weight",): [_whole_source_plan(source)]},
+            {"weight": target},
+            {0: LayoutInfo(str(path), TorchSerialization())},
+            _TrackingStorage(path, checkpoint.getvalue()),
+            read_chunk_bytes=1024,
+        )
+
+    torch.testing.assert_close(target, source)
+    chunk_bytes_read = sum(len(call.args[2]) for call in read_exact.call_args_list)
+    assert chunk_bytes_read == source.numel() * source.element_size()
+
+
+@pytest.mark.gpus_needed_1
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_offset_reads_leave_no_host_memory_pinned() -> None:
+    """Chunks are unpinned after the load, and nothing else is ever pinned."""
+    source = torch.randn(64, 64, generator=torch.Generator().manual_seed(0))
+    path = Path("model.safetensors")
+    plan = _whole_source_plan(source)
+    # Columns of a wider target are not contiguous, so they take the span read.
+    target = {
+        "rows": torch.zeros(64, 64, device="cuda"),
+        "columns": torch.zeros(64, 128, device="cuda"),
+    }
+    torch.cuda.init()
+    # The caching host allocator keeps what it pins for the life of the process.
+    cached_allocations = torch._C._cuda_hostMemoryStats()["allocations"]["allocated"]
+
+    with (
+        patch.object(
+            _pin_memory_utils, "pin_memory", wraps=_pin_memory_utils.pin_memory
+        ) as pin,
+        patch.object(
+            _pin_memory_utils, "unpin_memory", wraps=_pin_memory_utils.unpin_memory
+        ) as unpin,
+    ):
+        _execute_load_plans(
+            {("rows",): [plan], ("columns",): [plan]},
+            target,
+            {0: LayoutInfo(str(path), SafetensorsSerialization())},
+            _TrackingStorage(path, serialize_safetensors({"weight": source})),
+            file_read_workers=3,
+        )
+
+    torch.testing.assert_close(target["rows"].cpu(), source)
+    torch.testing.assert_close(target["columns"][:, :64].cpu(), source)
+    pinned = sorted(call.args[0] for call in pin.call_args_list)
+    # One file needs only one worker, so only one chunk is pinned.
+    assert len(pinned) == 1
+    assert sorted(call.args[0] for call in unpin.call_args_list) == pinned
+    assert (
+        torch._C._cuda_hostMemoryStats()["allocations"]["allocated"]
+        == cached_allocations
+    )
 
 
 _ONE_SAFETENSORS_FILE = {0: LayoutInfo("model.safetensors", SafetensorsSerialization())}
