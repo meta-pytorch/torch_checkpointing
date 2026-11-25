@@ -122,15 +122,17 @@ fast; set it `False` for optional items that may be absent from some checkpoints
 
 ## Layouts
 
-A layout maps a single top-level item key to a single file. Only top-level keys
-are supported, and each key maps to its own unique file — there is no file sharing
-between keys.
+A layout maps a single top-level item key to a single file, or to several part
+files (see [Splitting a large item](#splitting-a-large-item)). Only top-level keys
+are supported, and each key maps to its own unique files — there is no file
+sharing between keys.
 
 ```python
 @dataclass(frozen=True)
 class LayoutInfo:
     file_path: str
     serialization_format: SerializationFormat
+    num_parts: int = 1
 ```
 
 - **`file_path`** is an exact path relative to the checkpoint directory. It
@@ -174,6 +176,35 @@ and the manager expands it. `{rank}` is the only recognized placeholder;
 save, every rank processes every configured layout, so a path without `{rank}`
 causes the ranks to target the same file. Use fixed paths only for single-rank
 checkpoints or when the caller arranges for one rank to write the shared file.
+
+### Splitting a large item
+
+The writer writes each file on one thread, so one large item is one write
+stream. To write it with several streams, split it into parts and give the
+writer as many threads:
+
+```python
+manager = CheckpointManager(CheckpointManager.Config(
+    items={
+        "optimizer": ItemSpec(
+            layout=LayoutInfo("optimizer_{rank}.pt", TorchSerialization(), num_parts=4),
+        ),
+    },
+    save=SyncCheckpointSaverConfig(
+        writer_config=CheckpointWriterConfig(file_write_max_threads=4),
+    ),
+))
+# on global rank 3 -> optimizer_3.part0.pt ... optimizer_3.part3.pt
+```
+
+The item must be a dict serialized with `TorchSerialization`. Its leaves are
+spread over the parts by tensor bytes, keeping the nesting (`split_into_parts`).
+Tensors that share a storage stay in one part, so an item whose tensors are all
+views of one buffer can't be split. Direct loads read every part and merge them;
+resharded loads look up each tensor in the parts. `num_parts` is recorded in the
+checkpoint metadata with the rest of the layout. Readers from before `num_parts`
+existed ignore it and fail to find the item's file, so split an item only when
+newer readers will load it.
 
 ### The canonical FLAT layout
 

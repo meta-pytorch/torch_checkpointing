@@ -228,8 +228,18 @@ class DistributedItemMetadata:
 
         Returns:
             Full path to the checkpoint file for this rank and item.
+
+        Raises:
+            ValueError: If the item is split into parts; use
+                ``LayoutInfo.part_file_paths()`` instead.
         """
-        return checkpoint_path / self.get_layout_info(rank, item_key).file_path
+        layout_info = self.get_layout_info(rank, item_key)
+        if layout_info.num_parts > 1:
+            raise ValueError(
+                f"Item {item_key!r} on rank {rank} is split into "
+                f"{layout_info.part_file_paths()}; use LayoutInfo.part_file_paths()"
+            )
+        return checkpoint_path / layout_info.file_path
 
     def get_metadata_for_path_and_rank(
         self, nested_path: NestedPath, rank: int
@@ -362,14 +372,14 @@ class DistributedMetadata:
             for rank, layout_info in item_metadata.rank_to_layout_info.items():
                 if layout_info is None:
                     continue
-                file_path = layout_info.file_path
-                if file_path in used_paths:
-                    other_item, other_rank = used_paths[file_path]
-                    raise RuntimeError(
-                        f"Item '{other_item}' rank {other_rank} & item '{item_key}' rank {rank} "
-                        f"both write to the same file path {file_path}"
-                    )
-                used_paths[file_path] = (item_key, rank)
+                for file_path in layout_info.part_file_paths():
+                    if file_path in used_paths:
+                        other_item, other_rank = used_paths[file_path]
+                        raise RuntimeError(
+                            f"Item '{other_item}' rank {other_rank} & item '{item_key}' rank {rank} "
+                            f"both write to the same file path {file_path}"
+                        )
+                    used_paths[file_path] = (item_key, rank)
 
     def to_dict(self) -> dict[str, Any]:
         """

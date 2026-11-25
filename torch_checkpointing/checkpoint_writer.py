@@ -30,6 +30,7 @@ from .checkpoint_layout import (
     LayoutInfo,
     RawSerialization,
     SafetensorsSerialization,
+    split_into_parts,
     TorchSerialization,
 )
 from .logging_utils import EventLogger, EventType, get_log_event_type_for_file_save
@@ -223,7 +224,8 @@ class CheckpointWriter:
             tmp_dir_path = final_path
 
         state_dict = checkpoint_info.state_dict
-        save_items: list[tuple[str, LayoutInfo, Path]] = []
+        # One entry per file: (item key, layout, file path, value to write).
+        save_items: list[tuple[str, LayoutInfo, Path, Any]] = []
         for key, layout_info in checkpoint_info.layout_info_mappings.items():
             # Skip keys that are in layout but not in state_dict
             if key not in state_dict:
@@ -233,9 +235,17 @@ class CheckpointWriter:
                 layout_info = default_torch_layout_info(
                     key, self._args.rank_info.global_rank
                 )
-            save_items.append((key, layout_info, tmp_dir_path / layout_info.file_path))
+            values = (
+                [state_dict[key]]
+                if layout_info.num_parts == 1
+                else split_into_parts(state_dict[key], layout_info.num_parts)
+            )
+            for file_path, value in zip(
+                layout_info.part_file_paths(), values, strict=True
+            ):
+                save_items.append((key, layout_info, tmp_dir_path / file_path, value))
 
-        self._write_keys(save_items, state_dict)
+        self._write_keys(save_items)
 
         # Write metadata directly from serialized string if available (rank0 only)
         if self._args.rank_info.role_rank == 0:
@@ -342,8 +352,7 @@ class CheckpointWriter:
 
     def _write_keys(
         self,
-        save_items: list[tuple[str, LayoutInfo, Path]],
-        state_dict: dict[str, Any],
+        save_items: list[tuple[str, LayoutInfo, Path, Any]],
     ) -> None:
         if not save_items:
             return
@@ -356,7 +365,7 @@ class CheckpointWriter:
             thread_name_prefix="ckpt-write",
         ) as pool:
             self._prepare_save_dirs(
-                sorted({full_path.parent for _, _, full_path in save_items}),
+                sorted({full_path.parent for _, _, full_path, _ in save_items}),
                 pool,
             )
 
@@ -367,9 +376,9 @@ class CheckpointWriter:
                     key,
                     layout_info,
                     full_path,
-                    state_dict[key],
+                    value,
                 )
-                for key, layout_info, full_path in save_items
+                for key, layout_info, full_path, value in save_items
             ]
             for future in futures:
                 future.result()

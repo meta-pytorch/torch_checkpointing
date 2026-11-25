@@ -160,6 +160,20 @@ def _flatten_state_dict(item_key: str, value: Any) -> dict[str, Any]:
     return flattened
 
 
+def _raise_on_unread_sources(
+    layout_info: LayoutInfo,
+    rank_plans: list[tuple[NestedPath, LoadPlan]],
+    read_fqns: set[str],
+) -> None:
+    """Raise if a planned source tensor was in none of the source rank's files."""
+    unread_fqns = {plan.src_fqn for _, plan in rank_plans} - read_fqns
+    if unread_fqns:
+        raise KeyError(
+            f"Source tensors {sorted(unread_fqns)} are in none of "
+            f"{layout_info.part_file_paths()}"
+        )
+
+
 def _unwrap_dtensor(value: torch.Tensor) -> torch.Tensor:
     return value._local_tensor if isinstance(value, DTensor) else value
 
@@ -437,7 +451,7 @@ class DefaultLoadPlanExecutor(LoadPlanExecutor):
     """Reads each item's source files and copies the planned chunks into its targets.
 
     Items are loaded one after another, in the order given. Within an item,
-    source files are read concurrently.
+    source ranks are read concurrently, and one rank's part files in turn.
 
     Each load plan must be a plain copy: ``transpose_dims`` empty or the
     identity, and source and target chunks of the same shape, inside a local,
@@ -611,46 +625,51 @@ class DefaultLoadPlanExecutor(LoadPlanExecutor):
         caller_stream = torch.accelerator.current_stream() if on_accelerator else None
 
         def read_with_offsets(src_rank: int) -> bool:
-            """Return False if the file must be read in full instead."""
+            """Return False if the files must be read in full instead."""
             layout_info = source_layouts_by_rank[src_rank]
-            file_path = source_path / layout_info.file_path
+            read_fqns: set[str] = set()
+            # A worker reads one source rank's files, one at a time, and holds one
+            # chunk for them.
+            chunk = chunks.get()
             try:
-                # A worker reads one file at a time and holds one chunk for it.
-                chunk = chunks.get()
-                try:
-                    self._copy_source_slices_with_offset_reads(
-                        file_path,
-                        layout_info,
-                        src_rank,
-                        item_key,
-                        plans_by_rank[src_rank],
-                        target_tensors,
-                        storage,
-                        chunk,
-                        caller_stream,
-                        shard_headers.get(src_rank),
-                    )
-                finally:
-                    chunks.put(chunk)
-                return True
-            except NotImplementedError as error:
-                if read_strategy is ReshardingReadStrategy.OFFSET:
-                    raise
-                logger.warning(
-                    "Offset reads unavailable for %s; reading it in full: %s",
-                    file_path,
-                    error,
-                )
-                return False
-            except Exception:
-                # Only the first failure is raised to the caller; log every one.
-                logger.exception("Reading %s failed", file_path)
-                raise
+                # An item split into parts has its tensors spread over several files.
+                for part_file_path in layout_info.part_file_paths():
+                    file_path = source_path / part_file_path
+                    try:
+                        read_fqns |= self._copy_source_slices_with_offset_reads(
+                            file_path,
+                            layout_info,
+                            src_rank,
+                            item_key,
+                            plans_by_rank[src_rank],
+                            target_tensors,
+                            storage,
+                            chunk,
+                            caller_stream,
+                            shard_headers.get(src_rank),
+                        )
+                    except NotImplementedError as error:
+                        if read_strategy is ReshardingReadStrategy.OFFSET:
+                            raise
+                        logger.warning(
+                            "Offset reads unavailable for %s; reading it in full: %s",
+                            file_path,
+                            error,
+                        )
+                        return False
+                    except Exception:
+                        # Only the first failure is raised to the caller; log every one.
+                        logger.exception("Reading %s failed", file_path)
+                        raise
+            finally:
+                chunks.put(chunk)
+            _raise_on_unread_sources(layout_info, plans_by_rank[src_rank], read_fqns)
+            return True
 
         full_file_ranks = list(plans_by_rank)
         if read_strategy is not ReshardingReadStrategy.FULL_FILE:
-            # A worker reads one file at a time, so more workers than files
-            # would only pin chunks that no worker can use.
+            # A worker reads one source rank's files, one at a time, so more workers
+            # than source ranks would only pin chunks that no worker can use.
             max_workers = min(file_read_workers, len(plans_by_rank))
             # One chunk per worker, so no worker waits for one. The pool exits
             # after the workers, so no chunk is unpinned while one is in use.
@@ -676,17 +695,21 @@ class DefaultLoadPlanExecutor(LoadPlanExecutor):
         # time to bound memory regardless of file_read_workers.
         for src_rank in full_file_ranks:
             layout_info = source_layouts_by_rank[src_rank]
-            source_slices = self._read_source_slices_with_full_file_read(
-                source_path / layout_info.file_path,
-                layout_info,
-                item_key,
-                plans_by_rank[src_rank],
-                storage,
-            )
-            for nested_path, load_plan, src_data in source_slices:
-                _slice_tensor(
-                    target_tensors[nested_path], load_plan.offsets, load_plan.sizes
-                ).copy_(src_data)
+            read_fqns: set[str] = set()
+            for part_file_path in layout_info.part_file_paths():
+                source_slices = self._read_source_slices_with_full_file_read(
+                    source_path / part_file_path,
+                    layout_info,
+                    item_key,
+                    plans_by_rank[src_rank],
+                    storage,
+                )
+                for nested_path, load_plan, src_data in source_slices:
+                    _slice_tensor(
+                        target_tensors[nested_path], load_plan.offsets, load_plan.sizes
+                    ).copy_(src_data)
+                    read_fqns.add(load_plan.src_fqn)
+            _raise_on_unread_sources(layout_info, plans_by_rank[src_rank], read_fqns)
 
     def _copy_source_slices_with_offset_reads(
         self,
@@ -700,8 +723,9 @@ class DefaultLoadPlanExecutor(LoadPlanExecutor):
         chunk: torch.Tensor,
         caller_stream: torch.Stream | None,
         safetensors_header: SafetensorsFileMetadata | None = None,
-    ) -> None:
-        """Read the source data each plan needs into its target through ``chunk``."""
+    ) -> set[str]:
+        """Copy the source data of each plan whose tensor is in this file into its
+        target through ``chunk``. Return the source FQNs it copied."""
         if caller_stream is not None:
             torch.accelerator.set_stream(caller_stream)
         # O_DIRECT bypasses the page cache. On FUSE mounts, page-cache reads
@@ -724,6 +748,7 @@ class DefaultLoadPlanExecutor(LoadPlanExecutor):
                 source_tensors = {
                     source_fqn: _unwrap_dtensor(flattened[source_fqn])
                     for source_fqn in source_fqns
+                    if source_fqn in flattened
                 }
             elif isinstance(serialization_format, SafetensorsSerialization):
                 if safetensors_header is None:
@@ -739,6 +764,8 @@ class DefaultLoadPlanExecutor(LoadPlanExecutor):
                     f"{type(serialization_format).__name__}"
                 )
             for path, plan in rank_plans:
+                if plan.src_fqn not in source_tensors:
+                    continue
                 _copy_source_tensor_slice(
                     stream,
                     source_tensors[plan.src_fqn],
@@ -746,6 +773,7 @@ class DefaultLoadPlanExecutor(LoadPlanExecutor):
                     _slice_tensor(target_tensors[path], plan.offsets, plan.sizes),
                     chunk,
                 )
+        return set(source_tensors)
 
     def _read_source_slices_with_full_file_read(
         self,
@@ -755,7 +783,8 @@ class DefaultLoadPlanExecutor(LoadPlanExecutor):
         rank_plans: list[tuple[NestedPath, LoadPlan]],
         storage: Storage,
     ) -> list[tuple[NestedPath, LoadPlan, torch.Tensor]]:
-        """Read the source data every plan needs by loading the full file."""
+        """Read the source data of each plan whose tensor is in this file by
+        loading the full file."""
         serialization_format = layout_info.serialization_format
         if isinstance(serialization_format, TorchSerialization):
             loaded_data = load_torch_serialized_from_storage(
@@ -778,6 +807,8 @@ class DefaultLoadPlanExecutor(LoadPlanExecutor):
         flattened = _flatten_state_dict(item_key, loaded_data)
         source_slices = []
         for path, plan in rank_plans:
+            if plan.src_fqn not in flattened:
+                continue
             source = _unwrap_dtensor(flattened[plan.src_fqn])
             # Offset reads validate this before reading. Validate here too because
             # slicing silently clamps out-of-bounds ranges.

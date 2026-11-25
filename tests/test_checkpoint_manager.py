@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import logging
 import os
 from collections.abc import Mapping
 from concurrent.futures import Future
@@ -15,6 +16,7 @@ import pytest
 import torch
 import torch.nn as nn
 from torch_checkpointing.checkpoint_base import CheckpointBase, CheckpointItem
+from torch_checkpointing.checkpoint_layout import LayoutInfo, TorchSerialization
 from torch_checkpointing.checkpoint_manager import CheckpointManager
 from torch_checkpointing.checkpoint_writer import CallbackArgs
 from torch_checkpointing.config import (
@@ -22,7 +24,10 @@ from torch_checkpointing.config import (
     CheckpointLoaderConfig,
     SyncCheckpointSaverConfig,
 )
-from torch_checkpointing.default_load_plan_executor import DefaultLoadPlanExecutor
+from torch_checkpointing.default_load_plan_executor import (
+    DefaultLoadPlanExecutor,
+    ReshardingReadStrategy,
+)
 from torch_checkpointing.default_resharder import DefaultResharder
 from torch_checkpointing.load_plan_executor import (
     LoadExecutionContext,
@@ -32,7 +37,7 @@ from torch_checkpointing.metadata_serialization import (
     load_distributed_metadata,
     TorchDistributedMetadataFormat,
 )
-from torch_checkpointing.resharding import ReshardingInfo
+from torch_checkpointing.resharding import Resharder, ReshardingInfo
 from torch_checkpointing.schema import ItemSpec
 from torch_checkpointing.staging import CheckpointStagerConfig
 from torch_checkpointing.state_transformations import (
@@ -442,6 +447,108 @@ def test_load_reads_resharded_items_with_the_configured_executor(
 
     assert executor.batches == [["model"]]
     torch.testing.assert_close(target["w"], weights["w"])
+
+
+def _split_optimizer_config(
+    *,
+    async_save: bool = False,
+    resharder: Resharder | None = None,
+    load_plan_executor: LoadPlanExecutor | None = None,
+) -> CheckpointManager.Config:
+    config = (
+        _async_config_without_accelerator()
+        if async_save
+        else CheckpointManager.Config.with_sync_save()
+    )
+    config.save.wait_timeout_secs = 30
+    config.save.writer_config.file_write_max_threads = 3
+    config.items = {
+        "optimizer": ItemSpec(
+            layout=LayoutInfo("optimizer_{rank}.pt", TorchSerialization(), num_parts=3),
+            resharder=resharder,
+        )
+    }
+    config.load = CheckpointLoaderConfig(load_plan_executor=load_plan_executor)
+    config.storage_config = LocalFileSystemStorageConfig(use_direct_io=False)
+    return config
+
+
+def _optimizer_state(fill: float | None = None) -> dict[str, Any]:
+    """Adam-like state of three parameters, filled with ``fill`` or distinct values."""
+    sizes = {"wq": 8, "wk": 4, "wv": 2}
+    return {
+        "state": {
+            name: {
+                moment: torch.full((size,), fill if fill is not None else i + offset)
+                for moment, offset in (("exp_avg", 0.0), ("exp_avg_sq", 0.5))
+            }
+            for i, (name, size) in enumerate(sizes.items())
+        },
+        "param_groups": [{"lr": 0.1, "params": list(sizes)}],
+    }
+
+
+def _save_and_load_split_optimizer(
+    config: CheckpointManager.Config, path: str
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    saved = _optimizer_state()
+    manager = config.build()
+    try:
+        write_future = manager.save(path, {"optimizer": saved})
+        if write_future is not None:
+            write_future.result(timeout=30)
+        loaded = manager.load(
+            path, into={"optimizer": _optimizer_state(fill=0.0)}, strict=True
+        )
+    finally:
+        manager.close()
+    return saved, loaded["optimizer"]
+
+
+@pytest.mark.parametrize("async_save", [False, True], ids=["sync", "async"])
+def test_split_item_writes_one_file_per_part_and_loads_back(
+    tmp_path: Path, async_save: bool
+) -> None:
+    path = str(tmp_path / "checkpoint")
+
+    saved, loaded = _save_and_load_split_optimizer(
+        _split_optimizer_config(async_save=async_save), path
+    )
+
+    item_files = {name for name in os.listdir(path) if name.startswith("optimizer")}
+    assert item_files == {f"optimizer_0.part{k}.pt" for k in range(3)}
+    torch.testing.assert_close(loaded["state"], saved["state"])
+    assert loaded["param_groups"] == saved["param_groups"]
+
+
+def test_split_item_parts_are_written_by_parallel_threads(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level(logging.INFO, logger="torch_checkpointing.checkpoint_writer"):
+        _save_and_load_split_optimizer(
+            _split_optimizer_config(), str(tmp_path / "checkpoint")
+        )
+
+    assert "num_threads=3 num_files=3" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "read_strategy",
+    [ReshardingReadStrategy.OFFSET, ReshardingReadStrategy.FULL_FILE],
+    ids=["offset", "full_file"],
+)
+def test_split_item_loads_through_resharded_reads(
+    tmp_path: Path, read_strategy: ReshardingReadStrategy
+) -> None:
+    config = _split_optimizer_config(
+        resharder=_AlwaysReshardResharder(),
+        load_plan_executor=DefaultLoadPlanExecutor(read_strategy=read_strategy),
+    )
+
+    saved, loaded = _save_and_load_split_optimizer(config, str(tmp_path / "checkpoint"))
+
+    torch.testing.assert_close(loaded["state"], saved["state"])
+    assert loaded["param_groups"] == saved["param_groups"]
 
 
 def _module_with_params(names: tuple[str, ...]) -> nn.Module:
