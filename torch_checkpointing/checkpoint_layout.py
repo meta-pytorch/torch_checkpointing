@@ -46,7 +46,9 @@ Example usage:
 import abc
 import importlib
 import logging
+from collections.abc import Mapping
 from dataclasses import dataclass
+from pathlib import PurePosixPath
 from typing import Any, final
 
 logger = logging.getLogger(__name__)
@@ -310,17 +312,51 @@ class LayoutInfo:
                    arrange for only one rank to write it.
 
         serialization_format: How the data should be serialized
+        num_parts: Number of files the item is split into, so that
+                   ``file_write_max_threads`` threads can write one large item
+                   in parallel. Only ``TorchSerialization`` items that are
+                   dicts can be split; see ``split_into_parts``.
+
+                   - 1 -> the item is written to ``file_path``
+                   - 3 with "optimizer_0.pt" -> "optimizer_0.part0.pt",
+                     "optimizer_0.part1.pt" and "optimizer_0.part2.pt"
     """
 
     file_path: str
     serialization_format: SerializationFormat
+    num_parts: int = 1
+
+    def __post_init__(self) -> None:
+        if self.num_parts < 1:
+            raise ValueError(f"num_parts must be at least 1, got {self.num_parts}")
+        if self.num_parts > 1 and not isinstance(
+            self.serialization_format, TorchSerialization
+        ):
+            raise ValueError(
+                "num_parts > 1 requires TorchSerialization, got "
+                f"{self.serialization_format!r} for {self.file_path!r}"
+            )
+
+    def part_file_paths(self) -> list[str]:
+        """Paths of the files that hold this item, relative to the checkpoint."""
+        if self.num_parts == 1:
+            return [self.file_path]
+        path = PurePosixPath(self.file_path)
+        return [
+            str(path.with_name(f"{path.stem}.part{part_index}{path.suffix}"))
+            for part_index in range(self.num_parts)
+        ]
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize the layout info to a dictionary."""
-        return {
+        d: dict[str, Any] = {
             "file_path": self.file_path,
             "serialization_format": self.serialization_format.to_dict(),
         }
+        # Omitted for one part, so unsplit layouts serialize as before.
+        if self.num_parts > 1:
+            d["num_parts"] = self.num_parts
+        return d
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "LayoutInfo":
@@ -330,7 +366,86 @@ class LayoutInfo:
             serialization_format=serialization_format_from_dict(
                 d["serialization_format"]
             ),
+            num_parts=d.get("num_parts", 1),
         )
+
+
+def split_into_parts(value: Any, num_parts: int) -> list[dict[Any, Any]]:
+    """Split a nested dict into ``num_parts`` dicts of about equal tensor bytes.
+
+    A leaf is any value that is not a non-empty dict. Largest first, each leaf goes
+    to the part with the fewest bytes so far; non-tensor leaves count as 0 bytes.
+
+    Example:
+
+        split_into_parts(
+            {"exp_avg": {"w": tensor_8mb, "b": tensor_1mb}, "step": 3}, num_parts=2
+        )
+        # -> [{"exp_avg": {"w": tensor_8mb}}, {"exp_avg": {"b": tensor_1mb}, "step": 3}]
+
+    ``merge_parts`` reverses it.
+    """
+    import torch
+    from torch.distributed.tensor import DTensor
+
+    if not isinstance(value, Mapping):
+        raise ValueError(
+            f"Only a dict can be split into parts, got {type(value).__name__}"
+        )
+
+    leaves: list[tuple[tuple[Any, ...], Any]] = []
+
+    def collect(prefix: tuple[Any, ...], mapping: Mapping[Any, Any]) -> None:
+        for key, child in mapping.items():
+            if isinstance(child, Mapping) and child:
+                collect((*prefix, key), child)
+            else:
+                leaves.append(((*prefix, key), child))
+
+    def nbytes(leaf: Any) -> int:
+        if isinstance(leaf, DTensor):
+            leaf = leaf._local_tensor
+        return leaf.nbytes if isinstance(leaf, torch.Tensor) else 0
+
+    collect((), value)
+
+    # Place the largest leaves first, each on the part with the fewest bytes.
+    part_bytes = [0] * num_parts
+    part_of_leaf: list[int] = [0] * len(leaves)
+    largest_first = sorted(
+        range(len(leaves)),
+        key=lambda leaf_index: nbytes(leaves[leaf_index][1]),
+        reverse=True,
+    )
+    for leaf_index in largest_first:
+        part_index = min(range(num_parts), key=part_bytes.__getitem__)
+        part_of_leaf[leaf_index] = part_index
+        part_bytes[part_index] += nbytes(leaves[leaf_index][1])
+
+    # Rebuild each part in the original key order.
+    parts: list[dict[Any, Any]] = [{} for _ in range(num_parts)]
+    for (path, leaf), part_index in zip(leaves, part_of_leaf, strict=True):
+        node = parts[part_index]
+        for key in path[:-1]:
+            node = node.setdefault(key, {})
+        node[path[-1]] = leaf
+    return parts
+
+
+def merge_parts(parts: list[Any]) -> dict[Any, Any]:
+    """Deep-merge the dicts ``split_into_parts`` returned back into one dict."""
+    merged: dict[Any, Any] = {}
+
+    def merge_into(target: dict[Any, Any], source: Mapping[Any, Any]) -> None:
+        for key, child in source.items():
+            if isinstance(child, Mapping) and isinstance(target.get(key), dict):
+                merge_into(target[key], child)
+            else:
+                target[key] = child
+
+    for part in parts:
+        merge_into(merged, part)
+    return merged
 
 
 def default_torch_layout_info(key: str, rank: int) -> LayoutInfo:

@@ -29,6 +29,7 @@ from .checkpoint_layout import (
     default_torch_layout_info,
     JsonSerialization,
     LayoutInfo,
+    merge_parts,
     RawSerialization,
     SafetensorsSerialization,
     TorchSerialization,
@@ -407,15 +408,20 @@ class CheckpointReader:
 
         for key in checkpoint_info.keys:
             layout_info = source_layouts_by_item_key[key]
-            file_path = Path(path) / layout_info.file_path
-            if not self._storage.exists(file_path):
-                raise FileNotFoundError(
-                    f"Missing file {file_path} for checkpoint item {key!r}."
-                )
+            file_paths = [Path(path) / part for part in layout_info.part_file_paths()]
+            for file_path in file_paths:
+                if not self._storage.exists(file_path):
+                    raise FileNotFoundError(
+                        f"Missing file {file_path} for checkpoint item {key!r}."
+                    )
             requested_value = checkpoint_info.checkpoint_items[key].value
 
-            loaded_data = self._load_full_file(
-                file_path, layout_info, map_location=map_location
+            loaded_parts = [
+                self._load_full_file(file_path, layout_info, map_location=map_location)
+                for file_path in file_paths
+            ]
+            loaded_data = (
+                loaded_parts[0] if len(loaded_parts) == 1 else merge_parts(loaded_parts)
             )
             # Filter loaded data to only include keys present in the requested structure
             # Also track any missing keys within the nested structure
@@ -438,7 +444,8 @@ class CheckpointReader:
             )
             missing_paths.extend(item_missing_paths)
             logger.info(
-                f"Done Loading {key} checkpoint from {file_path} without resharder.",
+                f"Done Loading {key} checkpoint from "
+                f"{', '.join(map(str, file_paths))} without resharder.",
                 extra=event_logger(
                     EventType.LOG_METRIC,
                     metric_name=f"train.checkpoint_read.execute.filesystem.{key}.read.latency_ms",
