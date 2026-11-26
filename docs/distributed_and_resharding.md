@@ -201,7 +201,9 @@ class CheckpointWriterConfig:
         default_factory=DefaultStoreBarrierConfig
     )
     file_write_max_threads: int = 1
+    temp_dir_prefix: str = DEFAULT_TEMP_DIR_PREFIX  # "tmp_"
     write_to_temp_dir: bool = True
+    replace_existing: bool = False
 ```
 
 `DefaultStoreBarrierConfig` is the default because it costs nothing to hold: it
@@ -213,23 +215,43 @@ commit too.
 By default, inside `CheckpointWriter.write()` the ordering is:
 
 1. Run `pre_write_callback` with the final destination; raising aborts the write.
-2. Write all shard files (and, on `role_rank == 0`, the metadata file) into a
-   temporary directory.
-3. Run `pre_finalize_callback` (see below).
-4. If a barrier is configured, `execute_barrier(...)` — wait for every rank to
-   finish writing.
-5. On `role_rank == 0`, atomically rename the temporary directory to the final
-   path.
-6. Run `finalize_callback`.
+2. On `role_rank == 0`, remove any temporary directory left by an interrupted
+   save of the same path; then every rank waits at the barrier so none writes
+   into it before it is cleared.
+3. Write all shard files into the temporary directory. If `pre_finalize_callback`
+   is configured and distributed metadata is present, `role_rank == 0` also
+   stages a temporary copy of `metadata.pkl` there for the callback to read.
+4. Run `pre_finalize_callback` (see below).
+5. Wait for every rank at the barrier, so every shard is written.
+6. On `role_rank == 0`, commit: delete any staged `metadata.pkl` copy; rename
+   the temporary directory onto the final path (with `replace_existing=True`, if
+   `rename` raises `FileExistsError`, delete the existing destination
+   directory—its `metadata.pkl` first—and rename again); then publish
+   `metadata.pkl` there, staged as `.metadata.pkl.tmp` and renamed into place.
+7. Run `finalize_callback`.
 
-The temporary-directory-then-rename dance is what makes a checkpoint atomic:
-readers never observe a half-written directory.
+`metadata.pkl` marks a checkpoint directory complete, so it lands last: on a
+backend whose directory rename moves objects individually, a rename cut short
+leaves a directory without it, which metadata-requiring readers and resume
+discovery treat as incomplete (`CheckpointReader` itself defaults to
+`_REQUIRE_METADATA = False` and falls back to conventional rank files unless a
+`metadata_format` is passed). Both barriers use
+`checkpoint_write_barrier_timeout_sec`.
+
+The temporary-directory-then-rename dance keeps half-written shards out of the
+final directory (with `metadata.pkl` published right after the directory rename,
+there is a narrow window where the final directory holds the shards before
+`metadata.pkl` appears).
 
 ### Disabling the temporary directory
 
-`write_to_temp_dir` decides whether files are staged in a temporary directory and renamed in step 5. It defaults to
-`True`; set it to `False` and every rank writes directly to the final path. The
-barrier and callbacks still run as above.
+`write_to_temp_dir` decides whether files are staged in a temporary directory and renamed in step 6. It defaults to
+`True`; set it to `False` and every rank writes directly to the final path. Steps
+2 and 6 are then skipped: `role_rank == 0` writes `metadata.pkl` straight to the
+final path in step 3 (if metadata is present), and the write barrier in step 5
+(if configured) is the only one before
+`finalize_callback`. Nothing is renamed, so a reader can see the checkpoint
+before every rank has finished writing.
 
 This is for a backend where renaming a directory is NOT an atomic operation.
 For example, AWS S3 does not support this: a directory rename requires copying
@@ -304,7 +326,7 @@ in `torch_checkpointing.checkpoint_writer` and contains `path`, the writer's
   It receives the final destination path; raising aborts that rank's write.
   Configure this hook on `CheckpointWriterArgs`.
 - **`pre_finalize_callback`** runs on every writing rank after all files are
-  written but before the barrier. Its path is the temporary directory when
+  written but before the write barrier. Its path is the temporary directory when
   `write_to_temp_dir=True`, otherwise the final directory.
 - **`finalize_callback`** runs on every writing rank after its barrier and
   rename step, with the final path. Only rank 0 performs the rename.

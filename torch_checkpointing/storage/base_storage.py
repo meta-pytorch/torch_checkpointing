@@ -198,6 +198,14 @@ class Storage(ABC):
         file          directory             raise ``OSError`` (empty or not)
         ============  ====================  =========================================
 
+        A missing ``src_path`` raises ``FileNotFoundError`` and leaves
+        ``dst_path`` alone; the checkpoint writer relies on this and on the
+        refusals above to call ``rename`` without probing either path first.
+        Refuse an occupied destination with ``FileExistsError``: with
+        ``replace_existing`` the writer deletes the destination directory only
+        after such a refusal, since any other error may come from a move cut
+        short.
+
         Two rules generate that table, and both exist because getting them
         wrong is silent data corruption rather than a visible failure.
 

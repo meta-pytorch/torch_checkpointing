@@ -134,10 +134,19 @@ exact. Every backend must implement this table:
 | file | existing file | replace it |
 | file | directory | raise `OSError` |
 
+A missing `src_path` raises `FileNotFoundError` and leaves `dst_path` alone. The
+writer relies on these refusals to call `rename` without probing either path
+first. Refuse an occupied destination with `FileExistsError`: with
+`replace_existing=True` the writer deletes the destination directory only after
+such a refusal, because any other error may come from a move cut short, with
+part of the checkpoint already at `dst_path`.
+
 Two rules generate the table: the contents of `src_path` land *directly* at
 `dst_path` and never nested inside it, and an occupied destination raises instead
 of being merged into or deleted. Only file-onto-file is a replace, because the
-atomic-write callers ask for that by construction. A nested or merged commit is
+atomic-write callers ask for that by construction; callers that mean to replace
+an existing checkpoint directory use `CheckpointWriterConfig(replace_existing=True)`,
+which deletes it explicitly once `rename` refuses it, then renames again. A nested or merged commit is
 silent data corruption rather than a cosmetic difference, which is why this is
 spelled out rather than left to each backend's judgement.
 
@@ -361,13 +370,39 @@ and `remap_path` returns the full URI.
 
 **`storage_options`** are passed to the driver's filesystem class, for
 credentials or endpoints. The config must stay picklable, because the async
-save subprocess rebuilds the storage from it.
+save subprocess rebuilds the storage from it. On GCS zonal buckets, `gcsfs`
+leaves objects unfinalized (appendable) on close by default; pass
+`storage_options={"finalize_on_close": True}` if downstream consumers require
+finalized objects.
 
-**Commit is only as atomic as the driver's move.** `rename` checks the
-destination and then calls the driver's move. Where that move is a single
-directory rename, it is atomic. On a flat object store each object is copied
-and then deleted, so a crash midway can leave the final checkpoint directory
-partly written.
+**Commit is only as atomic as the driver's move.** On the staged-write path the
+sequence is: pre-write callback -> `role_rank == 0` removes any leftover staging
+directory from an interrupted save -> pre-write barrier -> every rank writes its
+shards (plus a temporary `metadata.pkl` on `role_rank == 0` if a pre-finalize
+callback is set) -> pre-finalize callback -> write barrier -> `role_rank == 0`
+deletes any temporary `metadata.pkl`, renames the staging directory onto the
+final path (with `replace_existing=True`, a `FileExistsError` refusal deletes
+the existing checkpoint directory and renames again), and publishes
+`metadata.pkl` -> finalize callback.
+`rename` checks the destination and then calls the driver's move. Where that
+move is a single directory rename, it is atomic: on GCS, a bucket with
+hierarchical namespace (including zonal buckets) renames the folder in one
+request. On a flat object store each object is moved individually (for example
+copy-then-delete on S3, or per-object `moveTo` on flat GCS), so a crash midway
+can leave the final checkpoint directory partly written. Because `metadata.pkl`
+is added only after the directory rename, a partly written directory has no
+metadata, so callers that check for `metadata.pkl` (such as resume discovery or
+metadata-requiring readers) treat it as incomplete; and because it is written as
+`.metadata.pkl.tmp` and renamed into place, `metadata.pkl` is never visible
+half-written, not even on a zonal bucket, whose objects can be read before they
+are finalized. When `replace_existing=True` and `rename` refuses an occupied
+destination with `FileExistsError`, `role_rank == 0` deletes `metadata.pkl`
+first and then removes the destination directory before retrying the rename, so
+a failure before that delete leaves the old checkpoint intact and an interrupted
+delete never leaves a marker next to missing shards; deleting the old
+checkpoint, renaming, and publishing the new `metadata.pkl` are separate steps,
+so a crash anywhere in that window leaves no complete checkpoint at the
+destination.
 
 **The listing cache is turned off.** Some drivers cache directory listings per
 client and trust them when looking a path up, but other ranks and the save

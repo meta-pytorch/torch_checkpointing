@@ -49,7 +49,7 @@ class CheckpointWriterConfig:
 
     Attributes:
         checkpoint_write_barrier_timeout_sec: Maximum time in seconds to wait for all ranks
-            to reach the checkpoint barrier before timing out. Default is 600 seconds.
+            at each of the writer's barriers before timing out. Default is 600 seconds.
         barrier_config: Complete configuration for the synchronization barrier that
             commits the write. Defaults to ``DefaultStoreBarrierConfig``, which
             coordinates on the store the process group already has and costs a
@@ -65,6 +65,18 @@ class CheckpointWriterConfig:
             directory and rename it onto the final path once every rank has finished.
             Defaults to True. If false, writer will write directly to the final path.
             Requires a barrier to be configured when True.
+        replace_existing: Replace an existing checkpoint directory at the
+            destination when committing. After every rank has written and passed
+            the write barrier, role rank 0 attempts the commit rename first;
+            only if ``rename`` raises ``FileExistsError`` does it delete the
+            existing destination directory (removing ``metadata.pkl`` first) and
+            rename again. A regular file at the destination is not deleted and
+            raises ``NotADirectoryError``. A failure before that delete leaves
+            the existing destination untouched. Deleting the old checkpoint,
+            renaming, and publishing the new ``metadata.pkl`` are separate
+            steps, so a crash anywhere after deleting the old ``metadata.pkl``
+            until the new ``metadata.pkl`` is published leaves no complete
+            checkpoint at the destination. Requires ``write_to_temp_dir=True``.
     """
 
     checkpoint_write_barrier_timeout_sec: int = 600
@@ -74,6 +86,7 @@ class CheckpointWriterConfig:
     file_write_max_threads: int = 1
     temp_dir_prefix: str = DEFAULT_TEMP_DIR_PREFIX
     write_to_temp_dir: bool = True
+    replace_existing: bool = False
 
     def __post_init__(self) -> None:
         if self.file_write_max_threads < 1:
@@ -83,6 +96,8 @@ class CheckpointWriterConfig:
             logger.warning(msg)
             warnings.warn(msg, stacklevel=2)
             self.write_to_temp_dir = False
+        if self.replace_existing and not self.write_to_temp_dir:
+            raise ValueError("replace_existing requires write_to_temp_dir=True")
         if self.write_to_temp_dir and not self.temp_dir_prefix:
             raise ValueError(
                 "temp_dir_prefix must be non-empty when writing to a temp dir"
@@ -219,9 +234,38 @@ class CheckpointWriter:
         final_path = Path(path)
         if self._args.config.write_to_temp_dir:
             tmp_dir_path = _temp_dir_path(final_path, self._args.config.temp_dir_prefix)
+            if self._args.rank_info.role_rank == 0 and self._storage.isdir(
+                tmp_dir_path
+            ):
+                logger.warning(
+                    "Removing leftover staging directory %s before writing.",
+                    tmp_dir_path,
+                )
+                self._storage.rmdir(tmp_dir_path)
+            # Every rank waits here even when rank 0 found nothing: other ranks
+            # cannot know whether a leftover existed, and must not write into
+            # tmp_dir_path until rank 0 has cleared it.
+            assert self._barrier is not None
+            logger.info(
+                f"Waiting for all ranks at staging barrier with timeout {self._args.config.checkpoint_write_barrier_timeout_sec}s",
+                extra=event_logger(EventType.CHECKPOINT_BARRIER_START),
+            )
+            self._barrier.execute_barrier(
+                self._args.config.checkpoint_write_barrier_timeout_sec,
+            )
+            logger.info(
+                "All ranks passed staging barrier",
+                extra=event_logger(
+                    EventType.CHECKPOINT_BARRIER_END,
+                    metric_name=f"{self._metric_prefix}.execute.staging_barrier.latency_ms",
+                ),
+            )
         else:
             tmp_dir_path = final_path
 
+        # Times only this rank's file writes, excluding pre-write setup and the
+        # staging barrier.
+        filesystem_event_logger = EventLogger()
         state_dict = checkpoint_info.state_dict
         save_items: list[tuple[str, LayoutInfo, Path]] = []
         for key, layout_info in checkpoint_info.layout_info_mappings.items():
@@ -237,26 +281,32 @@ class CheckpointWriter:
 
         self._write_keys(save_items, state_dict)
 
-        # Write metadata directly from serialized string if available (rank0 only)
-        if self._args.rank_info.role_rank == 0:
+        metadata = checkpoint_info.serialized_distributed_metadata
+        # On the commit path metadata.pkl is published at final_path after the
+        # rename, so the temp dir holds a copy only for a pre-finalize callback
+        # to read (deleted before the rename).
+        stage_metadata = bool(metadata) and (
+            not self._args.config.write_to_temp_dir
+            or self._args.pre_finalize_callback is not None
+        )
+        if self._args.rank_info.role_rank == 0 and stage_metadata:
             logger.info(
                 "Writing metadata to checkpoint directory",
             )
-            self._write_metadata(
-                tmp_dir_path,
-                checkpoint_info.serialized_distributed_metadata,
-            )
+            metadata_event_logger = EventLogger()
+            self._write_metadata(tmp_dir_path, metadata)
             logger.info(
                 "Done writing metadata to checkpoint directory",
-                extra=event_logger(
+                extra=metadata_event_logger(
                     EventType.LOG_METRIC,
                     metric_name=f"{self._metric_prefix}.execute.filesystem.metadata.write.latency_ms",
+                    end_to_end=True,
                 ),
             )
 
         logger.info(
             "Finished all filesystem writes",
-            extra=event_logger(
+            extra=filesystem_event_logger(
                 EventType.LOG_METRIC,
                 metric_name=f"{self._metric_prefix}.execute.filesystem.save.latency_ms",
                 end_to_end=True,
@@ -308,20 +358,17 @@ class CheckpointWriter:
 
         # rename back to original path for atomicity. It's important this is done
         # immediately after the barrier to ensure all ranks have finished writing
-        if (
-            self._args.config.write_to_temp_dir
-            and self._storage.exists(tmp_dir_path)
-            and self._args.rank_info.role_rank == 0
-        ):
+        if self._args.config.write_to_temp_dir and self._args.rank_info.role_rank == 0:
+            # The metadata file marks a checkpoint directory complete, so it
+            # lands last. On a store without a real directory rename, the move
+            # operates per object and metadata.pkl can finish ahead of shards:
+            # a crash midway would leave it next to missing shards.
+            if stage_metadata:
+                self._storage.delete(tmp_dir_path / METADATA_FILE_NAME)
             logger.info("Moving checkpoint to final directory")
-            self._storage.rename(tmp_dir_path, final_path, is_directory=True)
-            logger.info(
-                "Finished moving checkpoint to final directory",
-                extra=event_logger(
-                    EventType.LOG_METRIC,
-                    metric_name=f"{self._metric_prefix}.execute.rename.latency_ms",
-                ),
-            )
+            self._commit(tmp_dir_path, final_path)
+            if metadata:
+                self._publish_metadata(final_path, metadata)
 
         # Execute finalize callback if available
         if self._args.finalize_callback is not None:
@@ -473,6 +520,63 @@ class CheckpointWriter:
         """
         logger.debug("Closing checkpoint writer")
 
+    def _commit(self, tmp_dir_path: Path, final_path: Path) -> None:
+        """Rename the staging directory onto ``final_path``.
+
+        ``rename`` refuses a missing source and an occupied destination on its
+        own, so on a fresh path, the common case, the writer probes nothing
+        before calling ``rename``: on an object store every probe is an uncached
+        round trip. Only a ``FileExistsError`` refusal looks further: with
+        ``replace_existing``, it removes the existing destination directory and
+        renames again.
+        """
+        rename_event_logger = EventLogger()
+        try:
+            self._storage.rename(tmp_dir_path, final_path, is_directory=True)
+        except FileExistsError:
+            # Only a refusal of the occupied destination is replaced. Any other
+            # error, such as a timeout midway through a move on a flat object
+            # store, may have left part of this checkpoint at final_path, and a
+            # delete would throw it away.
+            if not self._args.config.replace_existing:
+                raise
+        else:
+            self._log_rename_latency(rename_event_logger)
+            return
+
+        logger.warning("Replacing existing checkpoint directory %s.", final_path)
+        replace_event_logger = EventLogger()
+        # The completeness marker leaves first, so an interrupted recursive
+        # delete never leaves metadata.pkl next to missing shards. On flat object
+        # stores the prefix vanishes with its last object, so re-check existence
+        # before rmdir.
+        existing_marker = final_path / METADATA_FILE_NAME
+        if self._storage.exists(existing_marker):
+            self._storage.delete(existing_marker)
+        if self._storage.exists(final_path):
+            self._storage.rmdir(final_path)
+        logger.info(
+            "Removed the checkpoint being replaced",
+            extra=replace_event_logger(
+                EventType.LOG_METRIC,
+                metric_name=f"{self._metric_prefix}.execute.replace_existing.latency_ms",
+                end_to_end=True,
+            ),
+        )
+        rename_event_logger = EventLogger()
+        self._storage.rename(tmp_dir_path, final_path, is_directory=True)
+        self._log_rename_latency(rename_event_logger)
+
+    def _log_rename_latency(self, event_logger: EventLogger) -> None:
+        logger.info(
+            "Finished moving checkpoint to final directory",
+            extra=event_logger(
+                EventType.LOG_METRIC,
+                metric_name=f"{self._metric_prefix}.execute.rename.latency_ms",
+                end_to_end=True,
+            ),
+        )
+
     def _write_metadata(
         self, dir_path: Path, serialized_distributed_metadata: bytes | None = None
     ) -> None:
@@ -487,3 +591,27 @@ class CheckpointWriter:
         if serialized_distributed_metadata:
             metadata_path = dir_path / METADATA_FILE_NAME
             self._storage.write(metadata_path, serialized_distributed_metadata)
+
+    def _publish_metadata(self, dir_path: Path, serialized_metadata: bytes) -> None:
+        """Make ``dir_path/metadata.pkl`` appear whole or not at all.
+
+        The metadata file marks a checkpoint directory complete, so readers
+        trust it as soon as it exists. Written in place, it is visible while
+        partly written: a POSIX file from its creat(), an unfinalized object on
+        a zonal bucket. It is staged under another name and renamed onto the
+        marker so every backend publishes the destination file whole atomically
+        (even when a flat object store implements file moves as copy then
+        delete).
+        """
+        metadata_event_logger = EventLogger()
+        staged_path = dir_path / f".{METADATA_FILE_NAME}.tmp"
+        self._storage.write(staged_path, serialized_metadata)
+        self._storage.rename(staged_path, dir_path / METADATA_FILE_NAME)
+        logger.info(
+            "Published metadata to checkpoint directory",
+            extra=metadata_event_logger(
+                EventType.LOG_METRIC,
+                metric_name=f"{self._metric_prefix}.execute.filesystem.metadata.write.latency_ms",
+                end_to_end=True,
+            ),
+        )
