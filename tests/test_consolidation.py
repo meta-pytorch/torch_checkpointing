@@ -7,6 +7,7 @@
 # Owner(s): ["oncall: pytorch_checkpointing"]
 
 import concurrent.futures
+import inspect
 import io
 import json
 import logging
@@ -15,6 +16,7 @@ import pickle
 import socket
 import threading
 import time
+from datetime import timedelta
 from pathlib import Path
 from unittest import mock
 
@@ -354,12 +356,20 @@ def _distributed_default_mapping_worker(
     world_size: int,
     checkpoint_path: str,
     port: int,
+    backend: str = "gloo",
+    new_group_calls_dir: str | None = None,
+    create_group_afterwards: bool = False,
 ) -> None:
     dist.init_process_group(
-        backend="gloo",
+        backend=backend,
         init_method=f"tcp://127.0.0.1:{port}",
         rank=rank,
         world_size=world_size,
+        # A training job binds each rank to its device. NCCL then builds
+        # subgroups by splitting the default group's communicator.
+        device_id=torch.device("cuda", rank) if backend == "nccl" else None,
+        # Bounds the barrier that follows consolidation below.
+        timeout=timedelta(seconds=60),
     )
     try:
         checkpoint_dir = Path(checkpoint_path)
@@ -389,12 +399,46 @@ def _distributed_default_mapping_worker(
             barrier_calls += 1
             return original_barrier(*args, **kwargs)
 
-        with mock.patch("torch.distributed.barrier", side_effect=counted_barrier):
+        original_new_group = dist.new_group
+        new_group_signature = inspect.signature(original_new_group)
+        new_group_calls: list[dict[str, object]] = []
+
+        def recorded_new_group(*args, **kwargs):
+            arguments = new_group_signature.bind(*args, **kwargs)
+            arguments.apply_defaults()
+            new_group_calls.append(
+                {
+                    "ranks": list(arguments.arguments["ranks"]),
+                    "use_local_synchronization": arguments.arguments[
+                        "use_local_synchronization"
+                    ],
+                }
+            )
+            return original_new_group(*args, **kwargs)
+
+        with (
+            mock.patch("torch.distributed.barrier", side_effect=counted_barrier),
+            mock.patch("torch.distributed.new_group", side_effect=recorded_new_group),
+        ):
             consolidate_hf_safetensors_checkpoint(
                 checkpoint_path,
                 item_key="model",
             )
         assert barrier_calls == (3 if rank < 2 else 0)
+        # A rank that owns no output file returns while the owners still work.
+        # If the owners are stuck creating their group, this collective times
+        # out and fails the test, where the owners alone would hang it.
+        dist.barrier()
+        if new_group_calls_dir is not None:
+            calls_path = Path(new_group_calls_dir) / f"rank_{rank}.json"
+            calls_path.write_text(json.dumps(new_group_calls))
+        if create_group_afterwards:
+            # What a later export or a device mesh does next. The group forms
+            # only if every rank, including those that own no output file, left
+            # consolidation with the same process group bookkeeping.
+            later_group = dist.new_group(timeout=timedelta(seconds=20))
+            dist.barrier(group=later_group)
+            dist.destroy_process_group(later_group)
     finally:
         dist.destroy_process_group()
 
@@ -1327,6 +1371,74 @@ def test_consolidate_hf_safetensors_balances_default_mapping_across_ranks(
         )
         for fqn in shard
     }
+
+
+def test_consolidate_hf_safetensors_creates_owner_group_on_every_rank(
+    tmp_path: Path,
+) -> None:
+    checkpoint_path = tmp_path / "checkpoint"
+    checkpoint_path.mkdir()
+    new_group_calls_dir = tmp_path / "new_group_calls"
+    new_group_calls_dir.mkdir()
+
+    mp.spawn(
+        _distributed_default_mapping_worker,
+        args=(
+            3,
+            os.fspath(checkpoint_path),
+            _get_free_port(),
+            "gloo",
+            os.fspath(new_group_calls_dir),
+        ),
+        nprocs=3,
+        join=True,
+    )
+
+    # Every rank of the default group has to enter new_group, including rank 2,
+    # which owns no output file: NCCL builds the subgroup with a collective over
+    # the default group. Local synchronization makes torch skip that collective
+    # on the ranks left out of the new group.
+    owner_group = {"ranks": [0, 1], "use_local_synchronization": False}
+    assert {
+        rank: json.loads((new_group_calls_dir / f"rank_{rank}.json").read_text())
+        for rank in range(3)
+    } == {0: [owner_group], 1: [owner_group], 2: [owner_group]}
+
+
+def test_consolidate_hf_safetensors_leaves_group_creation_in_step_across_ranks(
+    tmp_path: Path,
+) -> None:
+    checkpoint_path = tmp_path / "checkpoint"
+    checkpoint_path.mkdir()
+
+    mp.spawn(
+        _distributed_default_mapping_worker,
+        args=(3, os.fspath(checkpoint_path), _get_free_port(), "gloo", None, True),
+        nprocs=3,
+        join=True,
+    )
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 4, reason="requires 4 CUDA devices")
+@pytest.mark.gpus_needed_4
+def test_consolidate_hf_safetensors_completes_on_nccl_when_some_ranks_own_no_file(
+    tmp_path: Path,
+) -> None:
+    checkpoint_path = tmp_path / "checkpoint"
+    checkpoint_path.mkdir()
+
+    mp.spawn(
+        _distributed_default_mapping_worker,
+        args=(4, os.fspath(checkpoint_path), _get_free_port(), "nccl"),
+        nprocs=4,
+        join=True,
+    )
+
+    assert sorted(path.name for path in checkpoint_path.glob("model-*")) == [
+        "model-00001-of-00002.safetensors",
+        "model-00002-of-00002.safetensors",
+    ]
+    assert (checkpoint_path / "model.safetensors.index.json").exists()
 
 
 @pytest.mark.parametrize(

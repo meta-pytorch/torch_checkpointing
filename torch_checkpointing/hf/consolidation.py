@@ -214,6 +214,10 @@ def consolidate_hf_safetensors_checkpoint(
     files are written alongside the input checkpoint and prefixed with
     ``item_key``. Output files assigned to the same
     rank are processed sequentially while their tensors are read concurrently.
+
+    In a distributed job, call this on every rank of the default process group.
+    Output files are spread across the ranks, and the ranks that own none still
+    take part in creating the owners' process group.
     """
     event_logger = EventLogger()
     storage = (
@@ -486,19 +490,19 @@ def _create_consolidation_process_group(
         return rank == 0, None, False
 
     participating_ranks = sorted({0, *output_index_owners})
-    if rank not in participating_ranks:
-        return False, None, False
     if len(participating_ranks) == world_size:
         return True, dist.group.WORLD, False
-    return (
-        True,
-        dist.new_group(
-            ranks=participating_ranks,
-            use_local_synchronization=True,
-            group_desc="hf_safetensors_consolidation",
-        ),
-        True,
+    # Every rank of the default group enters new_group, including the ranks
+    # left out of the new group. A backend may build the subgroup with a
+    # collective over its parent, as NCCL does by splitting the parent
+    # communicator, and the owners would wait for ranks that never join.
+    process_group = dist.new_group(
+        ranks=participating_ranks,
+        group_desc="hf_safetensors_consolidation",
     )
+    if rank not in participating_ranks:
+        return False, None, False
+    return True, process_group, True
 
 
 def _write_and_finalize_consolidated_output_files(
